@@ -377,6 +377,134 @@ void test_plan_relocations_keeps_longest() {
     }
 }
 
+void test_plan_tail_relocation() {
+    using ninfer::targets::qwen3_6::detail::plan_tail_relocation;
+
+    // Scope A shape: [P R S] -> [P S]. S is the entire tail, so it is trimmed back to the last whole
+    // block ending before the final prompt token, which is always prefilled.
+    Tokens previous;
+    append(previous, segment(1, 1)); // P
+    append(previous, segment(2, 2)); // R, replaced
+    append(previous, segment(3, 2)); // S, survives and moves left
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(3, 2));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    const auto plan = plan_tail_relocation(diff, resident, 0, prompt, 6);
+    expect(plan.viable, "a Scope A edit yields a tail relocation");
+    expect(plan.spans.size() == 1, "a Scope A edit relocates a single run");
+    if (plan.spans.size() == 1) {
+        expect(plan.spans.front().source_begin == block_tokens(3),
+               "the relocation source is the old suffix");
+        expect(plan.spans.front().dest_begin == block_tokens(1),
+               "the relocation destination is the new suffix");
+        expect(plan.spans.front().tokens == block_tokens(1),
+               "the final block is trimmed and stays prefilled");
+    }
+    expect(plan.head.begin == 0 && plan.head.end == block_tokens(1), "the head covers the prefix");
+    expect(plan.tail.begin == block_tokens(2) && plan.tail.end == prompt,
+           "the tail covers the final block");
+    expect(!plan.tail.empty(), "the plan's tail is never empty");
+    expect(plan.relocated_tokens() == block_tokens(1), "the relocated token count is reported");
+
+    // A reuse frontier that lands exactly on the destination leaves an empty head.
+    const auto at_frontier = plan_tail_relocation(diff, resident, block_tokens(1), prompt, 6);
+    expect(at_frontier.viable, "a survivor exactly at the reuse frontier still relocates");
+    expect(at_frontier.head.empty(), "an empty head means nothing is prefilled before the run");
+
+    // A destination already covered by prefix reuse must not be claimed a second time.
+    expect(!plan_tail_relocation(diff, resident, block_tokens(2), prompt, 6).viable,
+           "a destination inside the prefix-reuse region is not relocated");
+
+    // Caps and degenerate prompts.
+    expect(!plan_tail_relocation(diff, resident, 0, prompt, 0).viable,
+           "a zero span cap relocates nothing");
+    expect(!plan_tail_relocation(diff, resident, prompt, prompt, 6).viable,
+           "a prompt that is entirely prefix reuse relocates nothing");
+    expect(!plan_tail_relocation(diff, block_tokens(4), 0, prompt, 6).viable,
+           "a survivor without resident KV is not relocated");
+}
+
+void test_plan_tail_relocation_picks_one_run() {
+    using ninfer::targets::qwen3_6::detail::plan_tail_relocation;
+
+    // Two survivors separated by a replaced block cannot both be relocated, because the gap between
+    // them would have to be prefilled. The longer run wins and the head absorbs the gap.
+    Tokens previous;
+    append(previous, segment(1, 1)); // prefix
+    append(previous, segment(2, 2)); // replaced by a single block
+    append(previous, segment(6, 1)); // survivor, shorter
+    append(previous, segment(4, 2)); // replaced by four blocks
+    append(previous, segment(5, 3)); // survivor, longer and last in prompt order
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(6, 1));
+    append(current, segment(7, 4));
+    append(current, segment(5, 3));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    const auto plan = plan_tail_relocation(diff, resident, 0, prompt, 6);
+    expect(plan.viable, "a tail relocation is found across non-adjacent survivors");
+    expect(plan.spans.size() == 1, "only the chosen run is relocated");
+    if (plan.spans.size() == 1) {
+        expect(plan.spans.front().dest_begin == block_tokens(6),
+               "the relocated run sits at its destination");
+        expect(plan.spans.front().tokens == block_tokens(2),
+               "the longer survivor is the one relocated, trimmed before the final token");
+    }
+    expect(plan.head.begin == 0 && plan.head.end == block_tokens(6),
+           "the head absorbs everything before the run");
+    expect(plan.tail.begin == block_tokens(8) && plan.tail.end == prompt,
+           "the tail covers the final block");
+}
+
+void test_plan_tail_relocation_merges_adjacent_survivors() {
+    using ninfer::targets::qwen3_6::detail::plan_tail_relocation;
+
+    // Two survivors separated in the source but adjacent in the destination form a single run even
+    // though the detector reports them separately, so both are relocated. The span cap then keeps
+    // only the best window inside the run, and equal windows keep the earliest.
+    Tokens previous;
+    append(previous, segment(1, 1)); // prefix
+    append(previous, segment(2, 1)); // replaced, keeps the next survivor off the prefix
+    append(previous, segment(3, 1)); // survivor, destination follows the prefix
+    append(previous, segment(4, 1)); // replaced, so the two survivors stay separate spans
+    append(previous, segment(5, 1)); // survivor, destination abuts the previous one
+    append(previous, segment(6, 2)); // replaced by a different two blocks
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(3, 1));
+    append(current, segment(5, 1));
+    append(current, segment(7, 2));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    const auto plan = plan_tail_relocation(diff, resident, 0, prompt, 6);
+    expect(plan.viable, "a destination-adjacent run yields a tail relocation");
+    expect(plan.spans.size() == 2, "both spans of the run are relocated");
+    expect(plan.head.begin == 0 && plan.head.end == block_tokens(1),
+           "the head stops at the start of the run");
+    expect(plan.tail.begin == block_tokens(3) && plan.tail.end == prompt,
+           "the tail covers everything after the run");
+
+    const auto capped = plan_tail_relocation(diff, resident, 0, prompt, 1);
+    expect(capped.viable, "a one-span cap still relocates");
+    expect(capped.spans.size() == 1, "the span cap keeps a single span");
+    if (capped.spans.size() == 1) {
+        expect(capped.spans.front().dest_begin == block_tokens(1),
+               "equal spans keep the earliest window");
+    }
+}
+
 void test_determinism() {
     Tokens previous;
     append(previous, segment(1, 2));
@@ -405,6 +533,9 @@ int main() {
     test_empty_and_degenerate_inputs();
     test_plan_relocations();
     test_plan_relocations_keeps_longest();
+    test_plan_tail_relocation();
+    test_plan_tail_relocation_picks_one_run();
+    test_plan_tail_relocation_merges_adjacent_survivors();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

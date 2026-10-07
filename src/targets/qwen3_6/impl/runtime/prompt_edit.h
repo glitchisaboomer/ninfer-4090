@@ -99,6 +99,66 @@ struct RelocatedSpan {
                                                          std::uint32_t prefix_reuse_tokens,
                                                          std::uint32_t max_spans);
 
+// A range of prompt tokens the runtime prefills, `[begin, end)`.
+struct PrefillRange {
+    std::uint32_t begin = 0;
+    std::uint32_t end   = 0;
+
+    [[nodiscard]] bool empty() const noexcept { return begin >= end; }
+    [[nodiscard]] std::uint32_t tokens() const noexcept { return end > begin ? end - begin : 0; }
+};
+
+// A tail-relocation plan: the runtime prefills `head` and `tail` and serves everything between them
+// from resident KV.
+//
+// This is the shape the roadmap calls Scope A, and it is the widest plan the runtime can act on
+// without prefilling a disjoint set of many ranges: the relocated spans are contiguous, so exactly
+// two prefilled ranges remain.
+struct TailRelocationPlan {
+    // False when no contiguous surviving run is usable; the caller must then treat the prompt as an
+    // ordinary prefix-reuse append.
+    bool viable = false;
+    // Prefilled before the relocated run, `[prefix_reuse_tokens, spans.front().dest_begin)`.
+    PrefillRange head;
+    // The contiguous surviving run, in prompt order.
+    std::vector<RelocatedSpan> spans;
+    // Prefilled after the relocated run, `[spans.back().dest_end(), prompt_tokens)`. Never empty: the
+    // final prompt token is always prefilled, because prompt logits can only come from a real
+    // forward pass.
+    PrefillRange tail;
+
+    [[nodiscard]] std::uint32_t relocated_tokens() const noexcept {
+        std::uint32_t total = 0;
+        for (const RelocatedSpan& span : spans) { total += span.tokens; }
+        return total;
+    }
+};
+
+// Plan a tail relocation for an edited prompt.
+//
+// Selection is the longest contiguous run of surviving spans, capped at `max_spans` spans by taking
+// the best window inside the run, so this returns the single most valuable relocation the runtime can
+// act on rather than the sum of every survivor. The run may sit anywhere in the prompt: whatever is
+// left on either side is prefilled, which is why the result carries two ranges rather than one.
+//
+// A span is a candidate only when all of the following hold:
+//
+//   * It is not the leading span, which is ordinary prefix reuse and would be counted twice.
+//   * Its source range is fully inside `resident_kv_tokens`.
+//   * Its destination begins at or after `prefix_reuse_tokens`.
+//   * Its destination begins before `prompt_tokens - 1`, so the final prompt token is always
+//     prefilled and the plan's `tail` range is never empty. A span reaching past that point is
+//     trimmed back to the last whole block ending before it, rather than dropped, so a surviving
+//     suffix that runs to the end of the prompt still relocates everything but its final block.
+//
+// Returns a non-viable plan when no candidate survives, when `max_spans` is zero, or when the prompt
+// has nothing after the reuse frontier.
+[[nodiscard]] TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff,
+                                                      std::uint32_t resident_kv_tokens,
+                                                      std::uint32_t prefix_reuse_tokens,
+                                                      std::uint32_t prompt_tokens,
+                                                      std::uint32_t max_spans);
+
 // Detect the spans of `previous` that survive in `current`.
 //
 // Blocks are hashed and matched by hash, then confirmed by exact token comparison, so a

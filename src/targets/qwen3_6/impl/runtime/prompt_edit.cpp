@@ -93,6 +93,87 @@ std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
     return candidates;
 }
 
+TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_t resident_kv_tokens,
+                                       std::uint32_t prefix_reuse_tokens,
+                                       std::uint32_t prompt_tokens, std::uint32_t max_spans) {
+    TailRelocationPlan plan;
+    if (max_spans == 0 || prompt_tokens == 0 || prompt_tokens <= prefix_reuse_tokens) {
+        return plan;
+    }
+
+    std::vector<RelocatedSpan> candidates;
+    for (const SurvivingSpan& span : diff.spans) {
+        // The leading span is ordinary prefix reuse, already expressed by the planner's reuse base.
+        if (span.old_begin == 0 && span.new_begin == 0) { continue; }
+        // Relocation needs the resident KV entry to still exist.
+        if (span.old_end() > resident_kv_tokens) { continue; }
+        // A destination at or below the prefix-reuse frontier is already covered by prefix reuse.
+        if (span.new_begin < prefix_reuse_tokens) { continue; }
+        if (span.tokens == 0 || span.new_begin >= prompt_tokens - 1) { continue; }
+        // The final prompt token stays prefilled, so the span is trimmed back to the last whole block
+        // ending before it. Trimming keeps the span block aligned, and only one span can be affected
+        // because surviving spans are disjoint, so it cannot break a run's adjacency.
+        const std::uint32_t room   = prompt_tokens - 1 - span.new_begin;
+        const std::uint32_t fit    = (room / kPromptEditBlockTokens) * kPromptEditBlockTokens;
+        const std::uint32_t tokens = std::min(span.tokens, fit);
+        if (tokens == 0) { continue; }
+        candidates.push_back(RelocatedSpan{.source_begin = span.old_begin,
+                                           .dest_begin   = span.new_begin,
+                                           .tokens       = tokens});
+    }
+    if (candidates.empty()) { return plan; }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const RelocatedSpan& a, const RelocatedSpan& b) {
+                  return a.dest_begin < b.dest_begin;
+              });
+
+    // Only a contiguous run can be relocated without prefilling a range between survivors, so take
+    // the most valuable fixed-size window across every maximal run. Ties keep the earliest run.
+    const std::size_t cap = std::min<std::size_t>(max_spans, candidates.size());
+    std::vector<RelocatedSpan> best;
+    std::uint32_t best_total = 0;
+
+    std::size_t run_begin = 0;
+    while (run_begin < candidates.size()) {
+        std::size_t run_end = run_begin + 1;
+        while (run_end < candidates.size() &&
+               candidates[run_end].dest_begin == candidates[run_end - 1].dest_end()) {
+            ++run_end;
+        }
+        const std::size_t run_length = run_end - run_begin;
+        const std::size_t window     = std::min(cap, run_length);
+
+        std::uint32_t sum = 0;
+        for (std::size_t i = 0; i < window; ++i) { sum += candidates[run_begin + i].tokens; }
+        std::uint32_t best_sum = sum;
+        std::size_t best_offset = 0;
+        for (std::size_t offset = 1; offset + window <= run_length; ++offset) {
+            sum -= candidates[run_begin + offset - 1].tokens;
+            sum += candidates[run_begin + offset + window - 1].tokens;
+            if (sum > best_sum) {
+                best_sum    = sum;
+                best_offset = offset;
+            }
+        }
+
+        if (best_sum > best_total) {
+            best_total = best_sum;
+            const auto first = candidates.begin() + static_cast<std::ptrdiff_t>(run_begin + best_offset);
+            best.assign(first, first + static_cast<std::ptrdiff_t>(window));
+        }
+        run_begin = run_end;
+    }
+
+    if (best.empty()) { return plan; }
+
+    plan.viable = true;
+    plan.head   = PrefillRange{.begin = prefix_reuse_tokens, .end = best.front().dest_begin};
+    plan.spans  = std::move(best);
+    plan.tail   = PrefillRange{.begin = plan.spans.back().dest_end(), .end = prompt_tokens};
+    return plan;
+}
+
 PromptEditDiff diff_prompt_edit(std::span<const TokenId> previous, std::span<const TokenId> current,
                                 std::uint32_t block_tokens) {
     if (block_tokens == 0) {
