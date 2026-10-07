@@ -83,6 +83,9 @@ struct GeneratedRound {
     // Next-token logprob of each entry in `tokens`, in the same order, or empty when the target
     // produced the round without measuring one. A non-empty span always matches `tokens` in size.
     std::span<const float> logprobs;
+    // Best-minus-second-best logit gap in nats for each entry, same order and same sizing rule as
+    // `logprobs`. Empty means not measured, never that every margin was zero.
+    std::span<const float> margins;
 };
 
 struct BatchedGeneratedRound {
@@ -92,6 +95,8 @@ struct BatchedGeneratedRound {
     // Same ragged layout as `tokens`: row r's logprobs start at r * row_stride. Empty means the
     // target did not measure this round's logprobs at all, never that they are zero.
     std::span<const float> logprobs;
+    // Same ragged layout as `logprobs`.
+    std::span<const float> margins;
 };
 
 struct PrefillStepResult {

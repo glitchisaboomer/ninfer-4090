@@ -414,6 +414,9 @@ struct GenerationResult {
     // being dropped, so the two vectors never describe different tokens. Phase 5.5 of
     // docs/SCR_ROADMAP.md measures Suffix Cache Reuse with this; the served API does not expose it.
     std::vector<float> generated_logprobs;
+    // Best-minus-second-best logit gap in nats, parallel to `generated_logprobs`. NaN where a path
+    // measured no margin. See ops::logprob_of_choice.
+    std::vector<float> generated_margins;
     std::string content;
     std::string reasoning;
     std::uint32_t reasoning_tokens     = 0;

@@ -36,6 +36,9 @@ struct LoggedCompletion {
     std::vector<ninfer::TokenId> generated_token_ids;
     // NaN where the log recorded null, which is how a path that measures no logprob reports.
     std::vector<float> generated_logprobs;
+    // Best-minus-second-best logit gap per generated token, same order. Empty when the log predates the
+    // field; NaN per entry where that position measured none. See ops::logprob_of_choice.
+    std::vector<float> generated_margins;
 };
 
 // Parses the `request_done` records of a request JSONL log, in file order, ignoring every other

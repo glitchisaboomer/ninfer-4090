@@ -78,6 +78,28 @@ ScrQualityPromptResult evaluate_scr_prompt(const ScrQualitySample& sample,
         result.first_token_divergence  = std::numeric_limits<double>::quiet_NaN();
     }
 
+    // The margin at position 0, read from whichever side reported one. Both sides describe the same
+    // column there when they agreed on the token, so either is a fact about the decision being
+    // measured; a run that measured neither leaves this NaN rather than inventing a margin.
+    {
+        const auto at_zero = [](const std::vector<float>& margins) -> double {
+            if (margins.empty()) { return std::numeric_limits<double>::quiet_NaN(); }
+            return static_cast<double>(margins[0]);
+        };
+        const double baseline_margin = at_zero(sample.baseline_margins);
+        const double scr_margin      = at_zero(sample.scr_margins);
+        // The smaller is the conservative reading: it is the tightest lead either run had to overcome.
+        const double reported = std::min(baseline_margin, scr_margin);
+        if (std::isfinite(reported)) {
+            result.margins_available = true;
+            // An infinite margin is the degenerate single-candidate column, which is a real answer but
+            // not a finite one; it stays NaN so nothing downstream reads it as "infinitely confident".
+            result.first_token_margin = reported;
+        } else {
+            result.first_token_margin = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
     const std::size_t agreement_limit =
         std::min<std::size_t>(thresholds.agreement_prefix_tokens, tokens_overlap);
     result.agreement_compared = static_cast<std::uint32_t>(agreement_limit);
@@ -140,6 +162,30 @@ ScrQualityPromptResult evaluate_scr_prompt(const ScrQualitySample& sample,
     return result;
 }
 
+ScrQualityPromptResult evaluate_scr_prompt_against_control(const ScrQualitySample& sample,
+                                                           const ScrQualitySample& control,
+                                                           const ScrQualityThresholds& thresholds) {
+    ScrQualityPromptResult result = evaluate_scr_prompt(sample, thresholds);
+    const ScrQualityPromptResult floor = evaluate_scr_prompt(control, thresholds);
+
+    // A control with nothing to compare establishes no floor. Reporting zero here would be the exact
+    // mistake this function exists to prevent, in the one case where it is easiest to miss.
+    if (floor.compared_tokens == 0 || floor.logprobs_available == 0) { return result; }
+
+    result.control_available            = true;
+    result.floor_first_token_divergence = floor.first_token_divergence;
+    result.floor_mean_logprob_divergence = floor.mean_logprob_divergence;
+    if (std::isfinite(result.first_token_divergence) &&
+        std::isfinite(floor.first_token_divergence)) {
+        result.signal_first_token_divergence =
+            result.first_token_divergence - floor.first_token_divergence;
+        result.above_floor = result.first_token_divergence > floor.first_token_divergence;
+    } else {
+        result.signal_first_token_divergence = std::numeric_limits<double>::quiet_NaN();
+    }
+    return result;
+}
+
 ScrQualityReport evaluate_scr_quality(std::span<const ScrQualitySample> samples,
                                       const ScrQualityThresholds& thresholds) {
     ScrQualityReport report;
@@ -188,6 +234,16 @@ std::string format_scr_quality_json(const ScrQualityReport& report,
             << ",\"max_logprob_divergence\":" << format_number(prompt.max_logprob_divergence)
             << ",\"first_token_divergence\":" << format_number(prompt.first_token_divergence)
             << ",\"logprobs_finite\":" << (prompt.logprobs_finite ? "true" : "false")
+            << ",\"margins_available\":" << (prompt.margins_available ? "true" : "false")
+            << ",\"first_token_margin\":" << format_number(prompt.first_token_margin)
+            << ",\"control_available\":" << (prompt.control_available ? "true" : "false")
+            << ",\"floor_first_token_divergence\":"
+            << format_number(prompt.floor_first_token_divergence)
+            << ",\"floor_mean_logprob_divergence\":"
+            << format_number(prompt.floor_mean_logprob_divergence)
+            << ",\"signal_first_token_divergence\":"
+            << format_number(prompt.signal_first_token_divergence)
+            << ",\"above_floor\":" << (prompt.above_floor ? "true" : "false")
             << ",\"agreement_compared\":" << prompt.agreement_compared
             << ",\"agreement_matched\":" << prompt.agreement_matched
             << ",\"greedy_agreement\":" << format_number(prompt.greedy_agreement) << ",\"note\":\""

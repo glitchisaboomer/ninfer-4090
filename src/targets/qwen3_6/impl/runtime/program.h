@@ -438,6 +438,8 @@ public:
     // Logprob of the token a completing prefill picked. Prefill has no decode egress to carry it,
     // so it is drained next to `host_tokens` and published through PrefillStepResult::round.logprobs.
     float host_logprob = 0.0f;
+    // Decision margin beside `host_logprob`; see ops::logprob_of_choice.
+    float host_margin = 0.0f;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;

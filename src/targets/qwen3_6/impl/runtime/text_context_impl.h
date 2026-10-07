@@ -1190,7 +1190,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // The prompt's first generated token has no decode round behind it, so its logprob
                 // is emitted here. Without this the measurement Phase 5.5 of docs/SCR_ROADMAP.md
                 // wants would start one token late on both paths.
-                ops::logprob_of_choice(logits, io_.token, kCfg.token_domain, io_.logprob, s);
+                ops::logprob_of_choice(logits, io_.token, kCfg.token_domain, io_.logprob,
+                                       io_.margin, s);
             }
 
             if (prepare_mtp_prompt) {

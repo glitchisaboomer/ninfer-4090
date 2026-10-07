@@ -47,6 +47,11 @@ struct ScrQualitySample {
     // Greedy tokens each path produced, in generation order.
     std::vector<TokenId> baseline_tokens;
     std::vector<TokenId> scr_tokens;
+    // Best-minus-second-best logit gap per position, same order, optional. Without them a logprob
+    // difference cannot be read: the same difference means "it flipped a coin" when the leading
+    // candidates were a hair apart and "it moved a decision" when they were far apart.
+    std::vector<float> baseline_margins;
+    std::vector<float> scr_margins;
 };
 
 struct ScrQualityThresholds {
@@ -86,12 +91,40 @@ struct ScrQualityPromptResult {
     // it did not report a usable logprob. `first_nonfinite_index` then names the position.
     bool logprobs_finite        = true;
     std::uint32_t first_nonfinite_index = 0;
+    // The decision margin at the first position, from whichever side reported it. Small means the greedy
+    // token both paths agreed on was won by a hair, so a measured divergence there is the expected
+    // consequence of any perturbation at all rather than evidence of a large one. Large means the token
+    // was comfortably ahead and a flip would have required moving it a long way.
+    //
+    // Position 0 specifically, and not the minimum over the prefix: the quantity being explained is
+    // `first_token_divergence`, and pairing it with a margin from some other position would be a
+    // correlation rather than an explanation.
+    double first_token_margin = 0.0;
+    bool margins_available    = false;
+
     // Leading tokens the agreement was measured over, and how many matched. Unlike divergence this
     // stays index-aligned over the whole configured prefix: the roadmap's question is whether greedy
     // decoding flipped, and a flip is a disagreement wherever it lands.
     std::uint32_t agreement_compared = 0;
     std::uint32_t agreement_matched  = 0;
     double greedy_agreement          = 0.0;
+
+    // The null control's measurements on the same prompt: the same two-run comparison performed on
+    // two runs of one identical configuration. See evaluate_scr_prompt_against_control.
+    //
+    // These are *not* subtracted from the thresholds. A control establishes the run-to-run floor, and
+    // the floor is not zero -- two runs of one configuration pick the same tokens from logits that
+    // differ by a few thousandths of a nat -- so a raw measurement has to be read against it rather
+    // than against an implied zero.
+    bool control_available            = false;
+    double floor_first_token_divergence = 0.0;
+    double floor_mean_logprob_divergence = 0.0;
+    // `first_token_divergence` minus the floor: what the reuse path contributed rather than what the
+    // run-to-run variation contributed. Negative means the measurement sat inside the floor.
+    double signal_first_token_divergence = 0.0;
+    // Whether the measurement exceeded the floor. A plain comparison, stated as a fact -- this is not
+    // a significance test and carries no confidence claim, because one control run cannot support one.
+    bool above_floor = false;
 
     bool ok = false;
     // Why the prompt did not pass, empty when it did.
@@ -113,6 +146,27 @@ struct ScrQualityReport {
 // Score a suite in order, counting the prompts that passed.
 [[nodiscard]] ScrQualityReport evaluate_scr_quality(std::span<const ScrQualitySample> samples,
                                                     const ScrQualityThresholds& thresholds);
+
+// Score one prompt against a null control: the same comparison run on two executions of one identical
+// configuration, which is what measures the run-to-run floor.
+//
+// The floor exists because two runs of the same configuration are not bit-identical. Greedy token
+// choice proved stable across every prompt measured so far, while the logprobs behind it moved by up
+// to ~0.08 nats -- the argmax is insensitive to a perturbation that the logprob metric is not. So a
+// control that agrees on tokens says the *tokens* are reproducible; it says nothing about the logprobs
+// being so, and reading a raw measurement against an implied zero overstates whatever it reports.
+//
+// This fills the floor fields on the result and leaves `ok` exactly as evaluate_scr_prompt set it: the
+// roadmap's thresholds are stated against the measurement, not against a noise-corrected quantity, and
+// quietly moving the goalposts here would mean the score no longer means what the roadmap says.
+// Deciding what a given signal-to-floor ratio is worth is a threshold question and belongs with the
+// other thresholds, not in a comparison helper.
+//
+// `control` must describe the same prompt as `sample`; a control that measured nothing leaves the floor
+// fields at their defaults with `control_available` false rather than reporting a floor of zero.
+[[nodiscard]] ScrQualityPromptResult evaluate_scr_prompt_against_control(
+    const ScrQualitySample& sample, const ScrQualitySample& control,
+    const ScrQualityThresholds& thresholds);
 
 // Whether a null-control report is clean: every prompt's two runs chose the same token at every
 // position both sides had one.

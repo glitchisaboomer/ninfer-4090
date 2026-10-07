@@ -322,6 +322,8 @@ private:
         // quiet NaN, so the two vectors always describe the same tokens instead of silently
         // shifting out of step.
         std::vector<float> generated_logprobs;
+        // Parallel to `generated`, with the same NaN-for-unmeasured rule. See ops::logprob_of_choice.
+        std::vector<float> generated_margins;
         std::string content;
         std::string reasoning;
         std::optional<std::uint32_t> lane;
@@ -472,6 +474,7 @@ private:
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
         result.generated_logprobs      = std::move(request->generated_logprobs);
+        result.generated_margins       = std::move(request->generated_margins);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.reasoning_tokens        = request->output.reasoning_tokens();
@@ -516,7 +519,7 @@ private:
     }
 
     bool resolve_round(const std::shared_ptr<Request>& request, TokenId token, float logprob,
-                       bool cancel_at_boundary) {
+                       float margin, bool cancel_at_boundary) {
         const std::uint32_t lane = *request->lane;
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
@@ -534,6 +537,7 @@ private:
         }
         request->generated.push_back(token);
         request->generated_logprobs.push_back(logprob);
+        request->generated_margins.push_back(margin);
         instance_.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
         auto published = request->output.commit_preview();
@@ -735,7 +739,10 @@ private:
         const float logprob = step.round.logprobs.empty()
                                   ? std::numeric_limits<float>::quiet_NaN()
                                   : step.round.logprobs.front();
-        if (resolve_round(request, step.round.tokens.front(), logprob, false)) {
+        const float margin = step.round.margins.empty()
+                                 ? std::numeric_limits<float>::quiet_NaN()
+                                 : step.round.margins.front();
+        if (resolve_round(request, step.round.tokens.front(), logprob, margin, false)) {
             remove_completed_slot(*request->lane);
         } else {
             request->decode_ready = true;
@@ -930,6 +937,7 @@ private:
                                     summary.effective_limit_reason);
             request->generated.reserve(summary.effective_output_tokens);
             request->generated_logprobs.reserve(summary.effective_output_tokens);
+            request->generated_margins.reserve(summary.effective_output_tokens);
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
             request->remaining_service_work  = summary.service_work_quanta;
@@ -1187,12 +1195,25 @@ private:
                     request->generated_logprobs.insert(
                         request->generated_logprobs.end(), accepted[row],
                         std::numeric_limits<float>::quiet_NaN());
+                    request->generated_margins.insert(
+                        request->generated_margins.end(), accepted[row],
+                        std::numeric_limits<float>::quiet_NaN());
                 } else {
                     const auto row_logprobs =
                         round.logprobs.subspan(row * round.row_stride,
                                                static_cast<std::size_t>(accepted[row]));
                     request->generated_logprobs.insert(request->generated_logprobs.end(),
                                                        row_logprobs.begin(), row_logprobs.end());
+                }
+                if (round.margins.empty()) {
+                    request->generated_margins.insert(request->generated_margins.end(), accepted[row],
+                                                      std::numeric_limits<float>::quiet_NaN());
+                } else {
+                    const auto row_margins =
+                        round.margins.subspan(row * round.row_stride,
+                                              static_cast<std::size_t>(accepted[row]));
+                    request->generated_margins.insert(request->generated_margins.end(),
+                                                      row_margins.begin(), row_margins.end());
                 }
                 request->budget->commit(accepted[row]);
                 consume_service_work(request, accepted[row], ServiceWorkConsumer::Decode);

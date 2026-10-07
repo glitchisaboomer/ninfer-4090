@@ -157,7 +157,8 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     // would be compared from their second token on. Emitted before the workspace reset, on the
     // same stream, so it reads the logits column the sampler just consumed.
     ops::logprob_of_choice(logits, state.execution.io.token, TextConfig::token_domain,
-                           state.execution.io.logprob, state.execution.device.stream);
+                           state.execution.io.logprob, state.execution.io.margin,
+                           state.execution.device.stream);
     state.execution.work.reset();
 }
 

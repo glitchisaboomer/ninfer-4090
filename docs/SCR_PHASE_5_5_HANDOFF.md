@@ -90,11 +90,62 @@ The corrected run then produced this, which is *not* a result, only a reason to 
 K=2, the smallest at K=12. A relocation error that grows with the reused region does not look like
 that. A run-to-run floor of comparable size does. Hence the control.
 
+### The control is clean on tokens, and its logprobs still moved
+
+The 2026-10-08 control agreed with itself on **every token at every position** (`parted@ = 64`,
+agreement 1.0, all six prompts). So the early splits at token 6–8 are reproducible and belong to the
+reuse path — the nondeterminism hypothesis is dead.
+
+Its logprobs were **not** identical, though. `d(first)` ran 3e-4 to 1.8e-3 nats and `d(max)` reached
+0.080. An earlier version of the harness printed "the run-to-run floor is zero" on the strength of the
+token agreement; that sentence was false, and the control's own numbers contradicted it directly
+underneath. Greedy choice is insensitive to a perturbation the logprob metric is not.
+
+Subtracting the floor leaves **two of six prompts carrying signal**, reproducing across independent runs:
+
+| K | relocated | signal run 1 | signal run 2 | × floor |
+|---|---|---|---|---|
+| 1 | 64 | 0.00033 | 0.00106 | 0.6 |
+| 2 | 192 | 0.07465 | 0.07329 | **178** |
+| 3 | 256 | 0.00270 | −0.00080 | 1.7 |
+| 6 | 576 | 0.02006 | 0.02128 | **40** |
+| 12 | 1152 | −0.00012 | 0.00062 | 2.0 |
+| 64 | 6208 | 0.00177 | 0.00163 | 1.1 |
+
+K=3's signal changes *sign* between runs, which is what noise does. So the earlier reading had it
+backwards: the apparent K=2 anomaly is the most robust signal in the sweep, and K=12's pristine
+0.00018 was the noise.
+
+K=2 is nonetheless unexplained. It relocates the *least* context of any interesting prompt and shows the
+*most* perturbation. That inversion is the signature of a near-tie being tipped rather than of
+accumulated staleness — which is why the decision margin was added (see below) and why K=2 must not be
+called a defect until the margin says what the competing logits were.
+
+### What the margin settles
+
+`ops::logprob_of_choice` now also emits `margin[t]`, the gap in nats between the best and second-best
+logit. `d(first)` is the logprob of the *argmax*, so a near-tie turns a few thousandths of a nat into a
+large apparent divergence: the perturbation is real but the decision it overturned was decided by a
+hair. The margin separates "flipped a coin" from "moved a decision", and it rides in the same per-thread
+reduction state, so it costs one compare and one select per streamed logit and no second pass.
+
+The scorer reports `first_token_margin` — the margin at position 0, paired with the
+`first_token_divergence` it explains. A small margin with a large divergence is a coin flip; a large
+margin with a large divergence is a moved decision.
+
+The floor itself is reported per prompt rather than subtracted from the thresholds.
+`evaluate_scr_prompt_against_control` fills `floor_*` and `signal_*` and leaves `ok` exactly as
+`evaluate_scr_prompt` set it: the roadmap's bounds are stated against the measurement, and quietly
+scoring a noise-corrected quantity instead would mean the score no longer means what the roadmap says.
+What a given signal-to-floor ratio is *worth* is a threshold question and belongs with the other
+thresholds.
+
 ### How to read the control
 
 - **Control clean** (`parted@ == logprobs_available` everywhere, `attributable: true`, exit 0): the
-  floor is zero, `d(first)` is genuinely the reuse path, and `parted@` of 6–8 is a real finding about
-  relocation worth chasing hard.
+  *token stream* is reproducible, so `parted@` of 6–8 is a real finding about relocation worth chasing
+  hard. It does **not** mean the logprobs matched — read `d(first)` against the `floor` column the
+  harness now prints, never against zero.
 - **Control dirty** (`attributable: false`, exit 3): two identical configurations disagreed, so
   `d(first)` has no floor to subtract and says nothing about SCR. The work is then determinism, not
   quality. The report is still written, because it is the evidence for *why* it is unattributable.

@@ -87,8 +87,22 @@ LoggedCompletion parse_record_checked(const Json& record) {
         throw std::invalid_argument(
             "request log carries a different number of tokens and logprobs");
     }
+    // The margin array was added with schema 9 alongside the logprobs. A record without it parsed
+    // fine and has nothing to say about decision margins, which is not a failure: the scorer treats an
+    // absent margin as unmeasured rather than as zero.
+    static const Json kNoMargins = Json::array();
+    const auto margin_it         = generated->find("margins");
+    const Json& margins = margin_it == generated->end() ? kNoMargins : *margin_it;
+    if (!margins.is_array()) {
+        throw std::invalid_argument("request log result.generated.margins is malformed");
+    }
+    if (margins.size() != 0 && margins.size() != tokens->size()) {
+        throw std::invalid_argument(
+            "request log carries a different number of tokens and margins");
+    }
     completion.generated_token_ids.reserve(tokens->size());
     completion.generated_logprobs.reserve(probs->size());
+    completion.generated_margins.reserve(margins.size());
     for (const Json& token : *tokens) {
         if (!token.is_number_integer()) {
             throw std::invalid_argument("request log token id is not an integer");
@@ -106,6 +120,18 @@ LoggedCompletion parse_record_checked(const Json& record) {
             throw std::invalid_argument("request log logprob is neither a number nor null");
         }
         completion.generated_logprobs.push_back(prob.get<float>());
+    }
+    for (const Json& margin : margins) {
+        // Same spelling as the logprob: null means the path measured no margin, which includes the
+        // degenerate single-candidate column the Op reports as +inf.
+        if (margin.is_null()) {
+            completion.generated_margins.push_back(std::numeric_limits<float>::quiet_NaN());
+            continue;
+        }
+        if (!margin.is_number()) {
+            throw std::invalid_argument("request log margin is neither a number nor null");
+        }
+        completion.generated_margins.push_back(margin.get<float>());
     }
     return completion;
 }
@@ -171,6 +197,8 @@ pair_samples(std::span<const LoggedCompletion> scr, std::span<const LoggedComple
         sample.scr_logprobs      = scr_completion.generated_logprobs;
         sample.baseline_tokens   = baseline_completion.generated_token_ids;
         sample.scr_tokens        = scr_completion.generated_token_ids;
+        sample.baseline_margins  = baseline_completion.generated_margins;
+        sample.scr_margins       = scr_completion.generated_margins;
         samples.push_back(std::move(sample));
     }
     return samples;

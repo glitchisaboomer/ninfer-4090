@@ -74,6 +74,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     layout.rope_delta = add_tensor(builder, DType::I32, {1}, "step rope delta");
     layout.logits     = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
     layout.logprob    = add_tensor(builder, DType::FP32, {1}, "step logprob");
+    layout.margin     = add_tensor(builder, DType::FP32, {1}, "step margin");
     layout.text_kv_table_row    = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     layout.backend_kv_table_row = add_tensor(builder, DType::I32, {1}, "step backend KV table row");
     return layout;
@@ -109,6 +110,9 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     sampled_logprobs = Tensor(static_cast<unsigned char*>(egress.data) +
                                   offsetof(OrdinaryDecodeEgress, sampled_logprobs),
                               DType::FP32, {count});
+    sampled_margins  = Tensor(static_cast<unsigned char*>(egress.data) +
+                                 offsetof(OrdinaryDecodeEgress, sampled_margins),
+                             DType::FP32, {count});
     logits           = layout.logits.bind(backing);
     hidden           = layout.hidden.bind(backing);
 }
@@ -355,6 +359,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     rope_delta           = layout.rope_delta.bind(backing);
     logits               = layout.logits.bind(backing);
     logprob              = layout.logprob.bind(backing);
+    margin               = layout.margin.bind(backing);
     text_kv_table_row    = layout.text_kv_table_row.bind(backing);
     backend_kv_table_row = layout.backend_kv_table_row.bind(backing);
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }

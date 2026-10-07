@@ -545,20 +545,34 @@ select_edited(const std::vector<ninfer::serve::LoggedCompletion>& completions, b
 // then wanders for 60 more tokens.
 void print_curve(const char* title, const std::vector<SuitePrompt>& prompts,
                  const std::vector<ninfer::serve::LoggedCompletion>& edited,
-                 const ninfer::targets::qwen3_6::detail::ScrQualityReport& scored) {
+                 const ninfer::targets::qwen3_6::detail::ScrQualityReport& scored,
+                 bool with_floor) {
     std::cerr << "\n" << title << "\n\n";
-    std::cerr << "  K   prompt  relocated   parted@   d(first)   d(mean)   d(max)   agree   "
-                 "verdict\n";
+    if (with_floor) {
+        std::cerr << "  K   prompt  relocated  parted@  d(first)   floor    signal   "
+                     "margin    d(mean)  agree  verdict\n";
+    } else {
+        std::cerr << "  K   prompt  relocated  parted@  d(first)     margin    d(mean)  "
+                     "agree  verdict\n";
+    }
     std::cerr << "  ----------------------------------------------------------------------"
-                 "----------\n";
+                 "---------------\n";
     for (std::size_t i = 0; i < scored.prompts.size() && i < prompts.size(); ++i) {
         const auto& result = scored.prompts[i];
         std::ostringstream row;
         row << "  " << prompts[i].name << "  " << edited[i].prompt_tokens << "  "
-            << edited[i].prefix_relocated_tokens << "  " << result.first_divergence_index << "  "
-            << result.first_token_divergence << "  " << result.mean_logprob_divergence << "  "
-            << result.max_logprob_divergence << "  " << result.greedy_agreement << "   "
-            << (result.ok ? "pass" : "FAIL") << "\n";
+            << edited[i].prefix_relocated_tokens << "  " << result.first_divergence_index;
+        if (with_floor) {
+            // signal = d(first) - floor. Negative means the measurement sat inside the run-to-run
+            // variation, which is the reading that matters: it is not a small perturbation, it is an
+            // unmeasurable one.
+            row << "  " << result.first_token_divergence << "  "
+                << result.floor_first_token_divergence << "  " << result.signal_first_token_divergence;
+        } else {
+            row << "  " << result.first_token_divergence;
+        }
+        row << "  " << result.first_token_margin << "  " << result.mean_logprob_divergence << "  "
+            << result.greedy_agreement << "  " << (result.ok ? "pass" : "FAIL") << "\n";
         std::cerr << row.str();
     }
 }
@@ -609,20 +623,32 @@ int main(int argc, char** argv) {
         const ninfer::targets::qwen3_6::detail::ScrQualityThresholds thresholds;
         // Throws when a prompt relocated nothing: a suite that never engaged Suffix Cache Reuse
         // would otherwise compare two full prefills and read as a pass.
-        const auto scored = ninfer::serve::evaluate_scr_quality_report(scr_edited, baseline_edited,
-                                                                      thresholds);
+        // Scored twice over: once on its own, and once paired with the control so each prompt carries
+        // the floor it has to be read against. Same thresholds, same function, no second arithmetic.
+        auto scored = ninfer::serve::evaluate_scr_quality_report(scr_edited, baseline_edited,
+                                                                 thresholds);
         // Scored through its own entry point because the control relocates nothing by construction,
         // which is precisely what pair_scr_quality_samples refuses.
         const auto control =
             ninfer::serve::evaluate_scr_quality_control(baseline_edited, control_edited, thresholds);
+        {
+            const auto measurement_samples =
+                ninfer::serve::pair_scr_quality_samples(scr_edited, baseline_edited);
+            const auto control_samples =
+                ninfer::serve::pair_scr_quality_samples_for_control(baseline_edited, control_edited);
+            for (std::size_t i = 0; i < scored.prompts.size() && i < control_samples.size(); ++i) {
+                scored.prompts[i] = ninfer::targets::qwen3_6::detail::evaluate_scr_prompt_against_control(
+                    measurement_samples[i], control_samples[i], thresholds);
+            }
+        }
         const std::vector<std::uint32_t> unattributable =
             ninfer::targets::qwen3_6::detail::scr_quality_control_divergent_prompts(control);
         const bool attributable =
             ninfer::targets::qwen3_6::detail::scr_quality_control_is_clean(control);
 
-        print_curve("MEASUREMENT  scr vs baseline", prompts, scr_edited, scored);
+        print_curve("MEASUREMENT  scr vs baseline", prompts, scr_edited, scored, true);
         print_curve("CONTROL  baseline vs baseline (the noise floor)", prompts, baseline_edited,
-                    control);
+                    control, false);
 
         std::cerr << "\n  parted@ is the first greedy token the two runs disagreed on, so the columns "
                      "to its right\n  describe a prefix both runs chose identically and are "
@@ -656,18 +682,25 @@ int main(int argc, char** argv) {
             std::remove(control_log.c_str());
         }
         if (!attributable) {
-            std::cerr << "\nUNATTRIBUTABLE: the control parted from itself on prompt(s) ";
+            std::cerr << "\nUNATTRIBUTABLE: the control chose a different token than itself on "
+                         "prompt(s) ";
             for (std::size_t i = 0; i < unattributable.size(); ++i) {
                 std::cerr << (i == 0 ? "" : ", ") << unattributable[i];
             }
-            std::cerr << ".\n  Two runs of the same configuration disagreed there, so the "
-                         "measurement's divergence\n  for those prompts has no floor to subtract and "
-                         "says nothing about Suffix\n  Cache Reuse. Settle run-to-run determinism "
+            std::cerr << ".\n  Two runs of the same configuration disagreed there, so the token "
+                         "stream itself is not\n  reproducible and the measurement's divergence for "
+                         "those prompts has no floor to\n  subtract. Settle run-to-run determinism "
                          "before reading them.\n";
             return 3;
         }
-        std::cerr << "\nThe control agreed with itself on every prompt, so the run-to-run floor is "
-                     "zero and the\n  measurement above is attributable to the reuse path.\n";
+        // The control agreeing on tokens is NOT a statement that the logprobs matched: greedy choice is
+        // insensitive to a perturbation the logprob metric is not, and the measured floor is a few
+        // thousandths of a nat with occasional excursions an order of magnitude higher. An earlier
+        // version of this message claimed the floor was zero, which the control's own numbers
+        // contradicted directly underneath it.
+        std::cerr << "\nThe control chose the same token as itself at every position, so the greedy "
+                     "token stream is\n  reproducible run to run. Its logprobs were not identical: "
+                     "read d(first) against the floor column,\n  not against zero.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << "\n";

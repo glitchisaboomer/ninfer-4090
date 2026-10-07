@@ -2115,6 +2115,8 @@ void ProgramImplCore::copy_round_token() {
     // Drained together with the token so the two can never be observed from different rounds.
     CUDA_CHECK(cudaMemcpyAsync(&host_logprob, io.logprob.data, sizeof(float), cudaMemcpyDeviceToHost,
                                device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(&host_margin, io.margin.data, sizeof(float), cudaMemcpyDeviceToHost,
+                               device.stream));
 }
 
 void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
@@ -2436,7 +2438,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         return runtime::PrefillStepResult{
             .summary = summary,
             .round   = runtime::GeneratedRound{.tokens   = std::span<const TokenId>(host_tokens, 1),
-                                               .logprobs = std::span<const float>(&host_logprob, 1)},
+                                               .logprobs = std::span<const float>(&host_logprob, 1),
+                                               .margins  = std::span<const float>(&host_margin, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
             .host_input_consumed     = host_input_consumed,
@@ -2547,6 +2550,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
                                                lanes.size()),
             .logprobs = std::span<const float>(ordinary_host_egress->sampled_logprobs.data(),
+                                               lanes.size()),
+            .margins  = std::span<const float>(ordinary_host_egress->sampled_margins.data(),
                                                lanes.size())};
     } catch (...) {
         try {

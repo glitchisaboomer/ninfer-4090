@@ -19,6 +19,7 @@ namespace {
 
 using ninfer::TokenId;
 using ninfer::targets::qwen3_6::detail::evaluate_scr_prompt;
+using ninfer::targets::qwen3_6::detail::evaluate_scr_prompt_against_control;
 using ninfer::targets::qwen3_6::detail::evaluate_scr_quality;
 using ninfer::targets::qwen3_6::detail::format_scr_quality_json;
 using ninfer::targets::qwen3_6::detail::ScrQualityReport;
@@ -339,6 +340,94 @@ void test_control_cleanliness_gates_attribution() {
            "a control whose tokens all match is clean however large the logprob difference");
 }
 
+// The measurement has to be read against the floor, because two runs of one configuration are not
+// bit-identical. An earlier version of the harness asserted the floor was zero; the control's own
+// numbers contradicted that directly underneath the claim.
+void test_the_floor_is_subtracted_not_assumed() {
+    const ScrQualityThresholds thresholds;
+
+    // A measurement of 0.005 nats against a floor of 0.003 is a 0.002 signal, not a 0.005 effect.
+    ScrQualitySample measurement = agreeing(64, 0.005);
+    ScrQualitySample floor       = agreeing(64, 0.003);
+    const auto result = evaluate_scr_prompt_against_control(measurement, floor, thresholds);
+    expect(result.control_available, "the control was read");
+    expect(result.floor_first_token_divergence > 0.0029 &&
+               result.floor_first_token_divergence < 0.0031,
+           "the floor is reported as measured");
+    expect(result.signal_first_token_divergence > 0.0019 &&
+               result.signal_first_token_divergence < 0.0021,
+           "the signal is the measurement minus the floor");
+    expect(result.above_floor, "the measurement exceeded the floor");
+
+    // A measurement smaller than the floor is *not* a small effect -- it is inside the run-to-run
+    // variation, and reporting it as a positive number is how the earlier reading went wrong.
+    ScrQualitySample buried = agreeing(64, 0.0002);
+    const auto inside = evaluate_scr_prompt_against_control(buried, floor, thresholds);
+    expect(!inside.above_floor, "a measurement inside the floor does not claim to exceed it");
+    expect(inside.signal_first_token_divergence < 0.0, "its signal is negative");
+
+    // The floor does not move the verdict. The roadmap's thresholds are stated against the
+    // measurement, so a noise-corrected number must not quietly become the thing being scored.
+    expect(result.ok == evaluate_scr_prompt(measurement, thresholds).ok,
+           "scoring against a control leaves the verdict alone");
+
+    // A control with nothing to compare establishes no floor. Reporting zero here would be the exact
+    // mistake this function exists to prevent, in the case where it is easiest to miss.
+    const auto no_control = evaluate_scr_prompt_against_control(measurement, ScrQualitySample{},
+                                                                thresholds);
+    expect(!no_control.control_available, "an empty control reports no floor");
+    expect(no_control.signal_first_token_divergence == 0.0,
+           "and does not manufacture a zero signal");
+}
+
+// Without margins a logprob difference cannot be read at all: 0.005 nats is a coin flip when the two
+// leading candidates were 0.002 apart and a moved decision when they were 4 nats apart.
+void test_the_margin_is_reported_at_the_first_position() {
+    const ScrQualityThresholds thresholds;
+
+    ScrQualitySample tied = agreeing(64, 0.005);
+    tied.baseline_margins = {0.002F, 9.0F};
+    tied.scr_margins      = {0.002F, 9.0F};
+    const auto near_tie = evaluate_scr_prompt(tied, thresholds);
+    expect(near_tie.margins_available, "a reported margin is used");
+    expect(near_tie.first_token_margin > 0.0019 && near_tie.first_token_margin < 0.0021,
+           "the margin at position 0 is reported");
+
+    // Only one side measured it. Both sides describe the same column when they agreed on the token, so
+    // the one report is still a fact about the decision being explained.
+    ScrQualitySample one_sided = agreeing(64, 0.005);
+    one_sided.baseline_margins = {3.0F};
+    const auto partial = evaluate_scr_prompt(one_sided, thresholds);
+    expect(partial.margins_available && partial.first_token_margin > 2.9 &&
+               partial.first_token_margin < 3.1,
+           "a margin from one side is used when the other measured none");
+
+    // The smaller of the two is the conservative reading: it is the tightest lead either run had.
+    ScrQualitySample split = agreeing(64, 0.005);
+    split.baseline_margins = {4.0F};
+    split.scr_margins      = {0.5F};
+    expect(evaluate_scr_prompt(split, thresholds).first_token_margin < 0.6,
+           "the smaller margin of the two is reported");
+
+    // No margin at all leaves it unmeasured rather than reading as "infinitely confident".
+    ScrQualitySample bare = agreeing(64, 0.005);
+    const auto none = evaluate_scr_prompt(bare, thresholds);
+    expect(!none.margins_available, "no margin reported means none available");
+    expect(std::isnan(none.first_token_margin), "and the margin is NaN, not zero");
+
+    // An empty margin span must not be indexed as though it had a position 0.
+    ScrQualitySample empty_margins = agreeing(4, 0.0);
+    expect(!evaluate_scr_prompt(empty_margins, thresholds).margins_available,
+           "an empty margin span is not read as a margin");
+
+    // The margin is read at position 0 only. A large margin at some later position says nothing about
+    // the first_token_divergence it is reported beside.
+    ScrQualitySample later_only = agreeing(64, 0.005);
+    later_only.baseline_margins = {0.0F, 0.0F, 50.0F};
+    expect(evaluate_scr_prompt(later_only, thresholds).first_token_margin < 0.001,
+           "the margin is position 0's, not the largest in the prefix");
+}
+
 void test_json_report() {
     const ScrQualityThresholds thresholds;
     std::vector<ScrQualitySample> samples{agreeing(64, 0.0), agreeing(64, 0.5)};
@@ -370,6 +459,8 @@ int main() {
     test_differing_first_tokens_is_not_a_vacuous_pass();
     test_non_finite_logprobs_are_reported_not_averaged();
     test_control_cleanliness_gates_attribution();
+    test_the_floor_is_subtracted_not_assumed();
+    test_the_margin_is_reported_at_the_first_position();
     test_unmeasured_inputs_fail();
     test_report_aggregates();
     test_json_report();

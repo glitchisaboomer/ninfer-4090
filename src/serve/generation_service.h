@@ -56,6 +56,8 @@ struct GenerationOutcome {
     // tokens; the JSON writer emits null for those rather than a number JSON cannot represent.
     std::vector<ninfer::TokenId> generated_token_ids;
     std::vector<float> generated_logprobs;
+    // Parallel to `generated_logprobs`; see ops::logprob_of_choice.
+    std::vector<float> generated_margins;
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;

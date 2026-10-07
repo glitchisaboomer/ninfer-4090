@@ -471,6 +471,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     // logprobs are diagnostic-only, so no protocol translation has to learn about them.
     outcome.generated_token_ids = std::move(result.generated_token_ids);
     outcome.generated_logprobs  = std::move(result.generated_logprobs);
+    outcome.generated_margins   = std::move(result.generated_margins);
     outcome.finish_reason     = result.finish_reason;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;

@@ -38,6 +38,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
         Tensor sampled          = ordinary.sampled_tokens.slice(0, 0, batch_size);
         Tensor sampled_logprobs = ordinary.sampled_logprobs.slice(0, 0, batch_size);
+        Tensor sampled_margins  = ordinary.sampled_margins.slice(0, 0, batch_size);
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
@@ -48,7 +49,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         // Rows at and past `token_domain` are output padding and must not enter the log-sum-exp.
         // `sampled` is already the sampler's pick, so this can never disagree with the token.
         ops::logprob_of_choice(logits, sampled, TextConfig::token_domain, sampled_logprobs,
-                               state.execution.device.stream);
+                               sampled_margins, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

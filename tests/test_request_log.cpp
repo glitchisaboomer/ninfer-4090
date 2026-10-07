@@ -232,6 +232,11 @@ int main() {
     // null rather than as a number that claims a measurement nobody made.
     outcome.generated_token_ids = {11, 22, 33};
     outcome.generated_logprobs  = {0.5f, std::numeric_limits<float>::quiet_NaN(), -1.25f};
+    // Margins carry the same null-for-unmeasured rule, and a +inf margin -- the degenerate
+    // single-candidate column ops::logprob_of_choice reports -- must also land as null, since JSON has
+    // no infinity and writing a number there would claim a confidence that was never measured.
+    outcome.generated_margins   = {2.5f, std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::infinity()};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -247,6 +252,10 @@ int main() {
     failures += check(done.at("result").at("generated").at("logprobs") ==
                           Json::array({0.5, nullptr, -1.25}),
                       "generated logprobs missing, or an unmeasured token was written as a number");
+    failures += check(done.at("result").at("generated").at("margins") ==
+                          Json::array({2.5, nullptr, nullptr}),
+                      "generated margins missing, or an unmeasured/infinite margin was written as a "
+                      "number");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");

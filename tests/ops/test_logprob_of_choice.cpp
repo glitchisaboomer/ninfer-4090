@@ -61,11 +61,30 @@ double oracle_logprob(const std::vector<double>& column, std::int32_t chosen) {
 // magnitude, so the separation is wide either way.
 constexpr double kTolerance = 2.0e-5;
 
+// FP64 top-two gap of one column, from the exact values the Op will read: the largest value minus the
+// largest strictly-smaller one. Returns +inf for a single valid row, which is what the Op emits there.
+double oracle_margin(const std::vector<double>& column, std::int32_t valid_rows) {
+    double top = -std::numeric_limits<double>::infinity();
+    double next = -std::numeric_limits<double>::infinity();
+    for (std::int32_t v = 0; v < valid_rows; ++v) {
+        const double value = column[static_cast<std::size_t>(v)];
+        if (value > top) {
+            next = top;
+            top  = value;
+        } else if (value > next) {
+            next = value;
+        }
+    }
+    return top - next;
+}
+
 struct Columns {
     __nv_bfloat16* device_logits  = nullptr;
     std::int32_t* device_chosen   = nullptr;
     float* device_out            = nullptr;
+    float* device_margin          = nullptr;
     std::vector<float> host_out;
+    std::vector<float> host_margin;
     std::int32_t physical_rows   = 0;
     std::int32_t count           = 0;
 
@@ -92,7 +111,9 @@ struct Columns {
         CUDA_CHECK(cudaMalloc(&device_chosen,
                               static_cast<std::size_t>(count) * sizeof(std::int32_t)));
         CUDA_CHECK(cudaMalloc(&device_out, static_cast<std::size_t>(count) * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&device_margin, static_cast<std::size_t>(count) * sizeof(float)));
         host_out.assign(static_cast<std::size_t>(count), 0.0F);
+        host_margin.assign(static_cast<std::size_t>(count), 0.0F);
     }
     Columns(const Columns&)            = delete;
     Columns& operator=(const Columns&) = delete;
@@ -100,6 +121,7 @@ struct Columns {
         if (device_logits != nullptr) { (void)cudaFree(device_logits); }
         if (device_chosen != nullptr) { (void)cudaFree(device_chosen); }
         if (device_out != nullptr) { (void)cudaFree(device_out); }
+        if (device_margin != nullptr) { (void)cudaFree(device_margin); }
     }
 
     [[nodiscard]] ninfer::Tensor logits() const {
@@ -111,9 +133,14 @@ struct Columns {
     [[nodiscard]] ninfer::Tensor out() const {
         return ninfer::Tensor(device_out, ninfer::DType::FP32, {count});
     }
+    [[nodiscard]] ninfer::Tensor margin() const {
+        return ninfer::Tensor(device_margin, ninfer::DType::FP32, {count});
+    }
     void read_back() {
         CUDA_CHECK(cudaMemcpy(host_out.data(), device_out, host_out.size() * sizeof(float),
                               cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host_margin.data(), device_margin,
+                              host_margin.size() * sizeof(float), cudaMemcpyDeviceToHost));
     }
 };
 
@@ -133,7 +160,8 @@ void check(const std::vector<std::vector<double>>& columns,
                           cudaMemcpyHostToDevice));
 
     ninfer::Tensor out = state.out();
-    ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), valid_rows, out, nullptr);
+    ninfer::Tensor margin = state.margin();
+    ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), valid_rows, out, margin, nullptr);
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     CUDA_CHECK(cudaGetLastError());
 
@@ -161,6 +189,45 @@ void check(const std::vector<std::vector<double>>& columns,
             worst   = error;
             worst_t = static_cast<std::int32_t>(t);
         }
+    }
+
+    char buf0[256];
+    // The margin is a difference of two logits, so it is exact in FP32 -- no reduction, no exp, and
+    // both operands are BF16 values widened without loss. Compared exactly, not with a tolerance: a
+    // merge that dropped the losing partial's maximum would still land near the right answer and would
+    // pass any loose bound.
+    double margin_worst = 0.0;
+    std::int32_t margin_worst_t = -1;
+    for (std::size_t t = 0; t < state.host_margin.size(); ++t) {
+        std::vector<double> column;
+        column.reserve(static_cast<std::size_t>(valid_rows));
+        for (std::int32_t v = 0; v < valid_rows; ++v) {
+            column.push_back(to_double(to_bf16(columns[t][static_cast<std::size_t>(v)])));
+        }
+        const double expected = oracle_margin(column, valid_rows);
+        const double got      = state.host_margin[t];
+        if (expected > 1.0e30) {
+            // A single valid row has no runner-up; the Op must say so rather than report a confident 0.
+            if (!std::isinf(got) || got < 0.0) {
+                std::snprintf(buf0, sizeof(buf0), "%s: single-candidate column reported margin %g",
+                              label.c_str(), got);
+                fail(buf0);
+                return;
+            }
+            continue;
+        }
+        const double error = std::fabs(got - expected);
+        if (error > margin_worst) {
+            margin_worst   = error;
+            margin_worst_t = static_cast<std::int32_t>(t);
+        }
+    }
+    if (margin_worst != 0.0) {
+        std::snprintf(buf0, sizeof(buf0),
+                      "%s: worst margin error %.3e at column %d (must be exact)",
+                      label.c_str(), margin_worst, margin_worst_t);
+        fail(buf0);
+        return;
     }
 
     char buf[256];
@@ -253,6 +320,36 @@ int main() {
         check(columns, picks, 1, 1, "single-row vocabulary is exactly zero");
     }
 
+    // A near-tie at the top, which is the whole reason the margin is reported: the winner is decided by
+    // a fraction of a nat, so any perturbation of that size legitimately swaps it.
+    {
+        std::vector<std::vector<double>> columns{
+            {10.0, 9.999, 1.0, 0.5},
+            {10.0, 9.996, 2.0, 0.25},
+            {4.0, 3.5, 3.0, 2.5},
+            // The two leading values are equal, so the margin is exactly zero and must read as a tie
+            // rather than as whichever one the reduction happened to visit last.
+            {7.25, 7.25, 0.0, -1.0},
+            // The maximum appears more than once: the runner-up is the other copy of it, so the gap is
+            // zero even though the top value is strictly greater than everything else in the column.
+            {6.5, 6.5, 6.5, 0.0},
+            // Descending, so the runner-up is the *second* element and a merge that only tracked the
+            // per-thread maximum would report the tail instead.
+            {9.0, 8.0, 7.0, 6.0, 5.0, 4.0},
+        };
+        const std::vector<std::int32_t> picks{0, 0, 0, 0, 0, 0};
+        check(columns, picks, 6, 6, "near-ties, equal maxima, descending order");
+    }
+
+    // Two valid rows out of many, so the runner-up is found in a domain where most values are padding.
+    {
+        constexpr std::int32_t kRows  = 1031;
+        constexpr std::int32_t kValid = 2;
+        std::vector<std::vector<double>> columns{{12.0, 4.0}, {5.0, 5.0}, {-1.0, 8.0}};
+        const std::vector<std::int32_t> picks{0, 1, 1};
+        check(columns, picks, kRows, kValid, "two valid rows, margin excludes padding");
+    }
+
     // A tiny vocabulary, so the block reduction combines mostly empty partials.
     {
         std::vector<std::vector<double>> columns{{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0}};
@@ -268,32 +365,54 @@ int main() {
         CUDA_CHECK(cudaMemcpy(state.device_chosen, &pick, sizeof(pick), cudaMemcpyHostToDevice));
 
         ninfer::Tensor good_out   = state.out();
+        ninfer::Tensor good_margin = state.margin();
         ninfer::Tensor bad_logits = state.logits();
         bad_logits.ne[1]          = 2;
 
         expect_throw([&] {
-            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 0, good_out, nullptr);
+            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 0, good_out, good_margin,
+                                           nullptr);
         }, "valid_rows == 0");
         expect_throw([&] {
-            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 4, good_out, nullptr);
+            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 4, good_out, good_margin,
+                                           nullptr);
         }, "valid_rows past the physical rows");
         // Each case must hand the Op a tensor of the *wrong* dtype. Copying a correctly typed view and
         // expecting a rejection would test nothing, which is what the first version of these cases did.
         expect_throw([&] {
             ninfer::Tensor wrong(state.device_out, ninfer::DType::BF16, {1});
-            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 3, wrong, nullptr);
+            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 3, wrong, good_margin,
+                                           nullptr);
         }, "out of the wrong dtype");
         expect_throw([&] {
+            ninfer::Tensor wrong(state.device_margin, ninfer::DType::BF16, {1});
+            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 3, good_out, wrong,
+                                           nullptr);
+        }, "margin of the wrong dtype");
+        expect_throw([&] {
             ninfer::Tensor wrong(state.device_chosen, ninfer::DType::FP32, {1});
-            ninfer::ops::logprob_of_choice(state.logits(), wrong, 3, good_out, nullptr);
+            ninfer::ops::logprob_of_choice(state.logits(), wrong, 3, good_out, good_margin, nullptr);
         }, "chosen of the wrong dtype");
         expect_throw([&] {
             ninfer::Tensor wrong(state.device_logits, ninfer::DType::FP32, {3, 1});
-            ninfer::ops::logprob_of_choice(wrong, state.chosen(), 3, good_out, nullptr);
+            ninfer::ops::logprob_of_choice(wrong, state.chosen(), 3, good_out, good_margin, nullptr);
         }, "logits of the wrong dtype");
         expect_throw([&] {
-            ninfer::ops::logprob_of_choice(bad_logits, state.chosen(), 3, good_out, nullptr);
+            ninfer::ops::logprob_of_choice(bad_logits, state.chosen(), 3, good_out, good_margin,
+                                           nullptr);
         }, "chosen length not matching T");
+        expect_throw([&] {
+            ninfer::Tensor wrong(state.device_margin, ninfer::DType::FP32, {2});
+            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 3, good_out, wrong,
+                                           nullptr);
+        }, "margin length not matching T");
+        // The two outputs are written by the same thread in the same kernel, so aliasing them would
+        // silently clobber one rather than fail. Pointed at the same storage on purpose here.
+        expect_throw([&] {
+            ninfer::Tensor aliased(state.device_out, ninfer::DType::FP32, {1});
+            ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 3, good_out, aliased,
+                                           nullptr);
+        }, "margin aliasing out");
 
         if (failures == 0) { std::printf("  validation rejections: ok\n"); }
     }

@@ -45,6 +45,10 @@ struct OrdinaryDecodeEgress {
     // switched this off would fork the captured CUDA graph for no measurable gain against a decode
     // step's weight traffic.
     std::array<float, kMaximumConcurrency> sampled_logprobs{};
+    // Gap in nats between the best and second-best logit for each decode column. Emitted alongside
+    // `sampled_logprobs` for the same reason: a logprob difference only means something once the
+    // reader knows how far apart the leading candidates were. See ops::logprob_of_choice.
+    std::array<float, kMaximumConcurrency> sampled_margins{};
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
@@ -157,6 +161,7 @@ struct RoundStateLayout {
     // Logprob of the token a prefill picked from `logits`. Prefill has no egress POD to carry it,
     // so the single value rides the round state and is drained next to `token`.
     TensorRegion logprob;
+    TensorRegion margin;
     TensorRegion text_kv_table_row;
     TensorRegion backend_kv_table_row;
     std::optional<MtpPrefillStateLayout> mtp;
@@ -177,6 +182,7 @@ struct OrdinaryDecodeState {
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor sampled_logprobs;
+    Tensor sampled_margins;
     Tensor logits;
     Tensor hidden;
 
@@ -289,6 +295,7 @@ struct RoundState {
     Tensor rope_delta;
     Tensor logits;
     Tensor logprob;
+    Tensor margin;
     Tensor text_kv_table_row;
     Tensor backend_kv_table_row;
     std::optional<MtpPrefillState> mtp;

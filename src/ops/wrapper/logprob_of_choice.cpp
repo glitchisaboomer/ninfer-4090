@@ -28,7 +28,7 @@ void require_rank1(const Tensor& tensor, std::int32_t expected, const char* op, 
 } // namespace
 
 void logprob_of_choice(const Tensor& logits, const Tensor& chosen, std::int32_t valid_rows,
-                       Tensor& out, cudaStream_t stream) {
+                       Tensor& out, Tensor& margin, cudaStream_t stream) {
     constexpr const char* op = "logprob_of_choice";
 
     if (logits.dtype != DType::BF16) {
@@ -39,6 +39,9 @@ void logprob_of_choice(const Tensor& logits, const Tensor& chosen, std::int32_t 
     }
     if (out.dtype != DType::FP32) {
         throw std::invalid_argument(std::string(op) + ": out must be FP32");
+    }
+    if (margin.dtype != DType::FP32) {
+        throw std::invalid_argument(std::string(op) + ": margin must be FP32");
     }
     if (logits.ne[1] <= 0) {
         throw std::invalid_argument(std::string(op) + ": T must be positive");
@@ -53,15 +56,30 @@ void logprob_of_choice(const Tensor& logits, const Tensor& chosen, std::int32_t 
     require_rank2_logits(logits, op);
     require_rank1(chosen, logits.ne[1], op, "chosen");
     require_rank1(out, logits.ne[1], op, "out");
+    require_rank1(margin, logits.ne[1], op, "margin");
 
-    if (!logits.is_contiguous() || !chosen.is_contiguous() || !out.is_contiguous()) {
+    if (!logits.is_contiguous() || !chosen.is_contiguous() || !out.is_contiguous() ||
+        !margin.is_contiguous()) {
         throw std::invalid_argument(std::string(op) + ": all tensors must be contiguous");
     }
-    if (logits.data == nullptr || chosen.data == nullptr || out.data == nullptr) {
+    if (logits.data == nullptr || chosen.data == nullptr || out.data == nullptr ||
+        margin.data == nullptr) {
         throw std::invalid_argument(std::string(op) + ": all tensors must be non-null");
     }
+    // The two outputs are written independently by the same thread, so sharing storage would make one
+    // silently clobber the other rather than fail.
+    const auto overlaps = [](const Tensor& a, const Tensor& b) {
+        const auto left  = reinterpret_cast<const unsigned char*>(a.data);
+        const auto right = reinterpret_cast<const unsigned char*>(b.data);
+        return left < right + b.bytes() && right < left + a.bytes();
+    };
+    if (overlaps(out, margin) || overlaps(out, logits) || overlaps(out, chosen) ||
+        overlaps(margin, logits) || overlaps(margin, chosen)) {
+        throw std::invalid_argument(std::string(op) + ": out and margin must not overlap the inputs "
+                                                     "or each other");
+    }
 
-    detail::logprob_of_choice_launch(logits, chosen, valid_rows, out, stream);
+    detail::logprob_of_choice_launch(logits, chosen, valid_rows, out, margin, stream);
 }
 
 } // namespace ninfer::ops

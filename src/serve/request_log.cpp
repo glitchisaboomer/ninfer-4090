@@ -493,14 +493,26 @@ std::string format_request_start_json(const std::string& server_instance_id,
 // The delivered tokens and their logprobs, in generation order. A logprob is null when the
 // producing path measured none (the MTP/DFlash licensed tokens): NaN is not representable in JSON,
 // and writing a number there would claim a measurement that does not exist.
+// The margin uses the same null-for-unmeasured spelling as the logprob, for the same reason: a NaN is
+// not representable in JSON and writing a number there would claim a measurement that does not exist.
+// A +inf margin is likewise not representable, so the degenerate single-candidate column the Op can
+// produce is reported as null rather than as a number JSON cannot hold.
+Json finite_or_null(float value) {
+    return std::isfinite(value) ? Json(value) : Json(nullptr);
+}
+
 Json generated_tokens_json(const GenerationOutcome& outcome) {
     Json tokens   = Json::array();
     Json logprobs = Json::array();
+    Json margins  = Json::array();
     for (const ninfer::TokenId token : outcome.generated_token_ids) { tokens.push_back(token); }
     for (const float logprob : outcome.generated_logprobs) {
-        logprobs.push_back(std::isfinite(logprob) ? Json(logprob) : Json(nullptr));
+        logprobs.push_back(finite_or_null(logprob));
     }
-    return Json{{"token_ids", std::move(tokens)}, {"logprobs", std::move(logprobs)}};
+    for (const float margin : outcome.generated_margins) { margins.push_back(finite_or_null(margin)); }
+    return Json{{"token_ids", std::move(tokens)},
+                {"logprobs", std::move(logprobs)},
+                {"margins", std::move(margins)}};
 }
 
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,

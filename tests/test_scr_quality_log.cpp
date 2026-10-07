@@ -47,7 +47,8 @@ void expect_invalid(std::string_view message, const std::function<void()>& body)
 // directly so a null (an unmeasured logprob) can be expressed.
 std::string record(std::uint64_t request_id, int prompt_tokens, std::uint32_t cache_hit_tokens,
                    std::uint32_t relocated_tokens, std::string_view reuse_path,
-                   std::string_view token_ids, std::string_view logprobs) {
+                   std::string_view token_ids, std::string_view logprobs,
+                   std::string_view margins = "") {
     return std::string{"{\"schema_version\":9,\"event\":\"request_done\",\"request\":{\"request_id\":"} +
            std::to_string(request_id) + "},\"result\":{\"prompt_tokens\":" +
            std::to_string(prompt_tokens) +
@@ -55,7 +56,8 @@ std::string record(std::uint64_t request_id, int prompt_tokens, std::uint32_t ca
            ",\"prefix_relocated_tokens\":" + std::to_string(relocated_tokens) +
            ",\"prefix_reuse_path\":\"" + std::string(reuse_path) +
            "\",\"generated\":{\"token_ids\":" + std::string(token_ids) +
-           ",\"logprobs\":" + std::string(logprobs) + "}}}";
+           ",\"logprobs\":" + std::string(logprobs) +
+           (margins.empty() ? std::string{} : ",\"margins\":" + std::string(margins)) + "}}}";
 }
 
 std::string joined(const std::vector<std::string>& lines) {
@@ -330,6 +332,46 @@ void test_server_arguments_are_a_valid_invocation() {
                                    "port");
 }
 
+// The margin array is what makes a measured logprob difference readable, so it has to survive the log
+// intact -- and a log written before the field existed has to parse rather than throw.
+void test_margins_survive_the_log() {
+    const std::string record_with =
+        record(1, 800, 64, 64, "suffix_relocation", "[1,2,3]", "[0.5,0.25,-0.125]",
+               "[0.002,0.5,null]");
+    const auto parsed = ninfer::serve::parse_completion_log(record_with + "\n");
+    expect(parsed.size() == 1, "a record carrying margins parses");
+    expect(parsed[0].generated_margins.size() == 3, "the margins are read");
+    expect(parsed[0].generated_margins[0] == 0.002f, "a finite margin is read");
+    expect(parsed[0].generated_margins[1] == 0.5f, "every finite margin is read");
+    expect(std::isnan(parsed[0].generated_margins[2]),
+           "a null margin is unmeasured, not zero");
+
+    // A log predating the field parses with no margins rather than throwing: the scorer treats an absent
+    // margin as unmeasured, so an older log yields a run with no margin column and no false verdict.
+    const auto legacy = ninfer::serve::parse_completion_log(
+        record(1, 800, 64, 64, "suffix_relocation", "[1,2,3]", "[0.5,0.25,-0.125]") + "\n");
+    expect(legacy.size() == 1, "a record without margins still parses");
+    expect(legacy[0].generated_margins.empty(), "and reports no margins rather than guessing them");
+    const auto scored =
+        ninfer::serve::evaluate_scr_quality_report(parsed, legacy, scr_quality::ScrQualityThresholds{});
+    expect(scored.prompts.size() == 1, "the pair still scores");
+    expect(!scored.prompts.front().margins_available, "with the margin reported as unavailable");
+
+    // A margins array of the wrong length is a malformed record, not something to score against.
+    expect_invalid("margins disagreeing in length with the tokens", [&] {
+        (void)ninfer::serve::parse_completion_log(
+            record(1, 800, 64, 64, "suffix_relocation", "[1,2,3]", "[0.5,0.25,-0.125]",
+                   "[0.002,0.5]") +
+            "\n");
+    });
+    expect_invalid("a non-numeric margin", [&] {
+        (void)ninfer::serve::parse_completion_log(
+            record(1, 800, 64, 64, "suffix_relocation", "[1,2,3]", "[0.5,0.25,-0.125]",
+                   "[0.002,\"wide\",0.1]") +
+            "\n");
+    });
+}
+
 // The control is the same configuration run twice, so it relocates nothing on either side -- which is
 // exactly what pair_scr_quality_samples refuses. The control needs its own pairing entry point, and
 // the point of these checks is that it is a *deliberate* bypass rather than a weakened guard: the
@@ -389,6 +431,7 @@ int main() {
     test_report_scores_and_fails_honestly();
     test_divergence_after_a_flip_is_not_averaged_in();
     test_control_pairs_two_full_prefills();
+    test_margins_survive_the_log();
     test_server_arguments_are_a_valid_invocation();
     if (failures != 0) {
         std::cerr << failures << " SCR quality log checks failed\n";
