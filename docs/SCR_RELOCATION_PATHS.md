@@ -217,21 +217,99 @@ The planner-side mode check is host-testable (`tests/targets/qwen3_6/test_prompt
 covers `plan_relocations`), so the mode split can be verified without CUDA even though the two
 runtimes cannot.
 
-## Verification that is still owed
+## Verification status
 
-Everything in Path A and Path B below the plan is unverified by the build: this change set was
-prepared on a host with no `nvcc`, `cmake`, or `ninja`, so `gqa_kv_rerotate`, the `reassign_pages`
-integration, and the `src/CMakeLists.txt` entries have never been compiled. The only CUDA-side code
-exercised at all is the `reassign_pages` accounting, through a host harness that compiles the real
-function body against a mock pool.
+Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 88-test suite green):
 
-On a CUDA machine, in order:
+1. `reassign_pages` against the real pool -- **done**, `tests/test_paged_kv_reassign_pages.cpp`.
+   Permutation, grow from the pool, shrink, reclaiming a whole entitlement, the shrink-one-region
+   while growing-another case served from the surplus, four rejections that must leave the mapping
+   and pool untouched, and the republished block-table row. Each case re-reads the KV payload of
+   every page it maps and confirms the bytes still belong to that physical page, which is the
+   property that distinguishes re-pointing from copying.
+2. `gqa_kv_rerotate` against an FP64 oracle -- **done**,
+   `tests/targets/qwen3_6/test_gqa_kv_rerotate.cpp`. A re-rotated element is compared against a
+   direct prefill at the destination, with the default table and with a caller-installed scaled
+   table, through both entry points, plus zero-delta identity, the untouched tail outside `[0, 64)`,
+   and six validation rejections. Errors are measured in BF16 ulp of the operand pair rather than
+   of the result, because a rotation can cancel toward zero; the allowance is 4 ulp against a
+   measured worst case of 1.79, while a sign-flipped variant costs 4222.
+3. End-to-end relocation wiring in `program_impl.h` -- **outstanding**. `tools/scr_e2e_check.py`
+   drives a live server over prompts that share a prefix and a suffix and differ in the middle, and
+   refuses to report a pass unless the server logs `reuse=suffix_relocation`.
+4. Phase 5.5 quality harness -- **not started**. `eval/ninfer_eval` has no `--scr` support.
 
-1. `reassign_pages` against the real pool: permutation, grow, shrink, and the shrink-and-grow case
-   that needs no free pages.
-2. `gqa_kv_rerotate` against a forward pass: prefill a token at position `p`, relocate it to `p'`,
-   and compare the cached K elementwise against prefilling the same token at `p'` directly. The
-   expectation is agreement except for one extra BF16 rounding. This is the check that
-   `kTextRopeInvFrequency` pairing and the `sincosf` argument order are right.
-3. Only then the end-to-end paths, with the Phase 5.5 quality harness (50 prompts, mean next-token
-   logprob divergence < 0.05 nats, greedy agreement on the first 64 tokens > 95%).
+### A latent defect that the unit tests could not have caught
+
+`rope.cuh` declares `kTextRopeInvFrequency` as `static __device__ __constant__`, which is internal
+linkage: every translation unit that includes `rope.cuh` gets a private copy in its own device
+module. `set_text_rope_frequencies` reaches `cudaMemcpyToSymbol` from `rope.cu` and writes only
+that copy, so the Op was reading its own module's compile-time defaults rather than the table the
+forward RoPE used. The table is now a required argument (`RerotateFreqTable`, carried into the
+kernel by value as `RerotateFreq`), which is what made the oracle test above possible.
+
+This is **not reachable in production on this hardware**. `compute_yarn_config` only scales above
+`kNativeContext = 1048576`, and the 27B artifact's weights occupy 16.96 GiB of a 24 GiB card, so no
+configurable context reaches that threshold. The defect was real but latent; the fix is
+architectural (the Op no longer depends on mutable module-global state) rather than a correctness
+rescue.
+
+## SCR is currently limited to BF16 KV, and that caps it below useful context
+
+`gqa_kv_rerotate` requires an uncompressed BF16 Text KV plane. `validate_text_k_cache` rejects every
+quantized layout (`int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), and **the request planner has
+no matching guard**, so a quantized `--kv-dtype` plans a relocation that then throws at runtime
+instead of degrading to `AppendAtFrontier`. A planner-side guard is the cheapest fix and is not
+done yet.
+
+For `qwen3_8_27b` the arithmetic is: 2 (K and V) x 16 full-attention layers x 4 KV heads x 256
+head_dim, against 16.96 GiB of `groupwise-int` weights on a 23.99 GiB card.
+
+| kv-dtype | KiB/token | KV @65k | KV @131k | KV @262k | SCR |
+|---|---|---|---|---|---|
+| bf16 | 64 | 4.0 GiB | 8.0 GiB (over) | 16 GiB (over) | yes |
+| int8 | 32 | 2.0 GiB | 4.0 GiB | 8.0 GiB (over) | no |
+| rk4v4-e8 | 16 | 1.0 GiB | 2.0 GiB | 4.0 GiB | no |
+| rk2v4-e8 | 12 | 0.8 GiB | 1.5 GiB | 3.0 GiB | no |
+
+So on this card SCR works only up to roughly 65k context, while the quantized formats are what buy
+the 160k-500k configurations in the README. That is backwards for a memory-constrained device: the
+feature is available only in the regime with the least memory pressure to relieve.
+
+### Why quantized K is the blocker, and why V is not
+
+RoPE acts on K only. The Op's own contract already states it: *"This Op deliberately does not touch
+V: RoPE does not act on V, so relocated V needs no adjustment."* V therefore needs no work in any
+format, and only K blocks a quantized layout.
+
+Re-rotation of BF16 K is a multiply-add per rotary plane. Re-rotation of a quantized K is not a
+rotation at all:
+
+- **`int8` (channel-quantized).** Dequantize, rotate in FP32, requantize with the same group scales.
+  Tractable. It adds one rounding of quantization error to relocated keys, which is measurable
+  against the Phase 5.5 threshold and would roughly double the usable SCR context to ~131k. This is
+  the highest-value item.
+- **`rk4v4-e8` / `rk2v4-e8`.** K is a 4-bit (or 2-bit) Conway-Sloane `E8` lattice code. Re-encoding
+  after an arbitrary rotation is a lattice-automorphism problem: find the codeword nearest to the
+  rotated vector, which is generally not the rotation of the original codeword. This is a research
+  problem, not an implementation detail, and there is no known cheap encoding. Deferred.
+
+Both need a decision on error accounting before implementation: whether a relocated quantized key is
+allowed to carry more error than a key prefilled at that position, and if so how much, measured
+against the same < 0.05 nat divergence threshold Phase 5.5 already defines.
+
+Recommended order: (1) the planner-side guard so `--scr` is safe to leave enabled across
+config changes, (2) `int8` K re-rotation, (3) the E8 work only if (2) shows the approach pays off.
+
+### A note on how SCR is triggered, for anyone writing tests
+
+`prefix_matches` requires the resident prompt to be a strict prefix of the new one, so ordinary
+prefix reuse never fires for an in-the-middle edit. SCR handles that case by diffing blocks
+directly: `diff_prompt_edit` indexes every whole 64-token block of the resident prompt by hash and
+finds surviving spans anywhere in the new prompt.
+
+The consequence for testing is that **the surviving tail must sit at the same 64-token boundary in
+both prompts**, which means the two edits must differ in length by a whole number of blocks. That
+cannot be arranged by counting characters. `tools/scr_e2e_check.py` uses the server's own
+`/v1/messages/count_tokens` to measure both prompts and search a padding until the delta is block
+aligned; without that, SCR silently declines to engage and reports `full_reset`.

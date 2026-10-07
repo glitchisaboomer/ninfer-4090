@@ -62,51 +62,109 @@ def intro_text(repeats):
     )
 
 
-def middle_text(variant):
-    if variant == "a":
-        return (
-            " SECTION ONE. The migration moves the primary datastore from a single node "
-            "cluster to a three node cluster with a consensus protocol. "
-            "All writes are routed through the new leader."
-        )
-    return (
-        " SECTION ONE. The migration moves the primary datastore from a single node "
-        "cluster to a five node cluster with a consensus protocol. "
-        "All reads are served from the nearest replica."
-    )
+# The surviving tail. diff_prompt_edit matches whole 64-token blocks by hash, so this text has to sit
+# at a 64-token boundary in both prompts. That requires the two middles to differ in length by a
+# multiple of 64 tokens, which cannot be arranged by counting characters, so count_prompt_tokens
+# below measures it against the server's own tokenizer.
+def tail_text():
+    return build_text(TAIL_SENTENCES, 12)
 
 
-def request_prompt(variant):
+MIDDLE_A = (
+    " SECTION ONE. The migration moves the primary datastore from a single node "
+    "cluster to a three node cluster with a consensus protocol. "
+    "All writes are routed through the new leader."
+)
+
+
+def middle_b(padding_words):
+    """The same shape as MIDDLE_A but padded so its token count differs by a multiple of 64."""
+    words = MIDDLE_A.split()
+    # Swap in a different cluster size, then pad deterministically to the requested length.
+    body = " ".join(words[:8] + ["five"] + words[9:12] + ["node"] + words[13:])
+    filler = " ".join(["Additionally the rollout proceeds in careful stages."] * padding_words)
+    return body + " " + filler
+
+
+def request_prompt(variant, padding_words=0):
     """INTRO + MIDDLE + TAIL, where only the middle differs between variants."""
+    middle = MIDDLE_A if variant == "a" else middle_b(padding_words)
     return (
         intro_text(6)
-        + middle_text(variant)
+        + middle
         + "\n\n"
-        + build_text(TAIL_SENTENCES, 12)
+        + tail_text()
         + "\n\nIn one sentence, what number of nodes does the target cluster have?"
     )
 
 
-def post_completion(port, prompt, max_tokens, timeout):
-    body = json.dumps(
-        {
-            "model": "local",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-    ).encode("utf-8")
+def request_body(prompt, max_tokens):
+    return {
+        "model": "local",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+
+
+def post_json(port, path, payload, timeout):
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
-        data=body,
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    return payload["choices"][0]["message"]["content"], payload["usage"]
+        return json.loads(response.read().decode("utf-8"))
+
+
+def count_tokens(port, prompt, max_tokens, timeout):
+    """Token count for `prompt` under the server's own tokenizer and chat template."""
+    payload = request_body(prompt, max_tokens)
+    result = post_json(port, "/v1/messages/count_tokens", payload, timeout)
+    return int(result["input_tokens"])
+
+
+def post_completion(port, prompt, max_tokens, timeout):
+    result = post_json(port, "/v1/chat/completions", request_body(prompt, max_tokens), timeout)
+    message = result["choices"][0]["message"]
+    # A thinking model can spend the whole budget on reasoning, leaving content empty. Keep both so
+    # the comparison does not silently degenerate into comparing two empty strings.
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or ""
+    return content, reasoning, result["usage"]
+
+
+BLOCK_TOKENS = 64
+
+
+def solve_padding(port, max_tokens, timeout):
+    """Find a padding that puts the surviving tail on a 64-token boundary in both prompts.
+
+    diff_prompt_edit matches whole blocks by hash, so the tail only survives if it starts at the
+    same block offset in both prompts. That means the two middles must differ in length by a whole
+    number of blocks. Character counts cannot predict token counts, so measure with the server and
+    adjust the padding until the delta is block aligned.
+    """
+    base = count_tokens(port, request_prompt("a"), max_tokens, timeout)
+    print(f"  prompt A tokenises to {base} tokens")
+
+    best = None
+    for padding_words in range(0, 40):
+        other = count_tokens(port, request_prompt("b", padding_words), max_tokens, timeout)
+        delta = other - base
+        if delta > 0 and delta % BLOCK_TOKENS == 0:
+            print(f"  padding={padding_words} filler units -> prompt B is {other} tokens, "
+                  f"delta {delta} = {delta // BLOCK_TOKENS} block(s)")
+            return padding_words, other, base
+        if best is None or abs(delta % BLOCK_TOKENS) < abs(best[1] % BLOCK_TOKENS):
+            best = (padding_words, delta, other)
+    print(f"  WARNING: no padding produced a block-aligned delta in 40 attempts; "
+          f"closest was padding={best[0]} delta={best[1]}")
+    print("           SCR needs the surviving tail block aligned, so it will likely not engage.")
+    return None, best[2], base
 
 
 def wait_for_health(port, proc, timeout):
@@ -174,13 +232,16 @@ def run_config(args, extra_flags, label):
                 print(f"  server not healthy: {why}", file=sys.stderr)
                 return None, []
 
+            padding, tokens_b, tokens_a = solve_padding(port, args.max_tokens, args.request_timeout)
+
             print("  request A (primes the KV cache)...")
-            post_completion(port, request_prompt("a"), args.max_tokens, args.request_timeout)
+            _, _, usage_a = post_completion(port, request_prompt("a"), args.max_tokens,
+                                            args.request_timeout)
             time.sleep(1.0)
 
             print("  request B (shares prefix and tail, differs in the middle)...")
-            text_b, usage_b = post_completion(
-                port, request_prompt("b"), args.max_tokens, args.request_timeout
+            content_b, reasoning_b, usage_b = post_completion(
+                port, request_prompt("b", padding or 0), args.max_tokens, args.request_timeout
             )
             time.sleep(1.0)
         finally:
@@ -193,7 +254,15 @@ def run_config(args, extra_flags, label):
     with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
         records = parse_done_lines(handle.read())
 
-    return {"text": text_b, "usage": usage_b}, records
+    return {
+        "content": content_b,
+        "reasoning": reasoning_b,
+        "usage": usage_b,
+        "usage_a": usage_a,
+        "tokens_a": tokens_a,
+        "tokens_b": tokens_b,
+        "padding": padding,
+    }, records
 
 
 def main():
@@ -207,7 +276,7 @@ def main():
                              "The script appends the flag under test and --port.")
     parser.add_argument("--cwd", default=".", help="working directory for the server")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--max-tokens", type=int, default=48)
+    parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--startup-timeout", type=int, default=600)
     parser.add_argument("--request-timeout", type=int, default=900)
     args = parser.parse_args()
@@ -302,23 +371,37 @@ def main():
         if second["reuse"] == "suffix_relocation":
             problems.append("--no-scr still reported suffix_relocation; the flag is not being honoured")
 
-    text_scr = scr_result["text"].strip()
-    text_ref = ref_result["text"].strip()
+    text_scr = scr_result["content"].strip()
+    text_ref = ref_result["content"].strip()
+    reason_scr = scr_result["reasoning"].strip()
+    reason_ref = ref_result["reasoning"].strip()
 
     print()
     print("request B, --scr:")
-    print(f"  {text_scr!r}")
+    print(f"  content   : {text_scr!r}")
+    if reason_scr:
+        print(f"  reasoning : {reason_scr[:200]!r}")
     print("request B, --no-scr:")
-    print(f"  {text_ref!r}")
+    print(f"  content   : {text_ref!r}")
+    if reason_ref:
+        print(f"  reasoning : {reason_ref[:200]!r}")
     print()
     print(f"usage --scr    : {scr_result['usage']}")
     print(f"usage --no-scr : {ref_result['usage']}")
 
+    if not text_scr and not reason_scr:
+        problems.append(
+            "request B produced neither content nor reasoning; raise --max-tokens so the model has "
+            "room to emit an answer")
+
     print()
-    if text_scr == text_ref:
+    if text_scr == text_ref and reason_scr == reason_ref:
         print("RESULT: outputs are identical.")
     else:
-        problems.append("outputs differ between --scr and --no-scr")
+        if text_scr != text_ref:
+            problems.append("content differs between --scr and --no-scr")
+        if reason_scr != reason_ref:
+            problems.append("reasoning differs between --scr and --no-scr")
 
     if problems:
         print("RESULT: FAILED")
