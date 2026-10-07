@@ -174,13 +174,21 @@ pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
     return samples;
 }
 
+targets::qwen3_6::detail::ScrQualityReport evaluate_scr_quality_report(
+    std::span<const LoggedCompletion> scr, std::span<const LoggedCompletion> baseline,
+    const targets::qwen3_6::detail::ScrQualityThresholds& thresholds) {
+    targets::qwen3_6::detail::ScrQualityReport report;
+    if (scr.empty() || baseline.empty()) { return report; }
+    return targets::qwen3_6::detail::evaluate_scr_quality(pair_scr_quality_samples(scr, baseline),
+                                                          thresholds);
+}
+
 std::string format_scr_quality_report(
     std::span<const LoggedCompletion> scr, std::span<const LoggedCompletion> baseline,
     const targets::qwen3_6::detail::ScrQualityThresholds& thresholds) {
     if (scr.empty() || baseline.empty()) { return {}; }
-    const auto samples = pair_scr_quality_samples(scr, baseline);
-    const auto report  = targets::qwen3_6::detail::evaluate_scr_quality(samples, thresholds);
-    return targets::qwen3_6::detail::format_scr_quality_json(report, thresholds);
+    return targets::qwen3_6::detail::format_scr_quality_json(
+        evaluate_scr_quality_report(scr, baseline, thresholds), thresholds);
 }
 
 std::vector<std::string> build_scr_quality_server_arguments(

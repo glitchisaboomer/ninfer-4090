@@ -52,8 +52,15 @@ struct LoggedCompletion {
 pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
                          std::span<const LoggedCompletion> baseline);
 
-// Scores every paired prompt and returns the target's own report JSON, one line per prompt plus an
-// aggregate. Empty when either side is empty.
+// Scores every paired prompt and returns the target's own report, so a caller that wants to read the
+// numbers rather than serialize them can, without re-pairing or duplicating the thresholds. Throws
+// exactly where pair_scr_quality_samples does. Empty when either side is empty.
+[[nodiscard]] targets::qwen3_6::detail::ScrQualityReport evaluate_scr_quality_report(
+    std::span<const LoggedCompletion> scr, std::span<const LoggedCompletion> baseline,
+    const targets::qwen3_6::detail::ScrQualityThresholds& thresholds);
+
+// The scored report as JSON, one line plus an aggregate, in a fixed key order so two runs are
+// diffable. Empty when either side is empty.
 [[nodiscard]] std::string format_scr_quality_report(
     std::span<const LoggedCompletion> scr, std::span<const LoggedCompletion> baseline,
     const targets::qwen3_6::detail::ScrQualityThresholds& thresholds);

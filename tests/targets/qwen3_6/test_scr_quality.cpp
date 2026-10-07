@@ -7,8 +7,10 @@
 
 #include "targets/qwen3_6/impl/runtime/scr_quality.h"
 
+#include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -201,6 +203,106 @@ void test_report_aggregates() {
     expect(!none.all_passed, "an empty suite has not passed");
 }
 
+// The case the previous implementation got wrong, and the reason this file grew: two runs of the same
+// length whose tokens diverge partway through. Past the flip, scr_logprobs[i] is the logprob of a
+// different token than baseline_logprobs[i], so averaging those pairs measures how far the outputs
+// drifted rather than how much relocation perturbed the distribution.
+void test_divergence_stops_at_the_first_divergent_token() {
+    const ScrQualityThresholds thresholds;
+    ScrQualitySample sample;
+    for (std::size_t i = 0; i < 64; ++i) {
+        sample.baseline_tokens.push_back(static_cast<TokenId>(i));
+        sample.scr_tokens.push_back(static_cast<TokenId>(i));
+        sample.baseline_logprobs.push_back(0.0F);
+        sample.scr_logprobs.push_back(0.01F);
+    }
+    // Flip at step 5, and make the post-flip logprobs wildly different so a contaminated mean cannot
+    // be mistaken for a clean one.
+    sample.scr_tokens[5] = static_cast<TokenId>(5) + 1000;
+    for (std::size_t i = 5; i < 64; ++i) {
+        // Every later step stays different, so the paths do not re-synchronize and agreement fails
+        // on its own instead of being rescued by a chance re-match.
+        sample.scr_tokens[i] = static_cast<TokenId>(i) + 1000;
+        sample.scr_logprobs[i] = 4.0F;
+        sample.baseline_logprobs[i] = 0.0F;
+    }
+
+    const auto result = evaluate_scr_prompt(sample, thresholds);
+    expect(result.first_divergence_index == 5, "the first divergent token is located");
+    expect(result.compared_tokens == 5, "divergence covers only the agreed prefix");
+    expect(result.logprobs_available == 64, "the run length that was available is reported");
+    expect(result.mean_logprob_divergence < 0.011 && result.mean_logprob_divergence > 0.009,
+           "the mean is 0.01, not the 0.5 the post-flip pairs would produce");
+    expect(result.max_logprob_divergence < 0.011 && result.max_logprob_divergence > 0.009,
+           "the worst agreed step is also 0.01");
+    expect(result.first_token_divergence < 0.011 && result.first_token_divergence > 0.009,
+           "the first token's divergence is reported");
+    // Agreement deliberately stays index-aligned: greedy agreement asks whether decoding flipped, and
+    // where it flipped is now reported rather than hidden.
+    // Index-aligned over the whole configured prefix: only the 5 agreed steps match. Where the paths
+    // parted is reported separately, because agreement alone cannot distinguish an early flip from a
+    // late one.
+    expect(result.agreement_matched == 5, "agreement stays index-aligned over the whole prefix");
+    expect(!result.ok, "a flipped run does not pass the agreement bound");
+    expect(contains(result.note, "first divergence at token 5"),
+           "the note says where the paths parted");
+}
+
+// The scalar that answers "did relocation move the distribution, before decoding feedback could
+// amplify it" -- usable even when everything after diverges, which is exactly when the mean is not.
+void test_first_token_divergence_survives_a_later_divergence() {
+    const ScrQualityThresholds thresholds;
+    ScrQualitySample sample;
+    sample.baseline_tokens   = {7, 8, 9};
+    sample.scr_tokens        = {7, 42, 43};
+    sample.baseline_logprobs = {-0.25F, -1.0F, -2.0F};
+    sample.scr_logprobs      = {-0.30F, -5.0F, -6.0F};
+
+    const auto result = evaluate_scr_prompt(sample, thresholds);
+    expect(result.compared_tokens == 1, "only the agreed first token is compared");
+    expect(result.first_token_divergence > 0.049 && result.first_token_divergence < 0.051,
+           "the first token moved by 0.05 nats, which is what is being measured");
+    expect(result.first_divergence_index == 1, "the paths parted at token 1");
+}
+
+void test_differing_first_tokens_is_not_a_vacuous_pass() {
+    const ScrQualityThresholds thresholds;
+    ScrQualitySample sample;
+    sample.baseline_tokens   = {11, 12};
+    sample.scr_tokens        = {13, 14};
+    sample.baseline_logprobs = {-0.1F, -0.2F};
+    sample.scr_logprobs      = {-0.1F, -0.2F};
+
+    const auto result = evaluate_scr_prompt(sample, thresholds);
+    // Perfectly equal logprobs and zero divergence would otherwise read as the best possible run.
+    expect(!result.ok, "disagreeing first tokens do not pass");
+    expect(result.compared_tokens == 0, "there is no agreed prefix to measure");
+    expect(result.greedy_agreement == 0.0, "agreement still reports the disagreement");
+    expect(contains(result.note, "different first tokens"),
+           "the note says the paths chose different first tokens");
+}
+
+void test_non_finite_logprobs_are_reported_not_averaged() {
+    const ScrQualityThresholds thresholds;
+    ScrQualitySample sample;
+    for (std::size_t i = 0; i < 8; ++i) {
+        sample.baseline_tokens.push_back(static_cast<TokenId>(i));
+        sample.scr_tokens.push_back(static_cast<TokenId>(i));
+        sample.baseline_logprobs.push_back(0.0F);
+        sample.scr_logprobs.push_back(0.0F);
+    }
+    // A path that emitted no logprob at one step must not be silently scored as agreement there.
+    sample.scr_logprobs[3] = std::numeric_limits<float>::quiet_NaN();
+
+    const auto result = evaluate_scr_prompt(sample, thresholds);
+    expect(!result.logprobs_finite, "the non-finite step is detected");
+    expect(result.first_nonfinite_index == 3, "the non-finite step is located");
+    expect(std::isnan(result.mean_logprob_divergence),
+           "the mean is NaN rather than an average that hides the gap");
+    expect(!result.ok, "a run with an unusable logprob does not pass");
+    expect(contains(result.note, "not finite at position 3"), "the note names the position");
+}
+
 void test_json_report() {
     const ScrQualityThresholds thresholds;
     std::vector<ScrQualitySample> samples{agreeing(64, 0.0), agreeing(64, 0.5)};
@@ -227,6 +329,10 @@ int main() {
     test_agreement_prefix_is_bounded();
     test_short_runs_compare_what_they_have();
     test_only_the_shared_prefix_is_compared();
+    test_divergence_stops_at_the_first_divergent_token();
+    test_first_token_divergence_survives_a_later_divergence();
+    test_differing_first_tokens_is_not_a_vacuous_pass();
+    test_non_finite_logprobs_are_reported_not_averaged();
     test_unmeasured_inputs_fail();
     test_report_aggregates();
     test_json_report();

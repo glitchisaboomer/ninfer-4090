@@ -17,9 +17,17 @@
 // magnitude, so a run that is confidently wrong and one that is uncertain both count; a signed mean
 // would let opposing errors cancel and read as agreement.
 //
-// Only the shared prefix is compared. The paths can diverge and then produce different-length output,
-// and comparing beyond the first divergence would compare different tokens, which says nothing about
-// SCR's approximation.
+// Only the shared prefix is compared, and "shared" means the leading run of positions at which both
+// paths emitted the *same* token -- not merely the shorter of the two output lengths. Once the paths
+// pick different tokens, position i holds a different token on each side, so `scr_logprobs[i]` and
+// `baseline_logprobs[i]` are logprobs of two unrelated tokens. Averaging those measures how far the
+// outputs drifted after the first flip, which is not a property of Suffix Cache Reuse, and it swamps
+// the quantity being measured: a run that perturbs the distribution by a hair can then diverge for
+// 60 more tokens and report a mean in the tenths.
+//
+// Agreement is deliberately *not* truncated this way. It is index-aligned over its configured prefix
+// on purpose, because the roadmap's question is whether greedy decoding flipped at all; `
+// first_divergence_index` is reported alongside it so a collapse can be read for what it is.
 
 #include <ninfer/types.h>
 
@@ -51,10 +59,36 @@ struct ScrQualityThresholds {
 };
 
 struct ScrQualityPromptResult {
-    // Tokens whose logprobs were compared, and the mean absolute divergence over them.
+    // Tokens whose logprobs were compared, and the mean absolute divergence over them. This is the
+    // agreed prefix: leading positions at which both paths emitted the *same* token, so each side's
+    // logprob is the logprob of that one token. Positions past the first disagreement are excluded --
+    // see `first_divergence_index`.
     std::uint32_t compared_tokens   = 0;
     double mean_logprob_divergence  = 0.0;
-    // Leading tokens the agreement was measured over, and how many matched.
+    // The worst single-step divergence over the agreed prefix. A mean can hide one badly perturbed
+    // step behind many unremarkable ones; this cannot.
+    double max_logprob_divergence = 0.0;
+    // |baseline - SCR| logprob at the very first generated position. This is the one scalar that needs
+    // no caveat: position 0 is compared before any divergence can have compounded, so it bounds how
+    // much the reused prefill moved the next-token distribution before decoding feedback muddies it.
+    // NaN when nothing was comparable.
+    double first_token_divergence = 0.0;
+    // Where the two paths first emitted different tokens. Equal to `logprobs_available` when they
+    // never did. Reported because the pass/fail metrics hide it: agreement collapses to whatever
+    // fraction of the drift happened to re-synchronize, which is not monotone in how much of the
+    // context was reused.
+    std::uint32_t first_divergence_index = 0;
+    // Positions both sides had a token *and* a logprob for, before any prefix truncation. The gap
+    // between this and `compared_tokens` is how much of the run the comparison discarded, and it is
+    // what makes a large mean legible.
+    std::uint32_t logprobs_available = 0;
+    // False when a compared step's logprob difference was NaN or infinite, i.e. the path that emitted
+    // it did not report a usable logprob. `first_nonfinite_index` then names the position.
+    bool logprobs_finite        = true;
+    std::uint32_t first_nonfinite_index = 0;
+    // Leading tokens the agreement was measured over, and how many matched. Unlike divergence this
+    // stays index-aligned over the whole configured prefix: the roadmap's question is whether greedy
+    // decoding flipped, and a flip is a disagreement wherever it lands.
     std::uint32_t agreement_compared = 0;
     std::uint32_t agreement_matched  = 0;
     double greedy_agreement          = 0.0;

@@ -527,6 +527,36 @@ select_edited(const std::vector<ninfer::serve::LoggedCompletion>& completions, b
     return selected;
 }
 
+// The K sweep is the point of this harness, and a single JSON blob does not show a curve. This is the
+// roadmap's Figure 13 grid read directly: how much of the context was reused, where the two paths first
+// parted, and how far the reused prefill had already moved the next-token distribution by then.
+//
+// first_token_divergence is the column that separates "relocation barely perturbs anything" from
+// "relocation perturbs the first token and the rest is decoder feedback": it is measured before any
+// divergence can compound, so unlike the mean it is not inflated by a run that flips at step 3 and
+// then wanders for 60 more tokens.
+void print_curve(const std::vector<SuitePrompt>& prompts,
+                 const std::vector<ninfer::serve::LoggedCompletion>& edited,
+                 const ninfer::targets::qwen3_6::detail::ScrQualityReport& scored) {
+    std::cerr << "\n  K   prompt  relocated   parted@   d(first)   d(mean)   d(max)   agree   "
+                 "verdict\n";
+    std::cerr << "  ----------------------------------------------------------------------"
+                 "----------\n";
+    for (std::size_t i = 0; i < scored.prompts.size() && i < prompts.size(); ++i) {
+        const auto& result = scored.prompts[i];
+        std::ostringstream row;
+        row << "  " << prompts[i].name << "  " << edited[i].prompt_tokens << "  "
+            << edited[i].prefix_relocated_tokens << "  " << result.first_divergence_index << "  "
+            << result.first_token_divergence << "  " << result.mean_logprob_divergence << "  "
+            << result.max_logprob_divergence << "  " << result.greedy_agreement << "   "
+            << (result.ok ? "pass" : "FAIL") << "\n";
+        std::cerr << row.str();
+    }
+    std::cerr << "\n  parted@ is the first greedy token the two paths disagreed on, so the columns to\n"
+                 "  its right describe a prefix both paths chose identically and are comparable; the\n"
+                 "  agreement column is index-aligned and is not.\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -558,11 +588,14 @@ int main(int argc, char** argv) {
             select_edited(scr_completions, true);
         const std::vector<ninfer::serve::LoggedCompletion> baseline_edited =
             select_edited(baseline_completions, false);
+        const ninfer::targets::qwen3_6::detail::ScrQualityThresholds thresholds;
         // Throws when a prompt relocated nothing: a suite that never engaged Suffix Cache Reuse
         // would otherwise compare two full prefills and read as a pass.
-        const std::string report = ninfer::serve::format_scr_quality_report(
-            scr_edited, baseline_edited,
-            ninfer::targets::qwen3_6::detail::ScrQualityThresholds{});
+        const auto scored = ninfer::serve::evaluate_scr_quality_report(scr_edited, baseline_edited,
+                                                                      thresholds);
+        const std::string report =
+            ninfer::targets::qwen3_6::detail::format_scr_quality_json(scored, thresholds);
+        print_curve(prompts, scr_edited, scored);
 
         if (options.json_out == "-") {
             std::cout << report;

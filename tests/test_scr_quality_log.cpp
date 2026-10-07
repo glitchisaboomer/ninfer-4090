@@ -207,6 +207,54 @@ void test_report_scores_and_fails_honestly() {
            "an empty pair produces no report");
 }
 
+// End to end over the log schema, for the failure the in-memory scorer tests cannot see: two real
+// records that diverge partway through. Every logprob past the flip is the logprob of a *different*
+// token on each side, so a scorer that averaged the whole run would report a mean in the tenths for a
+// run that agreed perfectly up to the flip. This is what the 2026-10-08 measurement actually did.
+void test_divergence_after_a_flip_is_not_averaged_in() {
+    const scr_quality::ScrQualityThresholds thresholds;
+    // The paths agree on tokens 1..3 and part at token 4. After the flip each side logs a *different*
+    // token, so each side's logprobs past position 3 are logprobs of its own tokens. They are made
+    // deliberately far apart: a scorer that averaged all six pairs reports a mean near 1.9 nats for a
+    // run whose first three steps are bit-identical, which is exactly the failure that produced the
+    // 2026-10-08 report. A scorer that stops at the flip sees zero.
+    const auto scr = ninfer::serve::parse_completion_log(
+        record(1, 800, 64, 64, "suffix_relocation", "[1,2,3,9,9,9]",
+               "[0.0,0.0,0.0,-0.5,-0.25,-0.125]") +
+        "\n");
+    const auto baseline = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", "[1,2,3,4,5,6]",
+               "[0.0,0.0,0.0,-3.0,-4.0,-5.0]") +
+        "\n");
+
+    const auto scored = ninfer::serve::evaluate_scr_quality_report(scr, baseline, thresholds);
+    expect(scored.prompts.size() == 1, "one prompt is scored");
+    const auto& prompt = scored.prompts.front();
+    expect(prompt.first_divergence_index == 3, "the first divergent token is reported");
+    expect(prompt.compared_tokens == 3, "only the agreed prefix is compared");
+    expect(prompt.logprobs_available == 6, "the run length available is reported");
+    expect(prompt.mean_logprob_divergence == 0.0,
+           "the agreeing prefix diverges by nothing, not by the ~1.9 nats an all-pairs mean gives");
+    expect(prompt.max_logprob_divergence == 0.0, "the worst agreed step is also zero");
+    expect(prompt.first_token_divergence == 0.0, "the first token's divergence is reported");
+    // Agreement still covers all six positions, because the roadmap asks whether greedy decoding
+    // flipped, not only whether the prefix held.
+    expect(prompt.agreement_compared == 6, "agreement measures the whole available prefix");
+    expect(prompt.agreement_matched == 3, "the three divergent positions do not match");
+    expect(prompt.greedy_agreement == 0.5, "agreement reports the flipped half");
+
+    // The serialized form carries the new fields, since a report that omits them cannot be read.
+    const std::string json = ninfer::serve::format_scr_quality_report(scr, baseline, thresholds);
+    expect(json.find("\"first_divergence_index\":3") != std::string::npos,
+           "the divergence point is serialized");
+    expect(json.find("\"logprobs_available\":6") != std::string::npos,
+           "the available length is serialized");
+    expect(json.find("\"first_token_divergence\":") != std::string::npos,
+           "the first-token divergence is serialized");
+    expect(json.find("\"max_logprob_divergence\":") != std::string::npos,
+           "the worst agreed step is serialized");
+}
+
 
 // The argv a measurement phase hands to ninfer-serve, checked against the server's own parser rather
 // than against a reading of its usage text. The two disagree in exactly one way that matters:
@@ -290,6 +338,7 @@ int main() {
     test_malformed_records_are_refused();
     test_pairing_requires_comparable_runs();
     test_report_scores_and_fails_honestly();
+    test_divergence_after_a_flip_is_not_averaged_in();
     test_server_arguments_are_a_valid_invocation();
     if (failures != 0) {
         std::cerr << failures << " SCR quality log checks failed\n";
