@@ -80,6 +80,10 @@ struct RelocatedSpan {
 
 // Turn a diff into the relocation geometry a runtime can act on.
 //
+// This is the general selector, for the segmented runtime described in
+// `docs/SCR_RELOCATION_PATHS.md` as Path B, which is not implemented. The runtime currently plans
+// with `plan_tail_relocation` instead, because it can only prefill a bounded number of ranges.
+//
 // A span is only relocatable when all of the following hold:
 //
 //   * It is not the leading span. The leading span is ordinary prefix reuse, which the existing

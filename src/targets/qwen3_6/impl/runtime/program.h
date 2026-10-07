@@ -47,6 +47,7 @@ enum class MtpBridgeMode : std::uint8_t {
 // the selection rules stay testable without a device; this alias only re-homes it into the
 // runtime namespace.
 using RelocatedSpan = qwen3_6::detail::RelocatedSpan;
+using PrefillRange   = qwen3_6::detail::PrefillRange;
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
@@ -76,6 +77,11 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     // Populated only when `reuse == SuffixRelocation`. Empty means every token after
     // `reuse_base` is prefilled, which is the assumption every other reuse path relies on.
     std::vector<NINFER_QWEN36_RUNTIME_NS::RelocatedSpan> relocated_spans;
+    // The two ranges prefilled around `relocated_spans`, both relative to the prompt. The runtime
+    // prefills these and serves everything between them from resident KV, so the ranges must tile
+    // `[reuse_base, prompt_tokens)` minus the relocated run.
+    NINFER_QWEN36_RUNTIME_NS::PrefillRange relocated_head;
+    NINFER_QWEN36_RUNTIME_NS::PrefillRange relocated_tail;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;

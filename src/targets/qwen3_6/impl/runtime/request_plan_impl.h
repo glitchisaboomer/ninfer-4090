@@ -256,18 +256,20 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const qwen3_6::detail::PromptEditDiff diff = qwen3_6::detail::diff_prompt_edit(
             sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
 
-        // Selection rules live with the detector so they stay unit-testable on the host.
-        // `reuse_base` is the prefix-reuse frontier, so a destination below it is already
-        // covered by ordinary prefix reuse and is not relocated a second time.
-        std::vector<RelocatedSpan> candidates = qwen3_6::detail::plan_relocations(
-            diff, sequence.text_kv_valid, plan->reuse_base, base.suffix_reuse_max_spans);
+        // Selection rules live with the detector so they stay unit-testable on the host. The plan is
+        // the widest one the runtime can act on, a single contiguous run: `reuse_base` is the
+        // prefix-reuse frontier, so a destination below it is already covered by ordinary prefix
+        // reuse, and everything the run does not cover is prefilled from the two reported ranges.
+        const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
+            diff, sequence.text_kv_valid, plan->reuse_base,
+            static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans);
 
-        if (!candidates.empty()) {
-            std::uint64_t relocated = 0;
-            for (const RelocatedSpan& span : candidates) { relocated += span.tokens; }
+        if (tail.viable) {
             plan->reuse                           = ReusePath::SuffixRelocation;
-            plan->relocated_spans                 = std::move(candidates);
-            plan->summary.relocated_prompt_tokens = static_cast<std::uint32_t>(relocated);
+            plan->relocated_head                  = tail.head;
+            plan->relocated_tail                  = tail.tail;
+            plan->summary.relocated_prompt_tokens = tail.relocated_tokens();
+            plan->relocated_spans                 = tail.spans;
         }
     }
 
