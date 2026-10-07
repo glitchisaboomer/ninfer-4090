@@ -8,7 +8,9 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace ninfer {
 namespace {
@@ -541,6 +543,87 @@ void PagedKVAllocation::trim_pages(std::uint32_t pages) {
 }
 
 void PagedKVAllocation::trim_tokens(std::uint32_t tokens) { trim_pages(pages_for_tokens(tokens)); }
+
+void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping, cudaStream_t stream) {
+    if (!valid()) { throw std::logic_error("Cannot reassign an empty Paged KV allocation"); }
+    if (mapping.empty()) {
+        throw std::invalid_argument("Paged KV reassignment must map at least one page");
+    }
+    if (mapping.size() > page_entitlement_) {
+        throw std::invalid_argument("Paged KV reassignment exceeds the page entitlement");
+    }
+
+    // Remaining ownership, by page. An entry the mapping names consumes one occurrence, so a page
+    // owned once cannot be claimed by two logical pages.
+    std::unordered_map<std::int32_t, std::uint32_t> remaining;
+    remaining.reserve(page_ids_.size());
+    for (const std::int32_t page : page_ids_) { ++remaining[page]; }
+
+    std::uint32_t acquire_count = 0;
+    for (const std::int32_t page : mapping) {
+        if (page == kPagedKVAquirePage) {
+            ++acquire_count;
+            continue;
+        }
+        const auto found = remaining.find(page);
+        if (found == remaining.end() || found->second == 0) {
+            throw std::invalid_argument(
+                "Paged KV reassignment names a page this allocation does not own");
+        }
+        if (--found->second == 0) { remaining.erase(found); }
+    }
+
+    // Occurrences the mapping did not claim are surplus. Those pages can themselves serve as the
+    // newly acquired physical pages, so only a shortfall beyond them has to come from the pool. A
+    // remap that shrinks one region while growing another therefore does not need free pool pages
+    // for the growth: the pool is never asked for pages the release already paid for.
+    std::vector<std::int32_t> surplus;
+    surplus.reserve(page_ids_.size());
+    for (const auto& entry : remaining) {
+        for (std::uint32_t copy = 0; copy < entry.second; ++copy) { surplus.push_back(entry.first); }
+    }
+
+    const std::uint32_t surplus_reused =
+        std::min(acquire_count, static_cast<std::uint32_t>(surplus.size()));
+    const std::uint32_t from_pool = acquire_count - surplus_reused;
+    if (from_pool > pool_->free_pages()) { throw std::bad_alloc(); }
+
+    // Acquire before releasing anything: once this returns no later step can fail, so the pool
+    // never observes a page that is both still owned here and already free.
+    std::vector<std::int32_t> acquired;
+    if (from_pool != 0) {
+        const std::int32_t preferred =
+            page_ids_.empty() ? -1 : static_cast<std::int32_t>(page_ids_.back() + 1);
+        acquired = pool_->take_pages(from_pool, preferred);
+    }
+
+    std::vector<std::int32_t> final_ids(mapping.begin(), mapping.end());
+    std::size_t surplus_slot = 0;
+    std::size_t pooled_slot  = 0;
+    for (std::int32_t& page : final_ids) {
+        if (page != kPagedKVAquirePage) { continue; }
+        if (surplus_slot < surplus_reused) {
+            page = surplus[surplus_slot++];
+        } else {
+            page = acquired[pooled_slot++];
+        }
+    }
+    if (pooled_slot != acquired.size()) {
+        // Unreachable: surplus_reused + from_pool == acquire_count, which is exactly how many slots
+        // were substituted. Hand the pages back rather than leak them if that ever stops holding.
+        if (!acquired.empty()) { pool_->return_pages(acquired); }
+        throw std::logic_error("Paged KV reassignment acquired more pages than it mapped");
+    }
+
+    // Surplus occurrences the mapping did not reuse are genuinely dropped.
+    if (surplus.size() > surplus_reused) {
+        pool_->return_pages(std::span<const std::int32_t>(surplus.data() + surplus_reused,
+                                                          surplus.size() - surplus_reused));
+    }
+
+    page_ids_ = std::move(final_ids);
+    if (bound_row_ >= 0) { publish_mapping(stream); }
+}
 
 void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot bind an empty Paged KV allocation"); }

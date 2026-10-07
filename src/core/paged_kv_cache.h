@@ -199,6 +199,24 @@ public:
     void trim_pages(std::uint32_t pages);
     void trim_tokens(std::uint32_t tokens);
 
+    // Replaces the whole logical-to-physical mapping with `mapping`, which describes exactly the
+    // pages this allocation should map afterwards in logical order. Each entry is either a page the
+    // allocation already owns or kPagedKVAquirePage for a page acquired from the pool. Owned pages
+    // named more than once, or not owned at all, are rejected. Owned pages the mapping does not name
+    // are returned to the pool, except that as many of them as there are acquire slots are reused as
+    // the new physical pages instead, so a remap that shrinks one region while growing another does
+    // not need free pool pages for the growth. The mapping may both grow and shrink relative to the
+    // current mapped page count as long as it stays inside the entitlement.
+    //
+    // The transition is atomic with respect to this allocation: pages are acquired before anything
+    // is released, and the mapping is validated before either step, so a failure leaves the previous
+    // mapping and the pool unchanged. This is the sole mechanism by which a caller re-points logical
+    // pages, and it exists for suffix relocation, which re-points destination blocks at surviving
+    // pages without copying KV and without a second allocator.
+    //
+    // The republished block-table row is updated when the allocation is bound.
+    void reassign_pages(std::span<const std::int32_t> mapping, cudaStream_t stream = nullptr);
+
     void bind_row(std::int32_t row, cudaStream_t stream = nullptr);
     void publish_mapping(cudaStream_t stream = nullptr) const;
     void unbind_row() noexcept;
@@ -219,6 +237,11 @@ private:
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
 };
+
+// Sentinel for one logical page in PagedKVAllocation::reassign_pages that must be filled with a
+// physical page acquired from the pool. Every real physical page id is non-negative, so -1 cannot
+// collide with an owned page.
+inline constexpr std::int32_t kPagedKVAquirePage = -1;
 
 struct PagedKVReservation {
     PagedKVPool* pool              = nullptr;
