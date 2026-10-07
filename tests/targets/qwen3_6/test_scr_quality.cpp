@@ -21,6 +21,9 @@ using ninfer::TokenId;
 using ninfer::targets::qwen3_6::detail::evaluate_scr_prompt;
 using ninfer::targets::qwen3_6::detail::evaluate_scr_quality;
 using ninfer::targets::qwen3_6::detail::format_scr_quality_json;
+using ninfer::targets::qwen3_6::detail::ScrQualityReport;
+using ninfer::targets::qwen3_6::detail::scr_quality_control_divergent_prompts;
+using ninfer::targets::qwen3_6::detail::scr_quality_control_is_clean;
 using ninfer::targets::qwen3_6::detail::ScrQualitySample;
 using ninfer::targets::qwen3_6::detail::ScrQualityThresholds;
 
@@ -303,6 +306,39 @@ void test_non_finite_logprobs_are_reported_not_averaged() {
     expect(contains(result.note, "not finite at position 3"), "the note names the position");
 }
 
+// The gate on attributing a measurement at all. Without it a run whose divergence is entirely
+// run-to-run variation reads exactly like a run that perturbed the distribution.
+void test_control_cleanliness_gates_attribution() {
+    const ScrQualityThresholds thresholds;
+
+    // Two runs of one configuration that agree throughout: the floor is zero, so anything the
+    // SCR-versus-baseline comparison reports is attributable.
+    std::vector<ScrQualitySample> identical{agreeing(64, 0.0), agreeing(32, 0.0)};
+    const auto clean_report = evaluate_scr_quality(identical, thresholds);
+    expect(scr_quality_control_is_clean(clean_report), "a control that agrees with itself is clean");
+    expect(scr_quality_control_divergent_prompts(clean_report).empty(),
+           "a clean control names no prompts");
+
+    // One prompt parts at token 3. Nothing about the size of that gap matters -- a single flipped
+    // token is enough to make the floor unknown for that prompt.
+    std::vector<ScrQualitySample> noisy{agreeing(64, 0.0), agreement(64, 3)};
+    const auto noisy_report = evaluate_scr_quality(noisy, thresholds);
+    expect(!scr_quality_control_is_clean(noisy_report), "a control that disagrees with itself is not clean");
+    const auto divergent = scr_quality_control_divergent_prompts(noisy_report);
+    expect(divergent.size() == 1 && divergent[0] == 1, "the disagreeing prompt is named by index");
+
+    // An empty control measured nothing. Nothing cannot establish a floor, so it is not clean --
+    // otherwise a control that failed to run would silently authorize every conclusion.
+    expect(!scr_quality_control_is_clean(evaluate_scr_quality({}, thresholds)),
+           "an empty control is not clean");
+
+    // A tiny logprob gap with an identical token is still agreement: cleanliness is about the token
+    // choice, not about the size of the perturbation.
+    std::vector<ScrQualitySample> nudged{agreeing(64, 0.04)};
+    expect(scr_quality_control_is_clean(evaluate_scr_quality(nudged, thresholds)),
+           "a control whose tokens all match is clean however large the logprob difference");
+}
+
 void test_json_report() {
     const ScrQualityThresholds thresholds;
     std::vector<ScrQualitySample> samples{agreeing(64, 0.0), agreeing(64, 0.5)};
@@ -333,6 +369,7 @@ int main() {
     test_first_token_divergence_survives_a_later_divergence();
     test_differing_first_tokens_is_not_a_vacuous_pass();
     test_non_finite_logprobs_are_reported_not_averaged();
+    test_control_cleanliness_gates_attribution();
     test_unmeasured_inputs_fail();
     test_report_aggregates();
     test_json_report();

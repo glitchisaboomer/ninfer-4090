@@ -330,6 +330,55 @@ void test_server_arguments_are_a_valid_invocation() {
                                    "port");
 }
 
+// The control is the same configuration run twice, so it relocates nothing on either side -- which is
+// exactly what pair_scr_quality_samples refuses. The control needs its own pairing entry point, and
+// the point of these checks is that it is a *deliberate* bypass rather than a weakened guard: the
+// measurement pairing still rejects a run that relocated nothing.
+void test_control_pairs_two_full_prefills() {
+    const std::string tokens = "[1,2,3,4]";
+    const std::string probs  = "[0.5,0.25,-0.125,-1.5]";
+    const auto first = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", tokens, probs) + "\n");
+    const auto second = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", tokens, probs) + "\n");
+
+    // The measurement pairing still refuses, so the guard has not been quietly relaxed.
+    expect_invalid("the measurement pairing still requires relocation",
+                   [&] { (void)ninfer::serve::pair_scr_quality_samples(first, second); });
+
+    const auto samples = ninfer::serve::pair_scr_quality_samples_for_control(first, second);
+    expect(samples.size() == 1, "the control pairs two full prefills");
+    expect(samples[0].baseline_tokens.size() == 4, "both sides' tokens are carried through");
+
+    // Two identical full prefills are a clean control: the floor is zero.
+    const auto control = ninfer::serve::evaluate_scr_quality_control(
+        first, second, scr_quality::ScrQualityThresholds{});
+    expect(control.prompts.size() == 1, "the control is scored");
+    expect(scr_quality::scr_quality_control_is_clean(control),
+           "two identical full prefills are a clean control");
+    expect(control.prompts.front().first_divergence_index == 4,
+           "the control agreed at every position it compared");
+    expect(control.prompts.front().logprobs_available == 4,
+           "all four positions were available to disagree at");
+
+    // A control that flips a token is not clean, even though the logprob gap that caused it is small.
+    const auto flipped = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", "[1,2,9,4]", probs) + "\n");
+    const auto noisy = ninfer::serve::evaluate_scr_quality_control(
+        first, flipped, scr_quality::ScrQualityThresholds{});
+    expect(!scr_quality::scr_quality_control_is_clean(noisy),
+           "a control that flipped a token cannot authorize a verdict");
+    const auto divergent = scr_quality::scr_quality_control_divergent_prompts(noisy);
+    expect(divergent.size() == 1 && divergent[0] == 0, "the flipped prompt is named");
+
+    // The prompt-length check is not bypassed along with the relocation check.
+    const auto other_length = ninfer::serve::parse_completion_log(
+        record(1, 900, 0, 0, "full_reset", tokens, probs) + "\n");
+    expect_invalid("the control still refuses mismatched prompt lengths", [&] {
+        (void)ninfer::serve::pair_scr_quality_samples_for_control(first, other_length);
+    });
+}
+
 } // namespace
 
 int main() {
@@ -339,6 +388,7 @@ int main() {
     test_pairing_requires_comparable_runs();
     test_report_scores_and_fails_honestly();
     test_divergence_after_a_flip_is_not_averaged_in();
+    test_control_pairs_two_full_prefills();
     test_server_arguments_are_a_valid_invocation();
     if (failures != 0) {
         std::cerr << failures << " SCR quality log checks failed\n";

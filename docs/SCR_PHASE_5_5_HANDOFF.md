@@ -49,6 +49,64 @@ Two smaller gaps are also known and deferred, in case they come up:
 
 ---
 
+## 1a. The measurement is built; it has never yet produced an attributable number
+
+`ninfer-scr-quality` exists and runs, but treat its output as **unproven** until the null control comes
+back clean. Three successive defects were found by reading its output, and each one had produced a
+confident wrong number rather than an obvious failure:
+
+1. **The suite could not exercise the feature.** `diff_prompt_edit` finds surviving spans by hashing
+   whole 64-token pages. The built-in suite's revision changed the prompt's token count by a few
+   tokens, so no page boundary after the edit realigned and nothing survived. Five of six prompts
+   reported `full_reset`. Fixed by making the edit length-balanced *and* by having the harness refuse
+   a non-page-aligned edit (`f7119708`).
+
+2. **The scorer measured its own divergence feedback.** `evaluate_scr_prompt` compared logprobs
+   index-aligned over `min(len_a, len_b)` — "shared prefix" was implemented as *the shorter run*.
+   Both runs emit 64 tokens, so the bound never bound, and past the first flipped token it
+   differenced logprobs of two *different* tokens. The header for that file already said this must
+   not happen. Fixed in `036a266c`.
+
+3. **There is no noise floor.** Two runs of one configuration are not guaranteed bit-identical, so a
+   divergence without a control is unattributable. This is what the third phase is for.
+
+Symptom of (2) that gave it away: greedy agreement was *non-monotone* in the amount of reused context
+(0.125, 0.109, 0.094, 0.094, 0.750, 0.750 for K = 1…64). Index-aligned agreement scores whatever
+fraction of the drift happened to re-synchronize. **A sweep whose x-axis is reused-context size cannot
+read as a curve if the y-axis measures coincidence.**
+
+The corrected run then produced this, which is *not* a result, only a reason to want the control:
+
+| K | relocated | parted@ | d(first) | d(mean) |
+|---|---|---|---|---|
+| 1 | 64 | 8 | 0.0021 | 0.0257 |
+| 2 | 192 | 8 | 0.0751 | 0.1692 |
+| 3 | 256 | 6 | 0.0043 | 0.0041 |
+| 6 | 576 | 6 | 0.0206 | 0.0410 |
+| 12 | 1152 | 6 | 0.00018 | 0.0028 |
+| 64 | 6208 | 48 | 0.0033 | 0.0233 |
+
+`d(first)` has **no relationship to how much context was reused** — the largest perturbation is at
+K=2, the smallest at K=12. A relocation error that grows with the reused region does not look like
+that. A run-to-run floor of comparable size does. Hence the control.
+
+### How to read the control
+
+- **Control clean** (`parted@ == logprobs_available` everywhere, `attributable: true`, exit 0): the
+  floor is zero, `d(first)` is genuinely the reuse path, and `parted@` of 6–8 is a real finding about
+  relocation worth chasing hard.
+- **Control dirty** (`attributable: false`, exit 3): two identical configurations disagreed, so
+  `d(first)` has no floor to subtract and says nothing about SCR. The work is then determinism, not
+  quality. The report is still written, because it is the evidence for *why* it is unattributable.
+
+Note the second-order tension this exposes, whichever way the control comes back: the roadmap's two
+thresholds are `mean divergence < 0.05 nats` and `greedy agreement > 95% over 64 tokens`. The first
+is a budget loose enough to permit perturbations that will eventually flip a greedy decode; the second
+requires *zero* flips in 64. If `d(first)` turns out to be real, those two bounds cannot both be
+satisfied on this model, and that is a finding about the thresholds rather than about SCR.
+
+---
+
 ## 2. Environment
 
 ```powershell

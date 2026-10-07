@@ -114,6 +114,24 @@ struct ScrQualityReport {
 [[nodiscard]] ScrQualityReport evaluate_scr_quality(std::span<const ScrQualitySample> samples,
                                                     const ScrQualityThresholds& thresholds);
 
+// Whether a null-control report is clean: every prompt's two runs chose the same token at every
+// position both sides had one.
+//
+// This is the gate on attributing a measurement. Two runs of an identical configuration are not
+// guaranteed bit-identical, so a measurement that reports divergence alongside a control that also
+// diverges has no floor to subtract -- the spread could be entirely run-to-run variation, and no
+// amount of reading the SCR-versus-baseline numbers will separate the two. A clean control says the
+// floor is zero, so whatever the measurement reports is attributable to the difference between the
+// paths being compared.
+//
+// An empty report is *not* clean: it measured nothing, and nothing cannot establish a floor.
+[[nodiscard]] bool scr_quality_control_is_clean(const ScrQualityReport& control);
+
+// The indices of the prompts in a control report that did not agree with themselves, for naming them.
+// Empty exactly when scr_quality_control_is_clean is true.
+[[nodiscard]] std::vector<std::uint32_t> scr_quality_control_divergent_prompts(
+    const ScrQualityReport& control);
+
 // One line of JSON per prompt plus an aggregate line, in a fixed key order so two runs are
 // diffable. Numbers are emitted with enough precision to compare against the thresholds by hand.
 [[nodiscard]] std::string format_scr_quality_json(const ScrQualityReport& report,

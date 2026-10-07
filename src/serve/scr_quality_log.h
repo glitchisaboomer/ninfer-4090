@@ -52,6 +52,25 @@ struct LoggedCompletion {
 pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
                          std::span<const LoggedCompletion> baseline);
 
+// Pairs two runs that are *both* full prefills, for the null control.
+//
+// The relocation requirement in pair_scr_quality_samples is the right guard for the measurement and
+// exactly wrong here: the control exists to measure the same configuration twice, so it relocates
+// nothing by construction and the guard would reject the very run that establishes the noise floor.
+// Nothing else differs between the two pairings -- same prompt-length check, same positional pairing,
+// same scoring.
+[[nodiscard]] std::vector<targets::qwen3_6::detail::ScrQualitySample>
+pair_scr_quality_samples_for_control(std::span<const LoggedCompletion> first,
+                                     std::span<const LoggedCompletion> second);
+
+// Scores the null control: the same prompts served twice under identical settings. A control that
+// agrees everywhere says the run-to-run floor is zero, so any divergence the measurement reports is
+// attributable to the reuse path; a control that parts early means the measurement is dominated by
+// whatever varies between processes and attributes nothing. Empty when either side is empty.
+[[nodiscard]] targets::qwen3_6::detail::ScrQualityReport evaluate_scr_quality_control(
+    std::span<const LoggedCompletion> first, std::span<const LoggedCompletion> second,
+    const targets::qwen3_6::detail::ScrQualityThresholds& thresholds);
+
 // Scores every paired prompt and returns the target's own report, so a caller that wants to read the
 // numbers rather than serialize them can, without re-pairing or duplicating the thresholds. Throws
 // exactly where pair_scr_quality_samples does. Empty when either side is empty.

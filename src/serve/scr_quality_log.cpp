@@ -137,9 +137,11 @@ std::vector<LoggedCompletion> parse_completion_log(std::string_view jsonl) {
     return completions;
 }
 
+namespace {
+
 std::vector<targets::qwen3_6::detail::ScrQualitySample>
-pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
-                         std::span<const LoggedCompletion> baseline) {
+pair_samples(std::span<const LoggedCompletion> scr, std::span<const LoggedCompletion> baseline,
+             bool require_relocation) {
     if (scr.size() != baseline.size()) {
         throw std::invalid_argument("the two runs logged a different number of completions");
     }
@@ -158,7 +160,7 @@ pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
         // Suffix Cache Reuse that relocated nothing is not a measurement of Suffix Cache Reuse.
         // Scoring it anyway would report near-zero divergence for a run in which the feature never
         // engaged, which is the one result that looks like success and means nothing.
-        if (scr_completion.prefix_relocated_tokens == 0) {
+        if (require_relocation && scr_completion.prefix_relocated_tokens == 0) {
             throw std::invalid_argument(
                 "completion " + std::to_string(index) +
                 " reused no relocated tokens (path=" + scr_completion.prefix_reuse_path +
@@ -174,6 +176,20 @@ pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
     return samples;
 }
 
+} // namespace
+
+std::vector<targets::qwen3_6::detail::ScrQualitySample>
+pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
+                         std::span<const LoggedCompletion> baseline) {
+    return pair_samples(scr, baseline, /*require_relocation=*/true);
+}
+
+std::vector<targets::qwen3_6::detail::ScrQualitySample>
+pair_scr_quality_samples_for_control(std::span<const LoggedCompletion> first,
+                                     std::span<const LoggedCompletion> second) {
+    return pair_samples(first, second, /*require_relocation=*/false);
+}
+
 targets::qwen3_6::detail::ScrQualityReport evaluate_scr_quality_report(
     std::span<const LoggedCompletion> scr, std::span<const LoggedCompletion> baseline,
     const targets::qwen3_6::detail::ScrQualityThresholds& thresholds) {
@@ -181,6 +197,15 @@ targets::qwen3_6::detail::ScrQualityReport evaluate_scr_quality_report(
     if (scr.empty() || baseline.empty()) { return report; }
     return targets::qwen3_6::detail::evaluate_scr_quality(pair_scr_quality_samples(scr, baseline),
                                                           thresholds);
+}
+
+targets::qwen3_6::detail::ScrQualityReport evaluate_scr_quality_control(
+    std::span<const LoggedCompletion> first, std::span<const LoggedCompletion> second,
+    const targets::qwen3_6::detail::ScrQualityThresholds& thresholds) {
+    targets::qwen3_6::detail::ScrQualityReport report;
+    if (first.empty() || second.empty()) { return report; }
+    return targets::qwen3_6::detail::evaluate_scr_quality(
+        pair_scr_quality_samples_for_control(first, second), thresholds);
 }
 
 std::string format_scr_quality_report(

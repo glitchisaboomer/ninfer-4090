@@ -153,6 +153,22 @@ ScrQualityReport evaluate_scr_quality(std::span<const ScrQualitySample> samples,
     return report;
 }
 
+std::vector<std::uint32_t> scr_quality_control_divergent_prompts(const ScrQualityReport& control) {
+    std::vector<std::uint32_t> divergent;
+    for (std::size_t i = 0; i < control.prompts.size(); ++i) {
+        // parted@ == logprobs_available means the two runs chose the same token at every position
+        // both of them had. Anything earlier is a disagreement, however small the logprob gap was.
+        if (control.prompts[i].first_divergence_index < control.prompts[i].logprobs_available) {
+            divergent.push_back(static_cast<std::uint32_t>(i));
+        }
+    }
+    return divergent;
+}
+
+bool scr_quality_control_is_clean(const ScrQualityReport& control) {
+    return !control.prompts.empty() && scr_quality_control_divergent_prompts(control).empty();
+}
+
 std::string format_scr_quality_json(const ScrQualityReport& report,
                                     const ScrQualityThresholds& thresholds) {
     std::ostringstream out;

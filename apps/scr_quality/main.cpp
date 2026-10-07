@@ -6,16 +6,23 @@
 // the target's own input by src/serve/scr_quality_log.cpp and scored by
 // qwen3_6::detail::evaluate_scr_quality, so the roadmap's thresholds exist in exactly one place.
 //
-// Two runs are needed and they cannot be concurrent -- a 27B model leaves no room for a second
+// Three runs are needed and they cannot be concurrent -- a 27B model leaves no room for a second
 // resident copy on one 4090 -- so the phases run one after the other on different ports:
 //
 //   phase SCR       --scr,                       request log A
 //   phase baseline  --no-scr --no-prefix-reuse,  request log B
+//   phase control   --no-scr --no-prefix-reuse,  request log C
 //
-// Each prompt is sent to both phases as [pre-edit, edited]; the edited reply is the one compared.
+// Each prompt is sent to every phase as [pre-edit, edited]; the edited reply is the one compared.
 // The baseline deliberately disables prefix reuse as well, because the roadmap measures against the
 // full-prefill path; two servers with different cache states would otherwise agree for reasons that
 // have nothing to do with relocation.
+//
+// The control is the baseline run repeated under identical settings, and it is not optional. Two runs
+// of the same configuration are not guaranteed to be bit-identical, and a comparison that reports
+// divergence without a floor cannot say whether the reuse path caused it. The control measures that
+// floor. When it is zero, the SCR-versus-baseline numbers are attributable; when it is not, the run
+// is reported as unattributable and exits non-zero rather than reaching a verdict.
 //
 // Requests are sent one at a time, and an edited request is only sent after its own pre-edit reply
 // has arrived. Concurrency would make the cache state the relocator sees depend on admission order,
@@ -106,13 +113,14 @@ struct SuitePrompt {
               << "usage: ninfer-scr-quality --model <artifact.ninfer> [options]\n"
               << "  --exe <path>                  ninfer-serve binary (default: " << Options{}.exe
               << ")\n"
-              << "  --work-dir <dir>              where the two request logs are written\n"
+              << "  --work-dir <dir>              where the three request logs are written\n"
               << "  --prompts <file>              JSONL of {name,primed_messages,edited_messages}\n"
               << "  --k-blocks <a,b,c>            shared-tail lengths to sweep, in 64-token blocks\n"
               << "  --prompts-per-k <n>           built-in prompts generated per K (default 1)\n"
               << "  --max-tokens <n>              output tokens per request (default 64)\n"
               << "  --max-context <n>             server KV context budget (default 8192)\n"
-              << "  --port <n>                    first phase port; the baseline uses n+1\n"
+              << "  --port <n>                    first phase port; the baseline uses n+1 and the\n"
+                 "                                null control n+2\n"
               << "  --server-args \"<args>\"       extra arguments for both server runs\n"
               << "  --baseline-server-args \"<args>\"   extra arguments for the baseline run\n"
               << "  --api-key <key>               bearer token, when the server requires one\n"
@@ -535,10 +543,11 @@ select_edited(const std::vector<ninfer::serve::LoggedCompletion>& completions, b
 // "relocation perturbs the first token and the rest is decoder feedback": it is measured before any
 // divergence can compound, so unlike the mean it is not inflated by a run that flips at step 3 and
 // then wanders for 60 more tokens.
-void print_curve(const std::vector<SuitePrompt>& prompts,
+void print_curve(const char* title, const std::vector<SuitePrompt>& prompts,
                  const std::vector<ninfer::serve::LoggedCompletion>& edited,
                  const ninfer::targets::qwen3_6::detail::ScrQualityReport& scored) {
-    std::cerr << "\n  K   prompt  relocated   parted@   d(first)   d(mean)   d(max)   agree   "
+    std::cerr << "\n" << title << "\n\n";
+    std::cerr << "  K   prompt  relocated   parted@   d(first)   d(mean)   d(max)   agree   "
                  "verdict\n";
     std::cerr << "  ----------------------------------------------------------------------"
                  "----------\n";
@@ -552,9 +561,6 @@ void print_curve(const std::vector<SuitePrompt>& prompts,
             << (result.ok ? "pass" : "FAIL") << "\n";
         std::cerr << row.str();
     }
-    std::cerr << "\n  parted@ is the first greedy token the two paths disagreed on, so the columns to\n"
-                 "  its right describe a prefix both paths chose identically and are comparable; the\n"
-                 "  agreement column is index-aligned and is not.\n";
 }
 
 } // namespace
@@ -565,6 +571,7 @@ int main(int argc, char** argv) {
         std::filesystem::create_directories(options.work_dir);
         const std::string scr_log      = options.work_dir + "/scr.jsonl";
         const std::string baseline_log = options.work_dir + "/baseline.jsonl";
+        const std::string control_log  = options.work_dir + "/control.jsonl";
         const std::vector<SuitePrompt> prompts = build_suite(options);
         const std::string report_path = (options.json_out.empty() || options.json_out == "-")
                                             ? options.work_dir + "/scr-quality.json"
@@ -573,37 +580,71 @@ int main(int argc, char** argv) {
                   << "\n";
 
         run_phase(options, prompts, true, options.port, scr_log);
-        // A separate port keeps the second phase off a socket still in TIME_WAIT.
+        // A separate port keeps each later phase off a socket still in TIME_WAIT.
         run_phase(options, prompts, false, options.port + 1, baseline_log);
+        // The control is the baseline configuration run a second time. Without it the measurement has
+        // no noise floor, and every divergence it reports is unattributable: the same spread is
+        // produced by two runs that differ in nothing. The 2026-10-08 sweep is the case in point --
+        // d(first) varied from 1.8e-4 to 7.5e-2 nats with no relationship to how much context was
+        // reused, which is what a floor of comparable size looks like and not what a relocation error
+       // that grows with the reused region looks like.
+        run_phase(options, prompts, false, options.port + 2, control_log);
 
-        const std::vector<ninfer::serve::LoggedCompletion> scr_completions =
-            ninfer::serve::parse_completion_log(read_file(scr_log));
-        const std::vector<ninfer::serve::LoggedCompletion> baseline_completions =
-            ninfer::serve::parse_completion_log(read_file(baseline_log));
-        if (scr_completions.size() != prompts.size() * 2 ||
-            baseline_completions.size() != prompts.size() * 2) {
-            throw std::runtime_error("the request logs do not describe the prompts that were sent");
-        }
+        const auto load = [&](const std::string& path, const char* phase) {
+            const std::vector<ninfer::serve::LoggedCompletion> completions =
+                ninfer::serve::parse_completion_log(read_file(path));
+            if (completions.size() != prompts.size() * 2) {
+                throw std::runtime_error(std::string("the ") + phase +
+                                         " request log does not describe the prompts that were sent");
+            }
+            return completions;
+        };
         const std::vector<ninfer::serve::LoggedCompletion> scr_edited =
-            select_edited(scr_completions, true);
+            select_edited(load(scr_log, "SCR"), true);
         const std::vector<ninfer::serve::LoggedCompletion> baseline_edited =
-            select_edited(baseline_completions, false);
+            select_edited(load(baseline_log, "baseline"), false);
+        const std::vector<ninfer::serve::LoggedCompletion> control_edited =
+            select_edited(load(control_log, "control"), false);
+
         const ninfer::targets::qwen3_6::detail::ScrQualityThresholds thresholds;
         // Throws when a prompt relocated nothing: a suite that never engaged Suffix Cache Reuse
         // would otherwise compare two full prefills and read as a pass.
         const auto scored = ninfer::serve::evaluate_scr_quality_report(scr_edited, baseline_edited,
                                                                       thresholds);
-        const std::string report =
-            ninfer::targets::qwen3_6::detail::format_scr_quality_json(scored, thresholds);
-        print_curve(prompts, scr_edited, scored);
+        // Scored through its own entry point because the control relocates nothing by construction,
+        // which is precisely what pair_scr_quality_samples refuses.
+        const auto control =
+            ninfer::serve::evaluate_scr_quality_control(baseline_edited, control_edited, thresholds);
+        const std::vector<std::uint32_t> unattributable =
+            ninfer::targets::qwen3_6::detail::scr_quality_control_divergent_prompts(control);
+        const bool attributable =
+            ninfer::targets::qwen3_6::detail::scr_quality_control_is_clean(control);
+
+        print_curve("MEASUREMENT  scr vs baseline", prompts, scr_edited, scored);
+        print_curve("CONTROL  baseline vs baseline (the noise floor)", prompts, baseline_edited,
+                    control);
+
+        std::cerr << "\n  parted@ is the first greedy token the two runs disagreed on, so the columns "
+                     "to its right\n  describe a prefix both runs chose identically and are "
+                     "comparable; the agreement column is\n  index-aligned and is not.\n";
+
+        // The envelope carries the control beside the measurement, because a report that states a
+        // verdict without the floor it was measured against is not a report. The inner objects are
+        // the target's own format, so the thresholds still exist in exactly one place.
+        std::ostringstream report;
+        report << "{\"attributable\":" << (attributable ? "true" : "false") << ",\"control\":"
+               << ninfer::targets::qwen3_6::detail::format_scr_quality_json(control, thresholds)
+               << ",\"measurement\":"
+               << ninfer::targets::qwen3_6::detail::format_scr_quality_json(scored, thresholds)
+               << "}\n";
 
         if (options.json_out == "-") {
-            std::cout << report;
+            std::cout << report.str();
             std::cout.flush();
         } else {
             std::ofstream output(report_path, std::ios::binary | std::ios::trunc);
             if (!output) { throw std::runtime_error("cannot write " + report_path); }
-            output << report;
+            output << report.str();
             std::cerr << "wrote " << report_path << "\n";
         }
         std::cerr << "\nThis measures argmax robustness and logprob divergence, not distribution "
@@ -612,7 +653,21 @@ int main(int argc, char** argv) {
         if (!options.keep_logs) {
             std::remove(scr_log.c_str());
             std::remove(baseline_log.c_str());
+            std::remove(control_log.c_str());
         }
+        if (!attributable) {
+            std::cerr << "\nUNATTRIBUTABLE: the control parted from itself on prompt(s) ";
+            for (std::size_t i = 0; i < unattributable.size(); ++i) {
+                std::cerr << (i == 0 ? "" : ", ") << unattributable[i];
+            }
+            std::cerr << ".\n  Two runs of the same configuration disagreed there, so the "
+                         "measurement's divergence\n  for those prompts has no floor to subtract and "
+                         "says nothing about Suffix\n  Cache Reuse. Settle run-to-run determinism "
+                         "before reading them.\n";
+            return 3;
+        }
+        std::cerr << "\nThe control agreed with itself on every prompt, so the run-to-run floor is "
+                     "zero and the\n  measurement above is attributable to the reuse path.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << "\n";
