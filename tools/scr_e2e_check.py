@@ -171,7 +171,15 @@ MIDDLE_FILLER = [
     "It is removed by the edit that request B applies.",
 ]
 
-# The fact the question asks about, at the very end of the prompt so it is the surviving tail.
+# Where the answer fact lives. "tail" puts it only in the surviving run, which is the harsh case:
+# the linear-attention layers cannot see a relocated run at all, so the answer is unreachable for
+# 48 of 64 layers. "prefix" puts it before the edit, where both the relocated KV and the rebuilt
+# linear-attention state can reach it, which separates "relocation is broken" from "the
+# approximation is too coarse at this relocated fraction".
+FACT_PLACEMENT = "tail"
+
+# The fact the question asks about. At the very end of the prompt when placed in the tail, so it is
+# the surviving region.
 TAIL_SENTENCES = [
     "The approved rollback window is fourteen minutes.",
     "Any rollback exceeding that window requires a change advisory.",
@@ -182,6 +190,12 @@ TAIL_SENTENCES = [
     "No customer-visible incident was attributed to these changes.",
     "The maintenance record closes with the operator sign-off.",
 ]
+
+# The same fact, placed in the prefix instead so it survives the edit without being relocated.
+PREFIX_FACT = (
+    "The approved rollback window is fourteen minutes. "
+    "Any rollback exceeding that window requires a change advisory.\n\n"
+)
 
 
 def _join(sentences, repeats):
@@ -201,7 +215,8 @@ def _pad(sentences, units):
 
 
 def prefix_text(units):
-    return QUESTION + _join(PREFIX_FILLER, 4) + _pad(MIDDLE_FILLER, units)
+    fact = PREFIX_FACT if FACT_PLACEMENT == "prefix" else ""
+    return QUESTION + fact + _join(PREFIX_FILLER, 4) + _pad(MIDDLE_FILLER, units)
 
 
 def middle_text(units):
@@ -209,6 +224,8 @@ def middle_text(units):
 
 
 def tail_text():
+    if FACT_PLACEMENT == "prefix":
+        return " " + _join(TAIL_SENTENCES[2:], 3)
     return " " + _join(TAIL_SENTENCES, 3)
 
 
@@ -368,6 +385,13 @@ def main():
     parser.add_argument("--cwd", default=".", help="working directory for the server")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--fact-in", choices=("tail", "prefix"), default="tail",
+                        help="where the answer fact sits. 'tail' puts it only in the relocated run, "
+                             "which the linear-attention layers cannot see at all -- the harsh case. "
+                             "'prefix' puts it before the edit, so both the relocated KV and the "
+                             "rebuilt linear-attention state can reach it. If 'prefix' passes and "
+                             "'tail' fails, relocation is working and the approximation is simply "
+                             "too coarse at this relocated fraction.")
     parser.add_argument("--think", action="store_true",
                         help="keep thinking enabled. Off by default: this model reasons at length, "
                              "so a thinking run can burn the whole token budget without ever "
@@ -385,6 +409,8 @@ def main():
     # Split on whitespace. Deliberately not shlex: on Windows a backslash path would be mangled by
     # POSIX-style escape handling, and the server arguments here never need quoting.
     args.base_args_list = args.base_args.split()
+    global FACT_PLACEMENT
+    FACT_PLACEMENT = args.fact_in
 
     artifact = next((a for a in args.base_args_list if a.lower().endswith(".ninfer")), None)
     if artifact is None:
