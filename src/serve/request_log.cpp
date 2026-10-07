@@ -135,6 +135,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case ninfer::PrefixReusePath::RestoreDiskCheckpoint:
         return "restore_disk_checkpoint";
+    case ninfer::PrefixReusePath::SuffixRelocation:
+        return "suffix_relocation";
     }
     return "unknown";
 }
@@ -440,6 +442,8 @@ std::string format_server_start_json(
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
+          {"suffix_cache_reuse", options.enable_suffix_cache_reuse},
+          {"suffix_reuse_max_spans", options.suffix_reuse_max_spans},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
           {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
@@ -498,6 +502,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
               std::max(0, outcome.prompt_tokens -
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
+             {"prefix_relocated_tokens", outcome.metrics.prefix_relocated_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{

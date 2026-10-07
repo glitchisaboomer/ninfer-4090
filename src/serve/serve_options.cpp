@@ -97,6 +97,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --prefill-chunk <N>         Prefill chunk size in tokens (multiple of 128, default: 1024)\n"
            "  --no-cuda-graph             Disable CUDA Graph capture/replay (executes via standard CUDA streams)\n"
            "  --no-prefix-reuse           Disable KV prefix cache reuse across requests (prefix reuse enabled by default)\n"
+           "  --scr                       Enable Suffix Cache Reuse: after an in-the-middle context\n"
+           "                              edit, reuse resident KV for the surviving suffix instead\n"
+           "                              of re-prefilling it (experimental; off by default)\n"
+           "  --scr-max-spans <N>         Maximum surviving spans relocated per edit (default: " +
+               std::to_string(kDefaultSuffixReuseMaxSpans) + ")\n"
            "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
            "Persistent Prompt Cache (DirectStorage DMA):\n"
            "  --disk-cache / --prompt-cache     Enable persistent multi-turn prompt caching to disk via DirectStorage DMA\n"
@@ -252,6 +257,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--scr" || arg == "--suffix-cache-reuse") {
+            options.enable_suffix_cache_reuse = true;
+        } else if (arg == "--no-scr" || arg == "--no-suffix-cache-reuse") {
+            options.enable_suffix_cache_reuse = false;
+        } else if (arg == "--scr-max-spans" || arg == "--suffix-reuse-max-spans") {
+            const int val = parse_nonnegative_int(require_value(arg.c_str()), arg.c_str());
+            if (val <= 0) {
+                throw std::invalid_argument(std::string(arg) + " must be positive");
+            }
+            options.suffix_reuse_max_spans = static_cast<std::uint32_t>(val);
         } else if (arg == "--wddm-evictable-budget") {
             options.wddm_evictable_budget = true;
         } else if (arg == "--prompt-cache" || arg == "--disk-cache" || arg == "--enable-prompt-cache") {

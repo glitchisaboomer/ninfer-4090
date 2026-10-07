@@ -162,6 +162,13 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // Opt-in Suffix Cache Reuse. Off by default: reusing cached KV for surviving suffix
+    // tokens is an approximation, because those states were computed under the pre-edit
+    // context.
+    bool enable_suffix_cache_reuse = false;
+    // Upper bound on relocated spans per edit. Reuse of the longest spans is preferred and
+    // the remainder is re-prefilled, which bounds the approximation introduced at once.
+    std::uint32_t suffix_reuse_max_spans = 6;
 };
 
 struct OutputOptions {
@@ -378,6 +385,11 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreDiskCheckpoint,
+    // Suffix Cache Reuse: the prompt survived a context edit, so resident KV for the
+    // unaffected run after the edit is reused at its new positions instead of being
+    // re-prefilled. Unlike every other path, the tokens after `reuse_base` are not all
+    // prefilled, so consumers must not assume "prefill the remainder".
+    SuffixRelocation,
 };
 
 struct GenerationResult {
@@ -388,6 +400,10 @@ struct GenerationResult {
     std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
+    // Prompt tokens served by Suffix Cache Reuse rather than re-prefilled. A subset of
+    // `reused_prompt_tokens`, reported separately so prefix reuse and SCR stay
+    // distinguishable in telemetry.
+    std::uint32_t relocated_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;

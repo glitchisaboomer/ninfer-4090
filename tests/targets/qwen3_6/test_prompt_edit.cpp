@@ -271,6 +271,112 @@ void test_empty_and_degenerate_inputs() {
         "zero block size must be rejected");
 }
 
+void test_plan_relocations() {
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    // Scope A shape: [P R S] -> [P S]. The prefix span is ordinary prefix reuse, so only the
+    // surviving suffix should be reported as a relocation.
+    Tokens previous;
+    append(previous, segment(1, 2));
+    append(previous, segment(2, 2));
+    append(previous, segment(3, 2));
+    Tokens current;
+    append(current, segment(1, 2));
+    append(current, segment(3, 2));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto relocations     = plan_relocations(diff, resident, 0, 6);
+
+    expect(relocations.size() == 1, "only the surviving suffix is relocated");
+    if (relocations.size() == 1) {
+        expect(relocations.front().source_begin == block_tokens(4), "relocation source is the old suffix");
+        expect(relocations.front().dest_begin == block_tokens(2), "relocation destination is the new suffix");
+        expect(relocations.front().tokens == block_tokens(2), "relocation length is the suffix length");
+    }
+
+    // Zero cap means reuse nothing, which is how SCR is disabled per request.
+    expect(plan_relocations(diff, resident, 0, 0).empty(), "a zero span cap relocates nothing");
+
+    // A span without resident KV cannot be relocated.
+    expect(plan_relocations(diff, block_tokens(5), 0, 6).empty(),
+           "a span outside resident KV is not relocated");
+
+    // The surviving suffix moves from block 4 to block 2. When ordinary prefix reuse already
+    // covers the first four blocks, the suffix starts at the frontier and is still relocated.
+    expect(plan_relocations(diff, resident, block_tokens(2), 6).size() == 1,
+           "a survivor exactly at the prefix frontier is relocated");
+
+    // Once prefix reuse reaches into the survivor's destination, that region is already covered
+    // and must not be claimed a second time.
+    expect(plan_relocations(diff, resident, block_tokens(3), 6).empty(),
+           "a survivor inside the prefix-reuse region is not relocated");
+    expect(plan_relocations(diff, resident, block_tokens(4), 6).empty(),
+           "prefix reuse covering the whole survivor leaves nothing to relocate");
+}
+
+void test_plan_relocations_keeps_longest() {
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+
+    // Three surviving regions after the prefix, each separated by a replaced block so the
+    // diff cannot merge them into one run. Lengths run 1, 2, 3 in prompt order, so the
+    // longest survivor is last: keeping the longest is distinguishable from keeping the
+    // first N in prompt order. The replacements differ in length from what they replace,
+    // so every survivor also moves, and source and destination offsets stay distinct.
+    Tokens previous;
+    append(previous, segment(1, 1)); // prefix
+    append(previous, segment(2, 1)); // replaced by three blocks
+    append(previous, segment(6, 1)); // survivor, shortest, first in prompt order
+    append(previous, segment(4, 2)); // replaced by one block
+    append(previous, segment(5, 2)); // survivor, middle
+    append(previous, segment(7, 1)); // replaced by two blocks
+    append(previous, segment(3, 3)); // survivor, longest, last in prompt order
+
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(9, 3));
+    append(current, segment(6, 1));
+    append(current, segment(8, 1));
+    append(current, segment(5, 2));
+    append(current, segment(8, 2));
+    append(current, segment(3, 3));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident = static_cast<std::uint32_t>(previous.size());
+
+    // All three survivors plus the prefix are detected before capping.
+    expect(diff.spans.size() == 4, "the fixture keeps its three survivors separate");
+    expect(diff.relocated_tokens() == block_tokens(6),
+           "the fixture relocates one, two, and three blocks");
+
+    // The cap is smaller than the number of candidates; the dropped span is the one-block
+    // survivor, not the earliest candidate.
+    const auto capped = plan_relocations(diff, resident, 0, 2);
+    expect(capped.size() == 2, "the span cap is honored");
+    if (capped.size() == 2) {
+        expect(capped[0].tokens == block_tokens(2) && capped[1].tokens == block_tokens(3),
+               "the cap keeps the longest survivors");
+        expect(capped[0].dest_begin < capped[1].dest_begin, "relocations are returned in prompt order");
+        expect(capped[0].source_begin == block_tokens(5) && capped[0].dest_begin == block_tokens(6),
+               "a capped survivor reports its own source and destination");
+    }
+
+    const auto all = plan_relocations(diff, resident, 0, 6);
+    expect(all.size() == 3, "every surviving region is relocated when the cap allows");
+    if (all.size() == 3) {
+        expect(all[0].dest_begin < all[1].dest_begin && all[1].dest_begin < all[2].dest_begin,
+               "uncapped relocations are in prompt order");
+        expect(all[0].tokens == block_tokens(1) && all[1].tokens == block_tokens(2) &&
+                   all[2].tokens == block_tokens(3),
+               "prompt order is independent of survivor length");
+        expect(all[0].source_begin == block_tokens(2) && all[0].dest_begin == block_tokens(4),
+               "the shortest survivor moves forward");
+        expect(all[2].source_begin == block_tokens(8) && all[2].dest_begin == block_tokens(10),
+               "the longest survivor moves forward");
+    }
+}
+
 void test_determinism() {
     Tokens previous;
     append(previous, segment(1, 2));
@@ -297,6 +403,8 @@ int main() {
     test_partial_tail_is_never_reused();
     test_repeated_blocks_stay_monotone();
     test_empty_and_degenerate_inputs();
+    test_plan_relocations();
+    test_plan_relocations_keeps_longest();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

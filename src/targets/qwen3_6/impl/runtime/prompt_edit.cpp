@@ -55,6 +55,44 @@ constexpr std::size_t kMaxCandidateProbes = 8;
 
 } // namespace
 
+std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
+                                           std::uint32_t resident_kv_tokens,
+                                           std::uint32_t prefix_reuse_tokens,
+                                           std::uint32_t max_spans) {
+    std::vector<RelocatedSpan> candidates;
+    if (max_spans == 0) { return candidates; }
+
+    for (const SurvivingSpan& span : diff.spans) {
+        // The leading span is ordinary prefix reuse, already expressed by the planner's
+        // reuse base; relocating it would account for the same tokens twice.
+        if (span.old_begin == 0 && span.new_begin == 0) { continue; }
+        // Relocation needs the resident KV entry to still exist.
+        if (span.old_end() > resident_kv_tokens) { continue; }
+        // A destination at or below the prefix-reuse frontier is already covered by ordinary
+        // prefix reuse. A span that starts below it and ends above it is dropped whole, because
+        // splitting it would leave the reused part of the destination claimed by two paths.
+        if (span.new_begin < prefix_reuse_tokens) { continue; }
+        candidates.push_back(RelocatedSpan{.source_begin = span.old_begin,
+                                           .dest_begin   = span.new_begin,
+                                           .tokens       = span.tokens});
+    }
+
+    // Longest survivors first so the cap discards the least useful reuse.
+    const std::size_t keep = std::min<std::size_t>(max_spans, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep),
+                      candidates.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
+                          return a.tokens > b.tokens;
+                      });
+    candidates.resize(keep);
+
+    // The runtime consumes them in prompt order.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const RelocatedSpan& a, const RelocatedSpan& b) {
+                  return a.dest_begin < b.dest_begin;
+              });
+    return candidates;
+}
+
 PromptEditDiff diff_prompt_edit(std::span<const TokenId> previous, std::span<const TokenId> current,
                                 std::uint32_t block_tokens) {
     if (block_tokens == 0) {

@@ -13,6 +13,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/prompt_edit.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -42,6 +43,11 @@ enum class MtpBridgeMode : std::uint8_t {
     AfterExactHit,
 };
 
+// Host-side relocation geometry for Suffix Cache Reuse. Defined with the edit detector so
+// the selection rules stay testable without a device; this alias only re-homes it into the
+// runtime namespace.
+using RelocatedSpan = qwen3_6::detail::RelocatedSpan;
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -56,6 +62,8 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<std::uint32_t> turn_rewrite_boundary;
     bool allow_prefix_reuse = false;
+    bool enable_suffix_cache_reuse = false;
+    std::uint32_t suffix_reuse_max_spans = 0;
     std::vector<std::uint32_t> token_mask;
     bool disable_speculation = false;
 };
@@ -65,6 +73,9 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
+    // Populated only when `reuse == SuffixRelocation`. Empty means every token after
+    // `reuse_base` is prefilled, which is the assumption every other reuse path relies on.
+    std::vector<NINFER_QWEN36_RUNTIME_NS::RelocatedSpan> relocated_spans;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;

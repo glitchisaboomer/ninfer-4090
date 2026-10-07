@@ -15,6 +15,9 @@ namespace ninfer::serve {
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
 inline constexpr int kDefaultMaxTokens                    = 8192;
+// Roadmap Phase 6 cap. The paper's sensitivity study shows reuse gains saturate at six
+// relocated spans per edit, so six is the default rather than a tunable knob.
+inline constexpr std::uint32_t kDefaultSuffixReuseMaxSpans = 6;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
@@ -44,6 +47,10 @@ struct ServeOptions {
     std::uint32_t vision_max_tokens        = 8192;
     bool use_cuda_graph                    = true;
     bool allow_prefix_reuse = true;
+    // Suffix Cache Reuse is opt-in and deliberately not advertised in --help tuning until
+    // correctness validation (roadmap Phase 5.5) has been run against real artifacts.
+    bool enable_suffix_cache_reuse       = false;
+    std::uint32_t suffix_reuse_max_spans = kDefaultSuffixReuseMaxSpans;
     bool enable_prompt_cache               = false;
     std::string prompt_cache_dir           = "";
     std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB default

@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
+#include "targets/qwen3_6/impl/runtime/prompt_edit.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include <algorithm>
@@ -98,6 +99,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->enable_suffix_cache_reuse      = options.enable_suffix_cache_reuse;
+    base->suffix_reuse_max_spans         = options.suffix_reuse_max_spans;
     base->token_mask                     = options.token_mask;
     base->disable_speculation            = options.disable_speculation;
     const std::uint32_t reserved_context_tokens =
@@ -239,6 +242,35 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
+    // --- Suffix Cache Reuse -----------------------------------------------------------
+    // Reuse resident KV for regions that survived an in-the-middle edit instead of
+    // re-prefilling them. Restricted to the plain decode backend, text-only prompts, and
+    // prompts without a turn-rewrite boundary: the MTP/DFlash caches and the
+    // turn-checkpoint capture path would each need their own relocation, which this change
+    // does not implement, so those keep the existing behaviour.
+    if (base.allow_prefix_reuse && base.enable_suffix_cache_reuse &&
+        base.suffix_reuse_max_spans != 0 && speculative_backend == SpeculativeBackend::None &&
+        base.vision_control == nullptr && !base.turn_rewrite_boundary && sequence.retained &&
+        sequence.kv && prompt.identity.reusable &&
+        (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier)) {
+        const qwen3_6::detail::PromptEditDiff diff = qwen3_6::detail::diff_prompt_edit(
+            sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
+
+        // Selection rules live with the detector so they stay unit-testable on the host.
+        // `reuse_base` is the prefix-reuse frontier, so a destination below it is already
+        // covered by ordinary prefix reuse and is not relocated a second time.
+        std::vector<RelocatedSpan> candidates = qwen3_6::detail::plan_relocations(
+            diff, sequence.text_kv_valid, plan->reuse_base, base.suffix_reuse_max_spans);
+
+        if (!candidates.empty()) {
+            std::uint64_t relocated = 0;
+            for (const RelocatedSpan& span : candidates) { relocated += span.tokens; }
+            plan->reuse                           = ReusePath::SuffixRelocation;
+            plan->relocated_spans                 = std::move(candidates);
+            plan->summary.relocated_prompt_tokens = static_cast<std::uint32_t>(relocated);
+        }
+    }
+
     const std::optional<std::uint32_t> desired = base.turn_rewrite_boundary;
     const bool can_keep                        = desired && plan->reuse != ReusePath::FullReset &&
                           plan->reuse != ReusePath::RestoreDiskCheckpoint &&
@@ -261,7 +293,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->turn_checkpoint_capture_frontier = desired;
     }
 
-    plan->summary.reusable_prompt_tokens = plan->reuse_base;
+    plan->summary.reusable_prompt_tokens =
+        plan->reuse_base + plan->summary.relocated_prompt_tokens;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
@@ -300,7 +333,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     const std::size_t prefill_splits = (plan->vision ? plan->vision->uses.size() : 0ULL) +
                                        (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL);
     plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
+        projected_service_work(plan->summary, plan->summary.reusable_prompt_tokens, prefill_chunk,
+                               prefill_splits);
     return RequestPlan(std::move(plan));
 }
 

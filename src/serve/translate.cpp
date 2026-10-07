@@ -235,6 +235,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
+    options.execution.enable_suffix_cache_reuse = server.enable_suffix_cache_reuse;
+    options.execution.suffix_reuse_max_spans    = server.suffix_reuse_max_spans;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();

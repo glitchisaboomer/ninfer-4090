@@ -23,6 +23,8 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    bool enable_suffix_cache_reuse        = false;
+    std::uint32_t suffix_reuse_max_spans  = 6;
     std::vector<std::uint32_t> token_mask;
     bool disable_speculation = false;
 };
@@ -52,6 +54,9 @@ struct AdmissionResources {
 struct RequestPlanSummary {
     std::uint32_t prompt_tokens           = 0;
     std::uint32_t reusable_prompt_tokens  = 0;
+    // Prompt tokens the plan expects to serve by relocating resident KV instead of
+    // prefilling. Zero unless the plan selected PrefixReusePath::SuffixRelocation.
+    std::uint32_t relocated_prompt_tokens = 0;
     std::uint32_t requested_output_tokens = 0;
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;

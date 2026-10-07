@@ -66,6 +66,39 @@ struct PromptEditDiff {
     }
 };
 
+// One surviving region that Suffix Cache Reuse would relocate instead of re-prefilling.
+// `source_begin` indexes the previous prompt/resident KV; `dest_begin` indexes the current
+// prompt. Both ranges are block aligned and disjoint.
+struct RelocatedSpan {
+    std::uint32_t source_begin = 0;
+    std::uint32_t dest_begin   = 0;
+    std::uint32_t tokens       = 0;
+
+    [[nodiscard]] std::uint32_t source_end() const noexcept { return source_begin + tokens; }
+    [[nodiscard]] std::uint32_t dest_end() const noexcept { return dest_begin + tokens; }
+};
+
+// Turn a diff into the relocation geometry a runtime can act on.
+//
+// A span is only relocatable when all of the following hold:
+//
+//   * It is not the leading span. The leading span is ordinary prefix reuse, which the existing
+//     planner already expresses, so relocating it would double account the same tokens.
+//   * Its source range is fully inside `resident_kv_tokens`, because resident KV for anything past
+//     the resident frontier does not exist.
+//   * Its destination range begins at or after `prefix_reuse_tokens`. A destination inside that
+//     region is already covered by ordinary prefix reuse, and a span that straddles the boundary
+//     would be claimed twice, so the whole span is dropped rather than split.
+//
+// Of the survivors the `max_spans` longest are kept and the rest are left to be re-prefilled, which
+// bounds how much approximation one edit introduces. The result is returned in prompt order.
+//
+// A `max_spans` of zero returns no spans.
+[[nodiscard]] std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
+                                                         std::uint32_t resident_kv_tokens,
+                                                         std::uint32_t prefix_reuse_tokens,
+                                                         std::uint32_t max_spans);
+
 // Detect the spans of `previous` that survive in `current`.
 //
 // Blocks are hashed and matched by hash, then confirmed by exact token comparison, so a

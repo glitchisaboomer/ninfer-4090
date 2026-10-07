@@ -467,8 +467,21 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::logic_error("planned turn checkpoint capture frontier is invalid");
     }
 
+    if (request_plan.reuse == ReusePath::SuffixRelocation && request_plan.relocated_spans.empty()) {
+        throw std::logic_error("suffix relocation plan carries no relocated spans");
+    }
+
     const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
+    // Suffix Cache Reuse additionally needs the device to relocate resident KV for the
+    // surviving spans. That relocation is not implemented yet (roadmap Phase 4), so a
+    // SuffixRelocation plan is applied as ordinary prefix reuse: the prefix up to `base` is
+    // kept and every token after it is prefilled normally. Generated output is therefore
+    // identical to the pre-SCR path, and telemetry reports the path actually taken rather
+    // than the path the plan requested.
+    const ReusePath applied_reuse =
+        request_plan.reuse == ReusePath::SuffixRelocation ? ReusePath::AppendAtFrontier
+                                                         : request_plan.reuse;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp && !request_plan.disable_speculation
             ? std::min({draft_window,
@@ -709,7 +722,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 sequence.retained           = true;
                 set_device_i32(io.rope_delta, sequence.rope_delta);
             }
-        } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
+        } else if (request_plan.reuse == ReusePath::AppendAtFrontier ||
+                   request_plan.reuse == ReusePath::SuffixRelocation) {
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
@@ -819,7 +833,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .elapsed_seconds                  = 0.0,
             .host_input_consumed_pending      = host_input_consumed,
             .prepare_mtp                      = request_plan.prepare_mtp,
-            .reuse                            = request_plan.reuse,
+            .reuse                            = applied_reuse,
             .mtp_bridge                       = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
