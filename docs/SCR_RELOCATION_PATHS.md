@@ -8,6 +8,10 @@ Status: **the primitives exist and are committed; neither path is wired into the
 `ReusePath::SuffixRelocation` plan is currently applied as ordinary prefix reuse, so generated output
 is unchanged (`program_impl.h`, `start_prefill_lane`).
 
+The two open design questions are now settled: Path A is the target, and the 27B's linear layers are
+handled by snapshot/restore. What remains is runtime wiring, which needs a machine with `nvcc` - see
+"Verification that is still owed".
+
 Already built and pushed:
 
 - planning: `plan_relocations` in `src/targets/qwen3_6/impl/runtime/prompt_edit.{h,cpp}`, selecting
@@ -53,61 +57,88 @@ multiple of 64.
 
 ## Path A - tail relocation (Scope A, reasoning-token stripping)
 
-**Applies when** the relocated spans tile a contiguous run that reaches the end of the prompt, so the
-only prefilled region is the head. Concretely, for chosen spans sorted by destination:
+**Applies when** the relocated spans form a single contiguous run, i.e. for chosen spans sorted by
+destination, consecutive spans are adjacent (`next.dest_begin == previous.dest_end`). Compare Path B,
+which allows several disjoint runs.
 
-- the first span's `dest_begin` is block aligned,
-- consecutive spans are adjacent (`next.dest_begin == previous.dest_end`, no gap),
-- the last span's `dest_end` is the last 64-aligned boundary at or below `prompt_tokens`.
+The run does *not* have to reach the end of the prompt, and it does not have to start at the reuse
+frontier. Whatever is left over simply gets prefilled, which makes the prefilled set
 
-Two sub-cases:
+```
+  [prefix_reuse_tokens, run.dest_begin)  union  [run.dest_end, prompt_tokens)
+```
 
-**A1 - the tail ends exactly on the relocated region.** Prefill the head range once, then relocate,
-then run a single-token forward at position `prompt_tokens - 1`. The extra forward is not overhead
-specific to SCR: it is the first decode step. Prompt logits have to come from a real forward pass
-because only KV is cached, never the hidden state, so *no* design can sample the next token purely
-from relocated state.
+and that is **two ranges, not one** whenever either boundary falls mid-block. Since spans are 64
+block aligned while `prefix_reuse_tokens` and `prompt_tokens` generally are not, the two-range shape
+is the normal case, not the exception. Do not plan around a single prefilled range: the A1 case
+(the run happens to end on the last block and the frontier happens to be block aligned) is a special
+case worth measuring but not worth designing for.
 
-**A2 - a partial block is left after the relocated region.** Prefill the head, relocate, prefill the
-partial trailing block, then take logits from that last chunk. Two prefilled ranges. This is the
-common case, and it is why A1 alone is not enough.
+The final position is still always prefilled, for the reason above: prompt logits can only come from
+a real forward pass, because only KV is cached and never the hidden state. So `prompt_tokens - 1` is
+always inside the trailing range.
 
-Which of A1/A2 applies is decided by `prompt_tokens mod 64` and the alignment of the surviving
-spans; it cannot be decided at plan time without also knowing the final block layout.
+### Why not relocate to the very end
+
+Relocation works at page granularity, and a page holds 64 tokens whose KV must stay contiguous at
+their logical positions. Relocating a partial trailing block would leave a page holding both
+relocated and prefilled tokens, which the page remap cannot express. So the relocated run always ends
+on a 64 boundary at or below `prompt_tokens`, and the leftover block is prefilled.
 
 ### Step list
 
 In `start_prefill_lane`, on `ReusePath::SuffixRelocation` with `relocated_spans` non-empty:
 
+The plan needs to carry the two prefilled boundaries, not just the spans: `head_begin`
+(= `prefix_reuse_tokens`), `head_end` (= the run's first destination), `tail_begin` (= the run's
+last destination end) and `tail_end` (= `prompt_tokens`). `RequestPlanImpl` has the spans today and
+would gain the boundaries.
+
 1. Instead of `trim_sequence_kv(sequence, base, ...)`, compute the pages the emitted sequence still
    needs and call `reassign_pages` with a mapping whose relocated slots name the surviving pages and
    whose replaced slots are `kPagedKVAquirePage`. This both keeps the surviving pages and publishes
-   the new block-table row, which step 2 depends on.
+   the new block-table row, which step 2 depends on. Note the pages above the frontier are exactly
+   the ones the existing branches trim away, so the relocation branch must be taken *instead of*
+   that trim, not after it.
 2. For every Text full-attention layer, call `gqa_kv_rerotate(positions, rope_deltas, layer_view,
    stream)` with `positions` = the new logical positions of the relocated tokens and
    `rope_deltas` = `new_position - old_position` (negative, for a left shift). One call per layer,
    because the op takes a single layer's `PagedKVLayerView`.
-3. Prefill the head `[reuse_base, first_dest_begin)` and, for A2, the trailing partial block.
-4. Report `relocated_prompt_tokens` and set `prefix_reuse_path` to `SuffixRelocation`.
+3. Leave the linear state alone (see above). Do not let the prefilled ranges rebuild it, and do not
+   copy a slot into it. If the sequence's linear state currently represents the pre-edit context,
+   which it does, retaining it is the whole action.
+4. Prefill the head range, then the trailing range. Two ranges, so the staged prefill and the
+   chunking walk need at least the ability to run a second range after the first completes.
+5. Report `relocated_prompt_tokens` and set `prefix_reuse_path` to `SuffixRelocation`.
 
-### Linear-attention caveat (blocking, specific to Qwen3.6-27B)
+### Linear-attention layers (decided: snapshot/restore)
 
 16 of the 27B hybrid's 84 layers are full attention; the other 48 are Gated DeltaNet, whose state is
 a single recurrent summary rather than per-token KV. Relocation as described only repairs the full
-attention layers. For the linear layers the state is whatever the sequence already held, and if the
-runtime prefills only the head and the trailing block, the recurrent state never sees the interior of
-the relocated tail. That is a *much* larger approximation than the paper describes - the paper's
-scheme snapshots and restores the recurrent state rather than silently skipping tokens.
+attention layers, so something has to be decided for the linear ones.
 
-So Path A is not complete for the 27B target until one of these is chosen:
+**Decision: keep the pre-edit linear state for the relocated suffix** (snapshot/restore), matching
+the paper's "linear layers snapshot recurrent state, not per-token KV relocation". The suffix is not
+re-processed by the linear layers at all.
 
-- process the relocated tail through the linear layers only (state update without KV write), which
-  costs a partial forward and eats into the savings but keeps the state faithful;
-- accept the stale state and treat it as part of the SCR approximation, documented and measured;
-- restrict SCR to full-attention-only models.
+Why not the alternatives:
 
-This needs a decision before Path A is written, and it is not a detail that can be settled by
-reading the kernels.
+- *Advancing the state over the tail* looks faithful but is self-defeating: a Gated DeltaNet state
+  updates from each token's residual stream at that layer, and that residual stream comes from the
+  preceding layers including the full-attention ones. Advancing over the tail therefore requires the
+  tail's attention outputs over the full context, which is exactly the prefill work SCR exists to
+  skip. It would leave the hybrid saving essentially nothing.
+- *Caching per-token linear-layer inputs* would make advancing cheap and faithful, but it is a new
+  per-token memory feature across all 48 linear layers and is out of scope here.
+
+Mechanically this is nearly free, because the machinery already exists: `LinearStateSlots` plus
+`decoder->linear_attention.copy_slot(...)`, which the turn-checkpoint restore path already uses to
+save and restore this exact state. Path A must simply not disturb the linear state across the
+relocation, instead of leaving it to be rebuilt by the prefilled ranges.
+
+The resulting state corresponds to the pre-edit context, which is the SCR approximation for this
+target family. Measuring it is the point of Phase 5.5; if the divergence exceeds the 0.05-nat
+threshold, the fallback is to disable SCR rather than to silently keep an unmeasured state.
 
 ## Path B - general segmented prefill
 
