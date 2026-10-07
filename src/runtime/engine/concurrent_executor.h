@@ -478,8 +478,9 @@ private:
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
         if (request->begin) {
-            result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+            result.reused_prompt_tokens    = request->begin->reused_prompt_tokens;
+            result.relocated_prompt_tokens = request->begin->relocated_prompt_tokens;
+            result.prefix_reuse_path       = request->begin->prefix_reuse_path;
         }
         if (request->lane) {
             result.timings = instance_.program->generation_timings_lane(*request->lane);

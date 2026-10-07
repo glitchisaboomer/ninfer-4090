@@ -217,6 +217,9 @@ struct RequestControl {
         std::optional<std::uint32_t> turn_checkpoint_capture_frontier;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
+        // From the plan, not derivable from `base`: a relocated run is skipped rather than prefilled,
+        // so it is neither the frontier nor anything the cursor passes through.
+        std::uint32_t relocated_prompt_tokens = 0;
         std::uint32_t prompt_tokens      = 0;
         std::uint32_t initial_mtp_extent = 0;
         double elapsed_seconds           = 0.0;

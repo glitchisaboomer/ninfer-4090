@@ -990,6 +990,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .turn_checkpoint_capture_frontier = request_plan.turn_checkpoint_capture_frontier,
             .base                             = base,
             .cursor                           = base,
+            .relocated_prompt_tokens          = request_plan.summary.relocated_prompt_tokens,
             .prompt_tokens                    = prompt_tokens,
             .initial_mtp_extent               = initial_mtp_extent,
             .elapsed_seconds                  = 0.0,
@@ -2210,9 +2211,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     }
 
     RequestControl::Prefill& staged = *request.prefill;
-    const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
-                                        .reused_prompt_tokens = staged.base,
-                                        .prefix_reuse_path    = staged.reuse};
+    const runtime::BeginSummary summary{.prompt_tokens           = staged.prompt_tokens,
+                                        .reused_prompt_tokens    = staged.base,
+                                        .relocated_prompt_tokens = staged.relocated_prompt_tokens,
+                                        .prefix_reuse_path       = staged.reuse};
     bool host_input_consumed              = staged.host_input_consumed_pending;
     staged.host_input_consumed_pending    = false;
     std::uint32_t processed_prompt_tokens = 0;
