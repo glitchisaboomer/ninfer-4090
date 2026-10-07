@@ -323,6 +323,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     const auto yarn = compute_yarn_config(capacity);
+    text_rope_inv_freq = yarn.inv_freq;
     ops::set_text_rope_frequencies(yarn.inv_freq.data());
     device.synchronize();
     prepare_graphs();
@@ -825,7 +826,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                      ++full_layer) {
                     ops::gqa_kv_rerotate_run(static_cast<std::int32_t>(span.dest_begin),
                                              static_cast<std::int32_t>(span.tokens), delta,
-                                             relocation_kv.layer_view(full_layer), device.stream);
+                                             text_rope_inv_freq, relocation_kv.layer_view(full_layer),
+                                             device.stream);
                 }
             }
         }

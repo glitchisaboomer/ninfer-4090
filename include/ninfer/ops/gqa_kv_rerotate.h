@@ -6,8 +6,29 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
+
+// The Text inverse-frequency table both entry points take: 32 entries, entry `e` governing rotary
+// elements `e` and `e + 32`. The caller passes the same table it gave the forward RoPE, which is
+// not necessarily the built-in default: `compute_yarn_config` replaces it once the configured
+// context capacity exceeds the model's native context.
+using RerotateFreqTable = std::span<const float, 32>;
+
+// The table in the form the kernel takes it.
+//
+// This is a by-value kernel argument rather than a read of `rope.cuh`'s `kTextRopeInvFrequency`. That
+// symbol is a `static __device__ __constant__`, so it has internal linkage and every translation unit
+// that includes `rope.cuh` gets a private copy in its own device module. The launcher writes the
+// caller's table into `rope.cu`'s copy with cudaMemcpyToSymbol and nothing writes this module's copy,
+// so a kernel in another TU would silently rotate with the compile-time defaults instead of the table
+// the forward pass used. Passing the table explicitly makes the Op's numerical contract depend on its
+// arguments alone, keeps it allocation-free, and is what lets the Op be checked against an
+// independent oracle.
+struct RerotateFreq {
+    float v[32];
+};
 
 /**
  * Op: rotate already-cached K in place by a per-logical-position delta.
@@ -25,12 +46,18 @@ namespace ninfer::ops {
  *     K'[p][:, e]      = x * c - y * s
  *     K'[p][:, e + 32] = y * c + x * s
  *
- *   `freq` is the Text inverse-frequency table the forward RoPE applied, and the pairing
+ *   `inv_freq` is the Text inverse-frequency table the forward RoPE applied, and the pairing
  *   (e, e + 32) is the one the forward kernel rotated. RoPE is a composition of per-plane 2-D
  *   rotations whose angle is position * freq, so rotating an already-rotated element by
  *   (new_position - old_position) * freq yields that element rotated once at the new position. The
  *   caller therefore supplies rope_deltas[p] = new_position - old_position and this Op needs no
  *   knowledge of either position beyond the delta.
+ *
+ *   The table is a required argument rather than read from module-global state, because the Op must
+ *   rotate by the frequencies the forward pass actually used. The forward Text RoPE's table is a
+ *   mutable `__constant__` symbol that the caller overwrites at startup with a YaRN-scaled table
+ *   whenever the context capacity exceeds the native context, and an Op that assumed the built-in
+ *   defaults would silently rotate with the wrong angles in exactly that configuration.
  *
  * Logical shapes:
  *   positions is a contiguous I32 vector [T] of distinct nonnegative logical cache positions.
@@ -61,8 +88,8 @@ namespace ninfer::ops {
  * Workspace:
  *   None. The Op has no other state side effect.
  */
-void gqa_kv_rerotate(const Tensor& positions, const Tensor& rope_deltas, PagedKVLayerView cache,
-                     cudaStream_t stream);
+void gqa_kv_rerotate(const Tensor& positions, const Tensor& rope_deltas, RerotateFreqTable inv_freq,
+                     PagedKVLayerView cache, cudaStream_t stream);
 
 /**
  * Op: the same re-rotation for one contiguous run of logical positions sharing a delta.
@@ -73,10 +100,11 @@ void gqa_kv_rerotate(const Tensor& positions, const Tensor& rope_deltas, PagedKV
  * device for what is a uniform shift.
  *
  * `tokens` must be positive and the whole run must lie inside the cache capacity, and the block table
- * must already map every position of the run. Validation, geometry, numerics, effects, ordering, and
- * workspace are otherwise the same as gqa_kv_rerotate.
+ * must already map every position of the run. `inv_freq` carries the same meaning as above.
+ * Validation, geometry, numerics, effects, ordering, and workspace are otherwise the same as
+ * gqa_kv_rerotate.
  */
 void gqa_kv_rerotate_run(std::int32_t first_position, std::int32_t tokens, std::int32_t delta,
-                         PagedKVLayerView cache, cudaStream_t stream);
+                         RerotateFreqTable inv_freq, PagedKVLayerView cache, cudaStream_t stream);
 
 } // namespace ninfer::ops

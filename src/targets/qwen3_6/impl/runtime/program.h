@@ -17,6 +17,7 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "targets/qwen3_6/impl/runtime/yarn.h"
 
 #include <cstdint>
 #include <array>
@@ -425,6 +426,12 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
     DiskStateCache* disk_state_cache          = nullptr;
+
+    // The Text RoPE inverse-frequency table this program installed, kept so that every Op which has
+    // to reproduce or undo that rotation is handed the same table. It is the YaRN-scaled table once
+    // the configured context capacity exceeds the model's native context, so an Op that assumed the
+    // built-in defaults would use the wrong angles in that configuration.
+    std::array<float, 32> text_rope_inv_freq = compute_yarn_config(0).inv_freq;
 
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;

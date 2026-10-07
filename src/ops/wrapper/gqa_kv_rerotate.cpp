@@ -3,6 +3,8 @@
 
 #include "ops/launcher/gqa_kv_rerotate.h"
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -81,19 +83,39 @@ void validate_positions_pair(const Tensor& positions, const Tensor& rope_deltas,
     }
 }
 
+// Copies the caller's table into the by-value kernel argument. Rejecting an empty table here keeps a
+// missing frequency table from becoming a zero-angle rotation that leaves cached K untouched.
+RerotateFreq make_freq(RerotateFreqTable inv_freq, const char* op) {
+    if (inv_freq.data() == nullptr) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": the Text RoPE inverse-frequency table must not be null");
+    }
+    RerotateFreq freq{};
+    for (std::size_t i = 0; i < inv_freq.size(); ++i) {
+        if (!std::isfinite(inv_freq[i])) {
+            throw std::invalid_argument(std::string(op) +
+                                        ": the Text RoPE inverse-frequency table must be finite");
+        }
+        freq.v[i] = inv_freq[i];
+    }
+    return freq;
+}
+
 } // namespace
 
-void gqa_kv_rerotate(const Tensor& positions, const Tensor& rope_deltas, PagedKVLayerView cache,
-                     cudaStream_t stream) {
+void gqa_kv_rerotate(const Tensor& positions, const Tensor& rope_deltas, RerotateFreqTable inv_freq,
+                     PagedKVLayerView cache, cudaStream_t stream) {
     constexpr const char* op = "gqa_kv_rerotate";
+    const RerotateFreq freq  = make_freq(inv_freq, op);
     const std::int32_t capacity = validate_text_k_cache(cache, op);
     validate_positions_pair(positions, rope_deltas, capacity, op);
-    detail::gqa_kv_rerotate_launch(positions, rope_deltas, cache, cache.num_kv_heads, stream);
+    detail::gqa_kv_rerotate_launch(positions, rope_deltas, freq, cache, cache.num_kv_heads, stream);
 }
 
 void gqa_kv_rerotate_run(std::int32_t first_position, std::int32_t tokens, std::int32_t delta,
-                         PagedKVLayerView cache, cudaStream_t stream) {
+                         RerotateFreqTable inv_freq, PagedKVLayerView cache, cudaStream_t stream) {
     constexpr const char* op = "gqa_kv_rerotate_run";
+    const RerotateFreq freq  = make_freq(inv_freq, op);
     const std::int32_t capacity = validate_text_k_cache(cache, op);
     if (first_position < 0) {
         throw std::invalid_argument(std::string(op) + ": first position must be nonnegative");
@@ -103,8 +125,8 @@ void gqa_kv_rerotate_run(std::int32_t first_position, std::int32_t tokens, std::
         static_cast<std::int64_t>(capacity)) {
         throw std::invalid_argument(std::string(op) + ": the run exceeds KV cache capacity");
     }
-    detail::gqa_kv_rerotate_run_launch(first_position, tokens, delta, cache, cache.num_kv_heads,
-                                       stream);
+    detail::gqa_kv_rerotate_run_launch(first_position, tokens, delta, freq, cache,
+                                       cache.num_kv_heads, stream);
 }
 
 } // namespace ninfer::ops

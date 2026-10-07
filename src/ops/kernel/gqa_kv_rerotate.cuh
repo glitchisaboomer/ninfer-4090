@@ -6,10 +6,10 @@
 // position and walks every KV head of that position; lane `pair` owns the rotary element pair
 // (pair, pair + kGqaRerotateHalf).
 //
-// The inverse-frequency table and the FP32 sincos convention are taken from rope.cuh so that a
-// re-rotation composes with the forward rotation the cached K already carries. The pairing is the
-// one apply_rope_head uses: for every rotary element e in [0, 32), element e pairs with element
-// e + 32 and uses frequency entry e.
+// The inverse-frequency table is supplied by the caller and the FP32 sincos convention matches
+// rope.cuh, so that a re-rotation composes with the forward rotation the cached K already carries.
+// The pairing is the one apply_rope_head uses: for every rotary element e in [0, 32), element e
+// pairs with element e + 32 and uses frequency entry e.
 //
 // Only the Text paged plane is served, because that plane's element order is the one
 // paged_kv_address.cuh describes. The DFlash paged plane is laid out head-major
@@ -17,8 +17,9 @@
 // [physical_page][kv_head][page][head_dim], so DFlash needs its own addressing and is deliberately
 // not accepted here.
 
+#include "ninfer/ops/gqa_kv_rerotate.h"
+
 #include "ops/kernel/paged_kv_address.cuh"
-#include "ops/kernel/rope.cuh"
 
 #include <cuda_bf16.h>
 
@@ -35,7 +36,7 @@ __global__ void gqa_kv_rerotate_kernel(const std::int32_t* __restrict__ position
                                        const std::int32_t* __restrict__ rope_deltas,
                                        __nv_bfloat16* __restrict__ cache_k,
                                        const std::int32_t* __restrict__ block_table,
-                                       std::int32_t tokens) {
+                                       RerotateFreq freq, std::int32_t tokens) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -55,7 +56,7 @@ __global__ void gqa_kv_rerotate_kernel(const std::int32_t* __restrict__ position
     const int pair        = lane;
     float sine            = 0.0F;
     float cosine          = 0.0F;
-    sincosf(static_cast<float>(delta) * kTextRopeInvFrequency[pair], &sine, &cosine);
+    sincosf(static_cast<float>(delta) * freq.v[pair], &sine, &cosine);
 
     for (int kv_head = 0; kv_head < KVHeads; ++kv_head) {
         __nv_bfloat16* row =
@@ -73,9 +74,9 @@ __global__ void gqa_kv_rerotate_kernel(const std::int32_t* __restrict__ position
 // warp owns one position of the run, so no positions or deltas tensor is needed.
 template <int KVHeads>
 __global__ void gqa_kv_rerotate_run_kernel(std::int32_t first_position, std::int32_t tokens,
-                                          std::int32_t delta,
-                                          __nv_bfloat16* __restrict__ cache_k,
-                                          const std::int32_t* __restrict__ block_table) {
+                                          std::int32_t delta, __nv_bfloat16* __restrict__ cache_k,
+                                          const std::int32_t* __restrict__ block_table,
+                                          RerotateFreq freq) {
     const int offset = static_cast<int>(blockIdx.x);
     if (offset >= tokens) { return; }
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -90,7 +91,7 @@ __global__ void gqa_kv_rerotate_run_kernel(std::int32_t first_position, std::int
     const int pair        = lane;
     float sine            = 0.0F;
     float cosine          = 0.0F;
-    sincosf(static_cast<float>(delta) * kTextRopeInvFrequency[pair], &sine, &cosine);
+    sincosf(static_cast<float>(delta) * freq.v[pair], &sine, &cosine);
 
     for (int kv_head = 0; kv_head < KVHeads; ++kv_head) {
         __nv_bfloat16* row =

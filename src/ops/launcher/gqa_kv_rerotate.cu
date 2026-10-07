@@ -12,28 +12,28 @@ namespace {
 constexpr int kRerotateThreads = 32;
 
 template <int KVHeads>
-void launch_mode(const Tensor& positions, const Tensor& rope_deltas, PagedKVLayerView cache,
-                 cudaStream_t stream) {
+void launch_mode(const Tensor& positions, const Tensor& rope_deltas, RerotateFreq freq,
+                 PagedKVLayerView cache, cudaStream_t stream) {
     const std::int32_t tokens = positions.ne[0];
     auto* cache_k             = static_cast<__nv_bfloat16*>(cache.k_pages.data);
     const auto* pos           = static_cast<const std::int32_t*>(positions.data);
     const auto* deltas        = static_cast<const std::int32_t*>(rope_deltas.data);
     const auto* table         = static_cast<const std::int32_t*>(cache.block_table.data);
-    gqa_kv_rerotate_kernel<KVHeads><<<tokens, kRerotateThreads, 0, stream>>>(pos, deltas, cache_k,
-                                                                            table, tokens);
+    gqa_kv_rerotate_kernel<KVHeads><<<tokens, kRerotateThreads, 0, stream>>>(
+        pos, deltas, cache_k, table, freq, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-void gqa_kv_rerotate_launch(const Tensor& positions, const Tensor& rope_deltas,
+void gqa_kv_rerotate_launch(const Tensor& positions, const Tensor& rope_deltas, RerotateFreq freq,
                             PagedKVLayerView cache, std::int32_t kv_heads, cudaStream_t stream) {
     if (kv_heads == 4) {
-        launch_mode<4>(positions, rope_deltas, cache, stream);
+        launch_mode<4>(positions, rope_deltas, freq, cache, stream);
         return;
     }
     if (kv_heads == 2) {
-        launch_mode<2>(positions, rope_deltas, cache, stream);
+        launch_mode<2>(positions, rope_deltas, freq, cache, stream);
         return;
     }
     throw std::invalid_argument("gqa_kv_rerotate: Text KV geometry requires 4 or 2 KV heads");
@@ -43,25 +43,25 @@ namespace {
 
 template <int KVHeads>
 void launch_run_mode(std::int32_t first_position, std::int32_t tokens, std::int32_t delta,
-                     PagedKVLayerView cache, cudaStream_t stream) {
+                     RerotateFreq freq, PagedKVLayerView cache, cudaStream_t stream) {
     auto* cache_k             = static_cast<__nv_bfloat16*>(cache.k_pages.data);
     const auto* table         = static_cast<const std::int32_t*>(cache.block_table.data);
     gqa_kv_rerotate_run_kernel<KVHeads><<<tokens, kRerotateThreads, 0, stream>>>(
-        first_position, tokens, delta, cache_k, table);
+        first_position, tokens, delta, cache_k, table, freq);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
 void gqa_kv_rerotate_run_launch(std::int32_t first_position, std::int32_t tokens,
-                                std::int32_t delta, PagedKVLayerView cache, std::int32_t kv_heads,
-                                cudaStream_t stream) {
+                                std::int32_t delta, RerotateFreq freq, PagedKVLayerView cache,
+                                std::int32_t kv_heads, cudaStream_t stream) {
     if (kv_heads == 4) {
-        launch_run_mode<4>(first_position, tokens, delta, cache, stream);
+        launch_run_mode<4>(first_position, tokens, delta, freq, cache, stream);
         return;
     }
     if (kv_heads == 2) {
-        launch_run_mode<2>(first_position, tokens, delta, cache, stream);
+        launch_run_mode<2>(first_position, tokens, delta, freq, cache, stream);
         return;
     }
     throw std::invalid_argument("gqa_kv_rerotate: Text KV geometry requires 4 or 2 KV heads");
