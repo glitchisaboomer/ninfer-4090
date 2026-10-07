@@ -224,13 +224,16 @@ void built_in_prompt(int blocks, int variant, Json& primed, Json& edited) {
     const std::string question =
         "Given everything above, how many rollbacks were performed in the maintenance window?" +
         (variant == 0 ? std::string{} : " Answer for survey " + std::to_string(variant) + ".");
+    // Both revisions must tokenize to the same length. The surviving-span detector hashes whole
+    // 64-token pages, so an edit that shifts the tail by even one token leaves nothing aligned to
+    // match and Suffix Cache Reuse cannot engage at all. Same sentence shape, same word count, only
+    // the facts differ.
     const std::string original =
         "SECTION ONE. The migration moved the primary datastore to a three node cluster, and all "
         "writes were routed through the new leader.";
     const std::string revised =
-        "SECTION ONE (revised). The migration moved the primary datastore to a " +
-        std::to_string(3 + variant) +
-        " node cluster, and writes were routed through a consensus protocol.";
+        "SECTION ONE. The migration moved the primary datastore to a four node cluster, and all "
+        "writes were routed through the new leader.";
 
     const auto user_turn = [](const std::string& text) {
         return Json{{"role", "user"}, {"content", text}};
@@ -484,14 +487,42 @@ std::vector<ninfer::serve::LoggedCompletion>
 select_edited(const std::vector<ninfer::serve::LoggedCompletion>& completions, bool scr) {
     std::vector<ninfer::serve::LoggedCompletion> selected;
     selected.reserve(completions.size() / 2);
+    std::vector<std::size_t> misaligned;
     for (std::size_t index = 0; index + 1 < completions.size(); index += 2) {
+        const ninfer::serve::LoggedCompletion& primed = completions[index];
         const ninfer::serve::LoggedCompletion& edited = completions[index + 1];
+        // Every surviving span is found by hashing whole KV pages, so an edit that changes the
+        // prompt's token count by anything other than a multiple of the page size shifts every later
+        // block off its boundary and leaves the detector nothing to match after the edit. The suite
+        // then reports near-zero divergence for a run in which Suffix Cache Reuse never engaged --
+        // the one result that looks like a pass and measures nothing.
+        //
+        // Checked rather than assumed. An earlier suite revised a message by a few words, which is
+        // exactly this mistake, and the only symptom was that five of six prompts reported
+        // full_reset with no relocation to explain it.
+        constexpr std::int32_t kPageTokens = 64; // kPagedKVPageSize
+        const std::int32_t offset = edited.prompt_tokens - primed.prompt_tokens;
+        const bool aligned        = offset % kPageTokens == 0;
         std::cerr << "[" << (scr ? "scr" : "baseline") << "] prompt " << (index / 2)
                   << ": prompt_tokens=" << edited.prompt_tokens
+                  << " primed=" << primed.prompt_tokens
+                  << " edit_offset=" << offset << (aligned ? "" : " NOT_PAGE_ALIGNED")
                   << " reused=" << edited.prefix_cache_hit_tokens
                   << " relocated=" << edited.prefix_relocated_tokens
                   << " path=" << edited.prefix_reuse_path << "\n";
+        if (!aligned && scr) { misaligned.push_back(index / 2); }
         selected.push_back(edited);
+    }
+    if (!misaligned.empty()) {
+        std::ostringstream message;
+        message << "the edit changes the prompt by a token count that is not a multiple of the "
+                   "64-token KV page, so no surviving span survives it and Suffix Cache Reuse cannot "
+                   "engage: prompt(s) ";
+        for (std::size_t i = 0; i < misaligned.size(); ++i) {
+            message << (i == 0 ? "" : ", ") << misaligned[i];
+        }
+        message << ". Pad the edited message so both versions tokenize to the same length.";
+        throw std::runtime_error(message.str());
     }
     return selected;
 }
