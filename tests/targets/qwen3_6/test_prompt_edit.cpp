@@ -429,6 +429,59 @@ void test_plan_tail_relocation() {
            "a survivor without resident KV is not relocated");
 }
 
+// Every chat request carries a turn-rewrite boundary, because the chat template always appends a
+// generation prompt. A boundary sitting at the end of the user content must therefore not disable
+// relocation; it must only bound how far a span may reach.
+void test_plan_tail_relocation_respects_turn_rewrite_boundary() {
+    using ninfer::targets::qwen3_6::detail::plan_tail_relocation;
+
+    // [P R S S S] -> [P S S S]: the middle is deleted and three blocks survive to the end.
+    Tokens previous;
+    append(previous, segment(1, 1)); // P
+    append(previous, segment(2, 2)); // R, deleted by the edit
+    append(previous, segment(3, 3)); // S, survives
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(3, 3));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    // Without a boundary the survivor is trimmed back from the final prompt token, which is the
+    // original behaviour.
+    const auto unbounded = plan_tail_relocation(diff, resident, 0, prompt, 6, std::nullopt);
+    expect(unbounded.viable, "no boundary relocates as before");
+    expect(unbounded.spans.front().tokens == block_tokens(2),
+           "without a boundary the final block is trimmed off");
+    expect(unbounded.spans.back().dest_end() == block_tokens(3),
+           "without a boundary the span stops at the last whole block before the final token");
+
+    // A boundary past the survivor leaves it untouched. This is the single-turn chat case: the
+    // boundary is the generation prompt at the very end of the user content.
+    const auto after = plan_tail_relocation(diff, resident, 0, prompt, 6, prompt);
+    expect(after.viable, "a boundary past the survivor still relocates");
+    expect(after.spans.size() == 1 && after.spans.front().tokens == block_tokens(2),
+           "a boundary past the survivor leaves its extent unchanged");
+
+    // A boundary before the survivor truncates it to whole blocks ending before the boundary. The
+    // survivor starts at block 1, so a boundary at block 2 leaves exactly one whole block.
+    const auto before = plan_tail_relocation(diff, resident, 0, prompt, 6, block_tokens(2));
+    expect(before.viable, "a boundary inside the survivor still relocates what precedes it");
+    expect(before.spans.front().tokens == block_tokens(1),
+           "a span is trimmed back to a whole block ending before the boundary");
+    expect(before.spans.front().dest_end() <= block_tokens(2),
+           "a truncated span never reaches past the boundary");
+    expect(before.tail.begin == before.spans.back().dest_end() && before.tail.end == prompt,
+           "the prefilled tail covers the boundary through the end of the prompt");
+
+    // A boundary at the survivor's first token leaves nothing to relocate.
+    expect(!plan_tail_relocation(diff, resident, 0, prompt, 6, block_tokens(1)).viable,
+           "a boundary at the start of the survivor relocates nothing");
+    expect(!plan_tail_relocation(diff, resident, 0, prompt, 6, 0).viable,
+           "a zero boundary relocates nothing");
+}
+
 void test_plan_tail_relocation_picks_one_run() {
     using ninfer::targets::qwen3_6::detail::plan_tail_relocation;
 
@@ -587,6 +640,7 @@ int main() {
     test_plan_relocations();
     test_plan_relocations_keeps_longest();
     test_plan_tail_relocation();
+    test_plan_tail_relocation_respects_turn_rewrite_boundary();
     test_plan_tail_relocation_picks_one_run();
     test_plan_tail_relocation_merges_adjacent_survivors();
     test_plan_page_remap();

@@ -245,14 +245,18 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     // --- Suffix Cache Reuse -----------------------------------------------------------
     // Reuse resident KV for regions that survived an in-the-middle edit instead of
-    // re-prefilling them. Restricted to the plain decode backend, text-only prompts, and
-    // prompts without a turn-rewrite boundary: the MTP/DFlash caches and the
-    // turn-checkpoint capture path would each need their own relocation, which this change
-    // does not implement, so those keep the existing behaviour.
+    // re-prefilling them. Restricted to the plain decode backend and to text-only prompts: the
+    // MTP/DFlash caches would each need their own relocation, which this change does not
+    // implement, so those keep the existing behaviour.
+    //
+    // A turn-rewrite boundary does not disable relocation. Every chat request carries one, because
+    // the chat template always appends a generation prompt, so rejecting prompts that have one would
+    // make this path unreachable from the served API. The boundary only bounds how far a span may
+    // reach, which `plan_tail_relocation` applies.
     if (base.allow_prefix_reuse && base.enable_suffix_cache_reuse &&
         base.suffix_reuse_max_spans != 0 && speculative_backend == SpeculativeBackend::None &&
-        base.vision_control == nullptr && !base.turn_rewrite_boundary && sequence.retained &&
-        sequence.kv && prompt.identity.reusable &&
+        base.vision_control == nullptr && sequence.retained && sequence.kv &&
+        prompt.identity.reusable &&
         (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier)) {
         const qwen3_6::detail::PromptEditDiff diff = qwen3_6::detail::diff_prompt_edit(
             sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
@@ -271,7 +275,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         } else {
             const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
                 diff, sequence.text_kv_valid, plan->reuse_base,
-                static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans);
+                static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans,
+                base.turn_rewrite_boundary);
             if (tail.viable) {
                 plan_head  = tail.head;
                 plan_tail  = tail.tail;

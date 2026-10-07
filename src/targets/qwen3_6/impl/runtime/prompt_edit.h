@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -154,6 +155,14 @@ struct TailRelocationPlan {
 //     prefilled and the plan's `tail` range is never empty. A span reaching past that point is
 //     trimmed back to the last whole block ending before it, rather than dropped, so a surviving
 //     suffix that runs to the end of the prompt still relocates everything but its final block.
+//   * Its destination ends at or before `turn_rewrite_boundary`, when one is supplied.
+//
+// The boundary is the first prompt token whose KV is stale because the assistant's reasoning is
+// about to be rewritten there, so a relocated span may not carry a token at or after it. Every
+// chat request carries a boundary, because the chat template always appends a generation prompt,
+// which means the boundary sits at the end of the user content on a single-turn request. A span is
+// trimmed back to the last whole block ending before the boundary rather than dropped, so the whole
+// user content stays relocatable and only the region that genuinely has to be prefilled is left.
 //
 // Returns a non-viable plan when no candidate survives, when `max_spans` is zero, or when the prompt
 // has nothing after the reuse frontier.
@@ -161,7 +170,9 @@ struct TailRelocationPlan {
                                                       std::uint32_t resident_kv_tokens,
                                                       std::uint32_t prefix_reuse_tokens,
                                                       std::uint32_t prompt_tokens,
-                                                      std::uint32_t max_spans);
+                                                      std::uint32_t max_spans,
+                                                      std::optional<std::uint32_t> turn_rewrite_boundary =
+                                                          std::nullopt);
 
 // Sentinel for a logical page with no resident physical page, so it has to come from the pool when a
 // remap is applied. The value matches PagedKVAllocation's acquire sentinel; the runtime static_asserts

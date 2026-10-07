@@ -95,11 +95,20 @@ std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
 
 TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_t resident_kv_tokens,
                                        std::uint32_t prefix_reuse_tokens,
-                                       std::uint32_t prompt_tokens, std::uint32_t max_spans) {
+                                       std::uint32_t prompt_tokens, std::uint32_t max_spans,
+                                       std::optional<std::uint32_t> turn_rewrite_boundary) {
     TailRelocationPlan plan;
     if (max_spans == 0 || prompt_tokens == 0 || prompt_tokens <= prefix_reuse_tokens) {
         return plan;
     }
+
+    // No span may reach this token, because nothing at or after it can be served from resident KV.
+    // Without a boundary the limit is the final prompt token, which always has to be prefilled
+    // because prompt logits can only come from a real forward pass. With one, the limit is the
+    // boundary itself, which is where the assistant's reasoning is rewritten and every earlier
+    // token stays valid.
+    std::uint32_t limit = prompt_tokens - 1;
+    if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
 
     std::vector<RelocatedSpan> candidates;
     for (const SurvivingSpan& span : diff.spans) {
@@ -109,11 +118,11 @@ TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_
         if (span.old_end() > resident_kv_tokens) { continue; }
         // A destination at or below the prefix-reuse frontier is already covered by prefix reuse.
         if (span.new_begin < prefix_reuse_tokens) { continue; }
-        if (span.tokens == 0 || span.new_begin >= prompt_tokens - 1) { continue; }
-        // The final prompt token stays prefilled, so the span is trimmed back to the last whole block
-        // ending before it. Trimming keeps the span block aligned, and only one span can be affected
-        // because surviving spans are disjoint, so it cannot break a run's adjacency.
-        const std::uint32_t room   = prompt_tokens - 1 - span.new_begin;
+        if (span.tokens == 0 || span.new_begin >= limit) { continue; }
+        // The span is trimmed back to the last whole block ending before the limit. Trimming keeps
+        // the span block aligned, and only one span can be affected because surviving spans are
+        // disjoint, so it cannot break a run's adjacency.
+        const std::uint32_t room   = limit - span.new_begin;
         const std::uint32_t fit    = (room / kPromptEditBlockTokens) * kPromptEditBlockTokens;
         const std::uint32_t tokens = std::min(span.tokens, fit);
         if (tokens == 0) { continue; }
