@@ -211,14 +211,19 @@ void check_relocation(Plane& plane, std::int32_t src_position, std::int32_t dst_
                       const char* label) {
     const std::int32_t delta = dst_position - src_position;
 
-    // Seed the cache with what a forward prefill at src_position leaves behind, rounded once to BF16.
-    // Each head keeps its own rotated row: the check below compares every head against its own
-    // oracle, so seeding one shared row for all of them would compare heads against the wrong input.
-    std::vector<std::array<double, kHeadDim>> rotated(static_cast<std::size_t>(kKvHeads));
+    // Seed the *destination* with what a forward prefill at src_position leaves behind, rounded once
+    // to BF16. The Op rotates in place and never moves data between positions: reassign_pages first
+    // re-points the destination logical block at the surviving physical page, and only then does the
+    // Op re-rotate that page for its new position. Seeding the destination with the surviving page's
+    // contents is what reproduces that sequence here.
+    //
+    // Each head keeps its own seeded row, because the check below compares every head against an
+    // oracle built from that head's own raw input.
+    std::vector<std::array<double, kHeadDim>> seeded(static_cast<std::size_t>(kKvHeads));
     for (std::int32_t head = 0; head < kKvHeads; ++head) {
         forward_rope_oracle(raw[static_cast<std::size_t>(head)].data(), src_position, freq,
-                            rotated[static_cast<std::size_t>(head)].data());
-        plane.write_head(src_position, head, rotated[static_cast<std::size_t>(head)].data());
+                            seeded[static_cast<std::size_t>(head)].data());
+        plane.write_head(dst_position, head, seeded[static_cast<std::size_t>(head)].data());
     }
 
     ninfer::ops::gqa_kv_rerotate_run(dst_position, 1, delta,
@@ -227,21 +232,25 @@ void check_relocation(Plane& plane, std::int32_t src_position, std::int32_t dst_
     CUDA_CHECK(cudaGetLastError());
 
     double worst = 0.0;
+    int outside_violations = 0;
     std::array<double, kHeadDim> got{};
     std::array<double, kHeadDim> oracle{};
     for (std::int32_t head = 0; head < kKvHeads; ++head) {
-        const std::array<double, kHeadDim>& seeded = rotated[static_cast<std::size_t>(head)];
+        const std::array<double, kHeadDim>& before = seeded[static_cast<std::size_t>(head)];
         forward_rope_oracle(raw[static_cast<std::size_t>(head)].data(), dst_position, freq,
                             oracle.data());
         plane.read_head(dst_position, head, got.data());
         for (std::int32_t e = 0; e < kHeadDim; ++e) {
             if (e >= kRotaryElems) {
-                // Outside [0, 64) the Op must leave the row byte-identical.
-                const double untouched = to_double(to_bf16(seeded[static_cast<std::size_t>(e)]));
+                // Outside [0, 64) the Op must leave the row byte-identical. Count these instead of
+                // returning, so a run that violates this still reports its rotary-region error.
+                const double untouched = to_double(to_bf16(before[static_cast<std::size_t>(e)]));
                 if (got[e] != untouched) {
-                    fail(std::string(label) + ": element " + std::to_string(e) +
-                         " outside [0,64) was modified");
-                    return;
+                    if (outside_violations < 4) {
+                        fail(std::string(label) + ": element " + std::to_string(e) +
+                             " outside [0,64) was modified");
+                    }
+                    ++outside_violations;
                 }
                 continue;
             }
@@ -269,9 +278,10 @@ void check_vector_entry_point(Plane& plane, std::int32_t src_position, std::int3
                               const FreqTable& freq) {
     const std::int32_t delta = dst_position - src_position;
 
-    std::array<double, kHeadDim> rotated{};
-    forward_rope_oracle(raw[0].data(), src_position, freq, rotated.data());
-    plane.write_head(src_position, 0, rotated.data());
+    std::array<double, kHeadDim> seeded{};
+    forward_rope_oracle(raw[0].data(), src_position, freq, seeded.data());
+    // Seeded at the destination, for the same reason as in check_relocation: the Op rotates in place.
+    plane.write_head(dst_position, 0, seeded.data());
 
     std::int32_t* d_pos   = nullptr;
     std::int32_t* d_delta = nullptr;
