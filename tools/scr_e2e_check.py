@@ -446,8 +446,10 @@ def main():
                 "SCR did not engage, so this comparison would be vacuous. "
                 "Make the shared tail longer (>= a few 64-token blocks) and check that no "
                 "turn-checkpoint path is taking precedence.")
-        elif second["cache_hit"] == 0:
-            problems.append("the --scr run reported cache_hit=0, so the shared prefix was not reused")
+        # cache_hit is prefix reuse only. For this edit shape the prefix does not match (the middle is
+        # deleted, so the resident prompt is not a prefix of the new one), so reuse_base is 0 and
+        # cache_hit is legitimately 0 even when relocation saved hundreds of tokens. The relocated
+        # count is reported separately as prefix_relocated_tokens in the JSON completion record.
 
     if len(ref_records) < 2:
         problems.append(f"expected 2 completion records in the --no-scr run, saw {len(ref_records)}")
