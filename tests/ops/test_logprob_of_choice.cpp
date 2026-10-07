@@ -267,10 +267,9 @@ int main() {
         const std::int32_t pick = 1;
         CUDA_CHECK(cudaMemcpy(state.device_chosen, &pick, sizeof(pick), cudaMemcpyHostToDevice));
 
-        ninfer::Tensor good_out = state.out();
-        ninfer::Tensor bad_chosen = state.chosen();
+        ninfer::Tensor good_out   = state.out();
         ninfer::Tensor bad_logits = state.logits();
-        bad_logits.ne[1]            = 2;
+        bad_logits.ne[1]          = 2;
 
         expect_throw([&] {
             ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 0, good_out, nullptr);
@@ -278,13 +277,20 @@ int main() {
         expect_throw([&] {
             ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 4, good_out, nullptr);
         }, "valid_rows past the physical rows");
+        // Each case must hand the Op a tensor of the *wrong* dtype. Copying a correctly typed view and
+        // expecting a rejection would test nothing, which is what the first version of these cases did.
         expect_throw([&] {
-            ninfer::Tensor wrong = state.out();
+            ninfer::Tensor wrong(state.device_out, ninfer::DType::BF16, {1});
             ninfer::ops::logprob_of_choice(state.logits(), state.chosen(), 3, wrong, nullptr);
         }, "out of the wrong dtype");
         expect_throw([&] {
-            ninfer::ops::logprob_of_choice(state.logits(), bad_chosen, 3, good_out, nullptr);
+            ninfer::Tensor wrong(state.device_chosen, ninfer::DType::FP32, {1});
+            ninfer::ops::logprob_of_choice(state.logits(), wrong, 3, good_out, nullptr);
         }, "chosen of the wrong dtype");
+        expect_throw([&] {
+            ninfer::Tensor wrong(state.device_logits, ninfer::DType::FP32, {3, 1});
+            ninfer::ops::logprob_of_choice(wrong, state.chosen(), 3, good_out, nullptr);
+        }, "logits of the wrong dtype");
         expect_throw([&] {
             ninfer::ops::logprob_of_choice(bad_logits, state.chosen(), 3, good_out, nullptr);
         }, "chosen length not matching T");
