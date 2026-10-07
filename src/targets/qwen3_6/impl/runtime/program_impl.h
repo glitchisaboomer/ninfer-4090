@@ -1365,18 +1365,27 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
 
 // Suffix-relocation diagnostics. Off unless scr_diagnostics_enabled(), so it costs nothing in
 // production. Writes to stderr, which the e2e script folds into the server log.
+// A KV plane is BF16, and BF16 is exactly the top 16 bits of an FP32, so decoding is a shift. The
+// page stride comes from nb[3] rather than a computed element count, so this stays correct for any
+// plane dtype.
 float ProgramImplCore::scr_page_fingerprint(const PagedKVLayerView& layer,
                                             std::int32_t physical_page) const {
-    const std::int64_t elements =
-        static_cast<std::int64_t>(kPagedKVPageSize) * layer.k_pages.ne[0] * layer.k_pages.ne[2];
     if (physical_page < 0 || physical_page >= layer.k_pages.ne[3]) { return -1.0F; }
-    std::vector<float> host(static_cast<std::size_t>(elements));
-    CUDA_CHECK(cudaMemcpy(host.data(), static_cast<const char*>(layer.k_pages.data) +
-                                             static_cast<std::int64_t>(physical_page) * elements * 4,
-                          host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t elements    = page_stride / sizeof(std::uint16_t);
+    std::vector<std::uint16_t> host(elements);
+    CUDA_CHECK(cudaMemcpy(host.data(),
+                          static_cast<const char*>(layer.k_pages.data) +
+                              static_cast<std::size_t>(physical_page) * page_stride,
+                          host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
     float total = 0.0F;
-    for (const float value : host) { total += std::fabs(value); }
-    return total + 1000.0F * (host.front() + host.back());
+    for (const std::uint16_t word : host) {
+        std::uint32_t bits = static_cast<std::uint32_t>(word) << 16;
+        float value        = 0.0F;
+        std::memcpy(&value, &bits, sizeof(value));
+        total += std::fabs(value);
+    }
+    return total;
 }
 
 
@@ -1428,24 +1437,30 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
     // Read back the first full-attention K plane and report its finiteness and range. A relocated
     // page holding uninitialised memory, or a re-rotation that produced non-finite values, would
     // show up here rather than as an unexplained downstream symptom.
-    const std::size_t elements = static_cast<std::size_t>(layer.k_pages.numel());
-    std::vector<float> host(elements);
-    CUDA_CHECK(cudaMemcpy(host.data(), layer.k_pages.data, host.size() * sizeof(float),
-                          cudaMemcpyDeviceToHost));
+    // Read exactly the plane's own bytes. This previously read numel * 4 from a BF16 plane, twice
+    // the allocation, so the reported range and non-finite count described memory past the plane.
+    const std::size_t plane_bytes = static_cast<std::size_t>(layer.k_pages.bytes());
+    std::vector<std::uint16_t> host(plane_bytes / sizeof(std::uint16_t));
+    CUDA_CHECK(cudaMemcpy(host.data(), layer.k_pages.data, plane_bytes, cudaMemcpyDeviceToHost));
     std::size_t non_finite = 0;
     std::size_t first_bad  = 0;
     float lo               = 0.0F;
     float hi               = 0.0F;
+    bool seeded            = false;
     for (std::size_t i = 0; i < host.size(); ++i) {
-        if (!std::isfinite(host[i])) {
+        std::uint32_t bits = static_cast<std::uint32_t>(host[i]) << 16;
+        float value        = 0.0F;
+        std::memcpy(&value, &bits, sizeof(value));
+        if (!std::isfinite(value)) {
             if (non_finite == 0) { first_bad = i; }
             ++non_finite;
             continue;
         }
-        if (i == 0 || host[i] < lo) { lo = host[i]; }
-        if (i == 0 || host[i] > hi) { hi = host[i]; }
+        if (!seeded || value < lo) { lo = value; }
+        if (!seeded || value > hi) { hi = value; }
+        seeded = true;
     }
-    out << " k_plane0{elems=" << elements << " non_finite=" << non_finite;
+    out << " k_plane0{bytes=" << plane_bytes << " non_finite=" << non_finite;
     if (non_finite != 0) { out << " first_bad_index=" << first_bad; }
     out << " range=[" << lo << "," << hi << "]}";
 
