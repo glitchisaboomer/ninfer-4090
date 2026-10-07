@@ -163,6 +163,40 @@ struct TailRelocationPlan {
                                                       std::uint32_t prompt_tokens,
                                                       std::uint32_t max_spans);
 
+// Sentinel for a logical page with no resident physical page, so it has to come from the pool when a
+// remap is applied. The value matches PagedKVAllocation's acquire sentinel; the runtime static_asserts
+// that, because this header is deliberately host-buildable and cannot include the paged-cache header.
+inline constexpr std::int32_t kRemapAcquirePage = -1;
+
+// Build the logical-to-physical page mapping for a tail relocation.
+//
+// `current_pages` is the allocation's current mapping, one physical page per logical page of the
+// resident prompt: page `i` holds tokens `[64i, 64i + 64)`. The result has one entry per logical page
+// of the new prompt, either the physical page that should hold it or `kRemapAcquirePage` for a page
+// that has no content to keep and that prefill will write into.
+//
+// Pages are only carried over where their content must survive, because the remap never copies data:
+//
+//   * every relocated block keeps the physical page that already holds it; and
+//   * the reused prefix keeps its own pages, including the partially reused page straddling the
+//     frontier, whose tail prefill overwrites in place.
+//
+// Everything else is left to acquire. The pages dropped from the replaced region are exactly what pays
+// for those slots, through the surplus reuse in PagedKVAllocation::reassign_pages.
+//
+// Returns an empty vector when the relocation cannot be expressed, which the caller must treat as a
+// fall back to ordinary prefix reuse:
+//
+//   * a relocated span is not 64-token aligned in both directions,
+//   * a relocated block's source page does not exist, or its destination falls outside the prompt,
+//   * the reused prefix reaches past the current mapping, or
+//   * the mapping would name one physical page twice. Reassigning would reject that anyway, and the
+//     overlap means a surviving region and the prefix disagree about which page holds it.
+[[nodiscard]] std::vector<std::int32_t> plan_page_remap(std::span<const std::int32_t> current_pages,
+                                                       std::span<const RelocatedSpan> spans,
+                                                       std::uint32_t prefix_reuse_tokens,
+                                                       std::uint32_t prompt_tokens);
+
 // Detect the spans of `previous` that survive in `current`.
 //
 // Blocks are hashed and matched by hash, then confirmed by exact token comparison, so a

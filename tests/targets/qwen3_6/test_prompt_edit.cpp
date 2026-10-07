@@ -505,6 +505,59 @@ void test_plan_tail_relocation_merges_adjacent_survivors() {
     }
 }
 
+void test_plan_page_remap() {
+    using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
+    using ninfer::targets::qwen3_6::detail::plan_page_remap;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    // Scope A shift: the surviving suffix moves from logical page 3 to logical page 1 of a three-page
+    // prompt whose first page is reused prefix. Only the relocated destination and the prefix are
+    // carried; the remaining slot is left for prefill and paid for by the dropped pages.
+    const std::vector<std::int32_t> resident{10, 11, 12, 13, 14};
+    const std::vector<RelocatedSpan> shift{
+        RelocatedSpan{.source_begin = block_tokens(3), .dest_begin = block_tokens(1), .tokens = block_tokens(1)}};
+
+    const auto remap = plan_page_remap(resident, shift, block_tokens(1), block_tokens(3));
+    expect(remap.size() == 3, "the remap covers every logical page of the new prompt");
+    if (remap.size() == 3) {
+        expect(remap[0] == 10, "the reused prefix keeps its page");
+        expect(remap[1] == 13, "the relocated block keeps the page that already holds it");
+        expect(remap[2] == kRemapAcquirePage, "a prefilled page is left to acquire");
+    }
+
+    // A partially reused frontier block is still carried, because prefill overwrites only its tail.
+    const auto partial = plan_page_remap(resident, shift, block_tokens(1) + 7, block_tokens(3));
+    expect(partial.size() == 3 && partial[0] == 10, "a frontier inside a block still keeps that page");
+
+    // A span whose source page is also a prefix page would name one page twice, which reassigning
+    // rejects, so the remap must refuse rather than hand it over.
+    const std::vector<std::int32_t> tight{10, 11, 12};
+    const std::vector<RelocatedSpan> overlapping{
+        RelocatedSpan{.source_begin = 0, .dest_begin = block_tokens(2), .tokens = block_tokens(1)}};
+    expect(plan_page_remap(tight, overlapping, block_tokens(2), block_tokens(3)).empty(),
+           "a remap that would reuse a page twice is refused");
+
+    // Degenerate and out-of-range inputs fall back rather than producing a bad mapping.
+    const std::vector<RelocatedSpan> unaligned{
+        RelocatedSpan{.source_begin = block_tokens(3) + 1, .dest_begin = block_tokens(1), .tokens = block_tokens(1)}};
+    expect(plan_page_remap(resident, unaligned, block_tokens(1), block_tokens(3)).empty(),
+           "an unaligned source is refused");
+    const std::vector<RelocatedSpan> beyond{
+        RelocatedSpan{.source_begin = block_tokens(9), .dest_begin = block_tokens(1), .tokens = block_tokens(1)}};
+    expect(plan_page_remap(resident, beyond, block_tokens(1), block_tokens(3)).empty(),
+           "a source page past the resident mapping is refused");
+    const std::vector<std::int32_t> no_pages;
+    const std::vector<RelocatedSpan> no_spans;
+    expect(plan_page_remap(resident, shift, block_tokens(1), 0).empty(),
+           "an empty prompt is refused");
+    expect(plan_page_remap(no_pages, shift, 0, block_tokens(3)).empty(),
+           "an empty resident mapping is refused");
+    expect(plan_page_remap(resident, no_spans, 0, block_tokens(3)).empty(),
+           "a remap with no relocated spans is refused");
+    expect(plan_page_remap(resident, shift, block_tokens(4), block_tokens(3)).empty(),
+           "a prefix reaching past the resident mapping is refused");
+}
+
 void test_determinism() {
     Tokens previous;
     append(previous, segment(1, 2));
@@ -536,6 +589,7 @@ int main() {
     test_plan_tail_relocation();
     test_plan_tail_relocation_picks_one_run();
     test_plan_tail_relocation_merges_adjacent_survivors();
+    test_plan_page_remap();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

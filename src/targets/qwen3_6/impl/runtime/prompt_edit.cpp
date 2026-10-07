@@ -174,6 +174,54 @@ TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_
     return plan;
 }
 
+std::vector<std::int32_t> plan_page_remap(std::span<const std::int32_t> current_pages,
+                                         std::span<const RelocatedSpan> spans,
+                                         std::uint32_t prefix_reuse_tokens,
+                                         std::uint32_t prompt_tokens) {
+    std::vector<std::int32_t> mapping;
+    if (current_pages.empty() || spans.empty() || prompt_tokens == 0) { return mapping; }
+
+    const std::uint32_t logical_pages =
+        (prompt_tokens + kPromptEditBlockTokens - 1) / kPromptEditBlockTokens;
+    mapping.assign(logical_pages, kRemapAcquirePage);
+
+    // Relocated destinations claim their source page first, so the prefix pass below can see which
+    // slots are already spoken for.
+    std::vector<std::uint8_t> claimed(logical_pages, 0);
+    for (const RelocatedSpan& span : spans) {
+        if (span.tokens == 0 || span.tokens % kPromptEditBlockTokens != 0 ||
+            span.source_begin % kPromptEditBlockTokens != 0 ||
+            span.dest_begin % kPromptEditBlockTokens != 0) {
+            return {};
+        }
+        for (std::uint32_t offset = 0; offset < span.tokens; offset += kPromptEditBlockTokens) {
+            const std::uint32_t source_page = (span.source_begin + offset) / kPromptEditBlockTokens;
+            const std::uint32_t dest_page   = (span.dest_begin + offset) / kPromptEditBlockTokens;
+            if (source_page >= current_pages.size() || dest_page >= mapping.size()) { return {}; }
+            mapping[dest_page] = current_pages[source_page];
+            claimed[dest_page]  = 1;
+        }
+    }
+
+    // The reused prefix keeps its own pages, including the one straddling the frontier.
+    const std::uint32_t prefix_page = prefix_reuse_tokens / kPromptEditBlockTokens;
+    if (prefix_page >= current_pages.size() || prefix_page >= mapping.size()) { return {}; }
+    for (std::uint32_t page = 0; page <= prefix_page; ++page) {
+        if (claimed[page] == 0) { mapping[page] = current_pages[page]; }
+    }
+
+    // One physical page must not be named twice. Reassigning rejects that, and it would mean the
+    // prefix and a surviving region disagree about which page holds their content.
+    std::vector<std::int32_t> carried;
+    carried.reserve(mapping.size());
+    for (const std::int32_t page : mapping) {
+        if (page != kRemapAcquirePage) { carried.push_back(page); }
+    }
+    std::sort(carried.begin(), carried.end());
+    if (std::adjacent_find(carried.begin(), carried.end()) != carried.end()) { return {}; }
+    return mapping;
+}
+
 PromptEditDiff diff_prompt_edit(std::span<const TokenId> previous, std::span<const TokenId> current,
                                 std::uint32_t block_tokens) {
     if (block_tokens == 0) {
