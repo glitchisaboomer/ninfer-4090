@@ -62,13 +62,6 @@ def intro_text(repeats):
     )
 
 
-# The surviving tail. diff_prompt_edit matches whole 64-token blocks by hash, so this text has to sit
-# at a 64-token boundary in both prompts. That requires the two middles to differ in length by a
-# multiple of 64 tokens, which cannot be arranged by counting characters, so count_prompt_tokens
-# below measures it against the server's own tokenizer.
-def tail_text():
-    return build_text(TAIL_SENTENCES, 12)
-
 
 MIDDLE_A = (
     " SECTION ONE. The migration moves the primary datastore from a single node "
@@ -232,18 +225,22 @@ def middle_text(units):
     return " " + _join(MIDDLE_FILLER, 1) + " " + _join(MIDDLE_FILLER[1:], 3 + units)
 
 
-# How many times the tail block is repeated. This is the length of the relocated run, so it is the
-# knob for bisecting a mechanical fault (fails at any size) from an approximation that only degrades
-# once the relocated run is a large fraction of the prompt. The script reports the token count.
+# Size of the relocated run. TAIL_BLOCKS requests a whole number of 64-token blocks, which is the
+# decisive knob: under the stale-state approximation a single block should be nearly harmless and
+# the damage should grow with the count, whereas one block that is already fatal points at something
+# structural rather than proportional to how much stale KV is reintroduced. TAIL_REPEATS is the
+# fallback when TAIL_BLOCKS is unset.
+TAIL_BLOCKS = None
 TAIL_REPEATS = 3
 
 
 def tail_text():
-    if FACT_PLACEMENT == "prefix":
-        return " " + _join(TAIL_SENTENCES[2:], TAIL_REPEATS)
-    return " " + _join(TAIL_SENTENCES, TAIL_REPEATS)
-
-
+    sentences = TAIL_SENTENCES if FACT_PLACEMENT == "tail" else TAIL_SENTENCES[2:]
+    repeats = TAIL_REPEATS
+    if TAIL_BLOCKS is not None:
+        per_repeat = max(1, len(sentences) * 11)
+        repeats = max(1, -(-TAIL_BLOCKS * 64 // per_repeat))
+    return " " + _join(sentences, repeats)
 def request_prompt(variant, prefix_units=0, middle_units=0):
     """A = PREFIX + MIDDLE + TAIL, B = PREFIX + TAIL. Only A carries the middle."""
     head = prefix_text(prefix_units)
@@ -429,6 +426,11 @@ def main():
                              "the stale-state approximation is tolerable. The paper reuses 7.8%% of "
                              "prompt tokens beyond prefix-cache hits; raise this until the reported "
                              "share lands in that range.")
+    parser.add_argument("--tail-blocks", type=int, default=None,
+                        help="size the relocated run to this many 64-token blocks. The decisive "
+                             "experiment: a single block that is already fatal points at something "
+                             "structural, while damage that grows with the count is the stale-state "
+                             "approximation.")
     parser.add_argument("--tail-repeats", type=int, default=3,
                         help="length of the relocated run, in repeats of the tail block. The knob for "
                              "bisecting a mechanical fault, which fails at any size, from an "
@@ -455,10 +457,11 @@ def main():
     # Split on whitespace. Deliberately not shlex: on Windows a backslash path would be mangled by
     # POSIX-style escape handling, and the server arguments here never need quoting.
     args.base_args_list = args.base_args.split()
-    global FACT_PLACEMENT, TAIL_REPEATS, PREFIX_REPEATS
+    global FACT_PLACEMENT, TAIL_REPEATS, PREFIX_REPEATS, TAIL_BLOCKS
     FACT_PLACEMENT = args.fact_in
     TAIL_REPEATS = args.tail_repeats
     PREFIX_REPEATS = args.prefix_repeats
+    TAIL_BLOCKS = args.tail_blocks
 
     artifact = next((a for a in args.base_args_list if a.lower().endswith(".ninfer")), None)
     if artifact is None:
