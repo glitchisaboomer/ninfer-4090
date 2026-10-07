@@ -164,6 +164,14 @@ PREFIX_FILLER = [
     "Do not speculate beyond what the record actually states.",
 ]
 
+# How many times the prefix block is repeated. This sets the *relocated fraction*, which is the
+# quantity that actually governs whether SCR works. The paper reuses 7.8% of prompt tokens beyond
+# prefix-cache hits (5.3 points from reasoning stripping, 2.5 from context edits). A short prefix
+# with a long surviving tail relocates most of the prompt, a far harsher regime than anything the
+# paper measured, and the stale-state error scales with the relocated fraction rather than with the
+# absolute token count.
+PREFIX_REPEATS = 4
+
 MIDDLE_FILLER = [
     "SECTION ONE. The migration moved the primary datastore onto a replicated cluster.",
     "Consensus settings, leader election, and replica placement were all reviewed.",
@@ -216,7 +224,7 @@ def _pad(sentences, units):
 
 def prefix_text(units):
     fact = PREFIX_FACT if FACT_PLACEMENT == "prefix" else ""
-    return QUESTION + fact + _join(PREFIX_FILLER, 4) + _pad(MIDDLE_FILLER, units)
+    return QUESTION + fact + _join(PREFIX_FILLER, PREFIX_REPEATS) + _pad(MIDDLE_FILLER, units)
 
 
 def middle_text(units):
@@ -282,10 +290,13 @@ def solve_alignment(port, max_tokens, timeout, think):
     head_only = request_prompt("a", prefix_units, middle_units).split("SECTION ONE")[0]
     prefix_only = count_tokens(port, head_only, max_tokens, timeout, think)
     tail_tokens = tokens_b - prefix_only
+    share = 100 * tail_tokens // max(tokens_b, 1)
     print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
           f"MIDDLE = {tokens_a - tokens_b} tokens ({(tokens_a - tokens_b) // BLOCK_TOKENS} blocks)")
     print(f"    relocated run is about {tail_tokens} tokens ({tail_tokens // BLOCK_TOKENS} blocks), "
-          f"roughly {100 * tail_tokens // max(tokens_b, 1)}% of the prompt")
+          f"roughly {share}% of the prompt")
+    print(f"    (the paper reuses ~8% of prompt tokens beyond prefix-cache hits; a share far above "
+          f"that is a much harsher regime than it measured)")
     return prefix_units, middle_units
 
 
@@ -405,6 +416,12 @@ def main():
                              "rebuilt linear-attention state can reach it. If 'prefix' passes and "
                              "'tail' fails, relocation is working and the approximation is simply "
                              "too coarse at this relocated fraction.")
+    parser.add_argument("--prefix-repeats", type=int, default=4,
+                        help="length of the shared prefix, in repeats of the prefix block. This is "
+                             "the knob for the relocated fraction, which is what governs whether "
+                             "the stale-state approximation is tolerable. The paper reuses 7.8%% of "
+                             "prompt tokens beyond prefix-cache hits; raise this until the reported "
+                             "share lands in that range.")
     parser.add_argument("--tail-repeats", type=int, default=3,
                         help="length of the relocated run, in repeats of the tail block. The knob for "
                              "bisecting a mechanical fault, which fails at any size, from an "
@@ -427,9 +444,10 @@ def main():
     # Split on whitespace. Deliberately not shlex: on Windows a backslash path would be mangled by
     # POSIX-style escape handling, and the server arguments here never need quoting.
     args.base_args_list = args.base_args.split()
-    global FACT_PLACEMENT, TAIL_REPEATS
+    global FACT_PLACEMENT, TAIL_REPEATS, PREFIX_REPEATS
     FACT_PLACEMENT = args.fact_in
     TAIL_REPEATS = args.tail_repeats
+    PREFIX_REPEATS = args.prefix_repeats
 
     artifact = next((a for a in args.base_args_list if a.lower().endswith(".ninfer")), None)
     if artifact is None:
