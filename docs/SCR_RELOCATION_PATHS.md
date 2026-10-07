@@ -217,6 +217,57 @@ The planner-side mode check is host-testable (`tests/targets/qwen3_6/test_prompt
 covers `plan_relocations`), so the mode split can be verified without CUDA even though the two
 runtimes cannot.
 
+## SCR produces garbage on both supported models: the GDN layers make it unworkable
+
+This is the finding that ends the current phase. With the planner fixed (see below), SCR engages and
+reports `reuse=suffix_relocation`, the relocated run is planned correctly, `reassign_pages` and
+`gqa_kv_rerotate` run, and the output is degenerate: the model emits an empty `content`, loops the
+maintenance log verbatim in `reasoning_content`, and runs to the `max_tokens` ceiling (observed:
+10240 tokens) instead of the one-sentence answer the reference path produces in 81.
+
+The cause is that the relocation branch in `program_impl.h` never touches
+`decoder->linear_attention`. Compare the two branches: the turn-checkpoint path explicitly calls
+`decoder->linear_attention.copy_slot(...)` to restore the recurrent state, and the relocation path
+has zero references to it.
+
+| model | full-attention layers | GDN layers |
+|---|---|---|
+| qwen3.8-27b | 16 | **48** |
+| qwen3.6-35b-a3b | 10 | **30** |
+
+So 48 of 64 layers (75%) keep a recurrent state that was summarised over the *old* prompt, including
+the deleted middle, while the prompt no longer contains it. The 16 full-attention layers are
+relocated correctly, which is why the plumbing is provably sound and the output is still garbage.
+
+**This is architectural, not an implementation defect.** A linear-attention state is a running
+recurrence: after tokens `[0, N)` it holds a sum over `t` of decayed `k_t v_t^T` products. Deleting a
+middle segment changes the decay products of every later token, and the `k_t`/`v_t` themselves were
+produced by hidden states computed *with* that middle present. There is therefore no way to derive
+the post-deletion state from the pre-deletion one; recovering it means replaying the recurrence over
+the surviving tokens, which is precisely the forward pass SCR exists to avoid. Page remapping and
+RoPE re-rotation work because KV is per-token and position-addressed. Recurrent state is neither.
+
+Neither supported model is a pure-attention transformer, so there is no configuration where this
+path is correct today. Until a mechanism exists for relocating or invalidating recurrent state,
+`--scr` should be treated as unimplemented for these architectures rather than experimental.
+
+### Two blockers fixed along the way
+
+**The planner made SCR unreachable.** The gate was `!base->turn_rewrite_boundary`, but
+`chat_template.cpp` always records a boundary when `add_generation_prompt` is set, that option
+defaults to true, and `translate.cpp` sets it true for every chat request. Nothing sets it false, so
+the gate was always false and the whole path -- `diff_prompt_edit`, `plan_tail_relocation`,
+`reassign_pages`, `gqa_kv_rerotate`, the prefill-lane wiring -- never executed, despite every
+component being proven correct by unit tests. The boundary marks where the assistant's reasoning is
+rewritten, so it bounds how far a relocated span may reach rather than forbidding relocation.
+`plan_tail_relocation` now takes it as an optional parameter and trims a span back to the last whole
+block ending before it. Before the fix every e2e run reported `full_reset`; after it, relocation is
+planned and executed.
+
+**The planner has no guard for quantized KV.** `gqa_kv_rerotate` requires an uncompressed BF16 Text
+KV plane, so a quantized `--kv-dtype` plans a relocation that then throws at runtime instead of
+degrading to `AppendAtFrontier`. This is the cheapest outstanding fix and is not done.
+
 ## Verification status
 
 Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 88-test suite green):
