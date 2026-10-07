@@ -61,23 +61,19 @@ __device__ __forceinline__ float logsumexp_value(LogsumexpState state) {
     return state.max + __logf(state.sum);
 }
 
-// Combines one shuffle step, updating only the lanes that own a partner at `offset`.
+// Combines one shuffle step, guarding only the *use* of the partner's value.
 //
-// The guard is load-bearing. __shfl_down_sync returns the *calling lane's own value* when the source
-// lane is out of range, so an unguarded butterfly makes every lane in the top half merge its partial
-// with itself. For a maximum that is harmless -- max(x,x) is x -- which is why the unguarded form is
-// idiomatic for argmax. A log-sum-exp merge is not idempotent: merging a partial with itself doubles
-// its sum. Lane 0 happens to survive that because the corrupted lanes are only ever read after the
-// lanes that consume them have already been folded in, so the result is right by an argument about
-// consumption order rather than by the reduction being correct. Guard it.
+// The shuffles must be reached by every lane. Their mask names all 32, and a lane that has already
+// left the warp makes the sync undefined rather than merely redundant -- on Volta+ independent thread
+// scheduling the barrier waits on threads that exited, so an early return here deadlocks the kernel.
+// Argmax gets this right for the same reason, though it can afford to leave the use unguarded because
+// a maximum is idempotent; a log-sum-exp merge is not, so the use is guarded too.
 __device__ __forceinline__ void logsumexp_shfl_step(LogsumexpState& state, int offset) {
-    const int lane = threadIdx.x & 31;
+    const int lane      = threadIdx.x & 31;
+    const float partner_max = __shfl_down_sync(0xffffffffu, state.max, offset);
+    const float partner_sum = __shfl_down_sync(0xffffffffu, state.sum, offset);
     if (lane >= offset) { return; }
-    const LogsumexpState other{
-        __shfl_down_sync(0xffffffffu, state.max, offset),
-        __shfl_down_sync(0xffffffffu, state.sum, offset),
-    };
-    state = logsumexp_merge(state, other);
+    state = logsumexp_merge(state, LogsumexpState{partner_max, partner_sum});
 }
 
 __device__ __forceinline__ LogsumexpState logsumexp_warp_reduce(LogsumexpState state) {
