@@ -136,10 +136,11 @@ def count_tokens(port, prompt, max_tokens, timeout, think):
 
 def post_completion(port, prompt, max_tokens, timeout, think):
     result = post_json(port, "/v1/chat/completions", request_body(prompt, max_tokens, think), timeout)
-    message = result["choices"][0]["message"]
+    choice = result["choices"][0]
+    message = choice["message"]
     content = message.get("content") or ""
     reasoning = message.get("reasoning_content") or ""
-    return content, reasoning, result["usage"]
+    return content, reasoning, result["usage"], choice.get("finish_reason")
 
 
 BLOCK_TOKENS = 64
@@ -353,11 +354,16 @@ def run_config(args, extra_flags, label):
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
+    environment = dict(os.environ)
+    if args.scr_diag:
+        environment["NINFER_SCR_DIAG"] = "1"
+
     # The server log is redirected to a file rather than a pipe: on Windows a pipe buffer fills up
     # while we are waiting on HTTP and the server blocks, which looks like a hang.
     with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
         proc = subprocess.Popen(
-            command, stdout=log_file, stderr=subprocess.STDOUT, cwd=args.cwd, creationflags=creationflags
+            command, stdout=log_file, stderr=subprocess.STDOUT, cwd=args.cwd,
+            env=environment, creationflags=creationflags
         )
         try:
             healthy, why = wait_for_health(port, proc, args.startup_timeout)
@@ -369,13 +375,13 @@ def run_config(args, extra_flags, label):
                                                         args.request_timeout, args.think)
 
             print("  request A (PREFIX + MIDDLE + TAIL, primes the KV cache)...")
-            _, _, usage_a = post_completion(port, request_prompt("a", prefix_units or 0,
-                                                                middle_units or 0),
-                                            args.max_tokens, args.request_timeout, args.think)
+            _, _, usage_a, _ = post_completion(port, request_prompt("a", prefix_units or 0,
+                                                                  middle_units or 0),
+                                              args.max_tokens, args.request_timeout, args.think)
             time.sleep(1.0)
 
             print("  request B (PREFIX + TAIL: the middle is deleted, the tail survives)...")
-            content_b, reasoning_b, usage_b = post_completion(
+            content_b, reasoning_b, usage_b, finish_b = post_completion(
                 port, request_prompt("b", prefix_units or 0), args.max_tokens,
                 args.request_timeout, args.think)
             time.sleep(1.0)
@@ -394,6 +400,7 @@ def run_config(args, extra_flags, label):
         "reasoning": reasoning_b,
         "usage": usage_b,
         "usage_a": usage_a,
+        "finish": finish_b,
     }, records
 
 
@@ -427,6 +434,10 @@ def main():
                              "bisecting a mechanical fault, which fails at any size, from an "
                              "approximation that only bites once the run is a large share of the "
                              "prompt. The script prints the resulting token count and share.")
+    parser.add_argument("--scr-diag", action="store_true",
+                        help="set NINFER_SCR_DIAG=1 on the server so it dumps the applied relocation "
+                             "plan, the page remap, the bound block-table row, and whether the "
+                             "relocated K plane is finite.")
     parser.add_argument("--think", action="store_true",
                         help="keep thinking enabled. Off by default: this model reasons at length, "
                              "so a thinking run can burn the whole token budget without ever "
@@ -499,6 +510,13 @@ def main():
             continue
         with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
             log_text = handle.read()
+        # The runtime's own account of what it did, emitted when NINFER_SCR_DIAG was set.
+        diagnostic = [line for line in log_text.splitlines() if "[scr-diag]" in line]
+        if diagnostic:
+            print()
+            print(f"runtime relocation diagnostic ({label}):")
+            for line in diagnostic:
+                print(f"  {line.strip()}")
         for needle, hint in (
             ("must be BF16", "SCR requires --kv-dtype bf16; quantized KV planes are rejected"),
             ("not supported", "the KV plane layout is one the relocation Op refuses"),
@@ -538,6 +556,8 @@ def main():
     reason_ref = ref_result["reasoning"].strip()
 
     print()
+    print(f"request B finish_reason: --scr={scr_result['finish']}  "
+          f"--no-scr={ref_result['finish']}")
     print("request B, --scr:")
     print(f"  content   : {text_scr!r}")
     if reason_scr:

@@ -475,6 +475,13 @@ private:
     [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
+
+    // Suffix-relocation diagnostic. No-op unless NINFER_SCR_DIAG is set. Reports the applied plan,
+    // the page remap, and whether the relocated K plane is finite, since the relocation path has
+    // produced badly wrong output while every component tests clean in isolation.
+    void log_scr_relocation(const RequestPlanImpl& request_plan, std::uint32_t prompt_tokens,
+                            std::uint32_t base, std::span<const std::int32_t> remap,
+                            const qwen3_6::PagedKVCacheView& view) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
 

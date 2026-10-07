@@ -20,11 +20,16 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -488,6 +493,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             ? (apply_relocation ? ReusePath::SuffixRelocation : ReusePath::AppendAtFrontier)
             : request_plan.reuse;
     std::vector<PrefillRange> suffix_prefill_ranges;
+    // The page remap the applied relocation used, retained so the diagnostic below can report it.
+    std::vector<std::int32_t> scr_remap;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp && !request_plan.disable_speculation
             ? std::min({draft_window,
@@ -762,6 +769,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 if (remap.empty()) {
                     throw std::logic_error("suffix relocation has no expressible page remap");
                 }
+                scr_remap = remap;
                 sequence.kv->text.reassign_pages(remap, device.stream);
                 suffix_prefill_ranges.clear();
                 if (!request_plan.relocated_head.empty()) {
@@ -851,6 +859,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                              device.stream);
                 }
             }
+            log_scr_relocation(request_plan, prompt_tokens, base, scr_remap, relocation_kv);
         }
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
@@ -1330,6 +1339,82 @@ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequenc
 qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& sequence) const {
     if (!sequence.kv) { throw std::logic_error("sequence has no KV allocation bundle"); }
     return decoder->text_kv.execution_view(sequence.kv->text);
+}
+
+// Suffix-relocation diagnostics. Off unless NINFER_SCR_DIAG is set, so it costs nothing in
+// production. Writes to stderr, which the e2e script folds into the server log.
+//
+// The relocated path has produced wildly wrong output (the model emitting a stop token as its first
+// token) while every component tests clean in isolation, so this reports what the runtime actually
+// did rather than what an external observer infers from the reuse path and token counts.
+bool scr_diagnostics_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SCR_DIAG");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
+                                         std::uint32_t prompt_tokens, std::uint32_t base,
+                                         std::span<const std::int32_t> remap,
+                                         const qwen3_6::PagedKVCacheView& view) const {
+    if (!scr_diagnostics_enabled()) { return; }
+
+    std::ostringstream out;
+    out << "[scr-diag] prompt_tokens=" << prompt_tokens << " base=" << base
+        << " rope_freq[0]=" << text_rope_inv_freq[0] << " rope_freq[17]=" << text_rope_inv_freq[17];
+    for (const RelocatedSpan& span : request_plan.relocated_spans) {
+        out << " span{src=" << span.source_begin << " dst=" << span.dest_begin
+            << " tok=" << span.tokens << " delta="
+            << (static_cast<std::int64_t>(span.dest_begin) -
+                static_cast<std::int64_t>(span.source_begin))
+            << "}";
+    }
+    out << " head{" << request_plan.relocated_head.begin << "," << request_plan.relocated_head.end
+        << "} tail{" << request_plan.relocated_tail.begin << "," << request_plan.relocated_tail.end
+        << "}";
+    out << " remap[";
+    for (std::size_t i = 0; i < remap.size(); ++i) { out << (i ? "," : "") << remap[i]; }
+    out << "]";
+
+    // Read back the first full-attention K plane and report its finiteness and range. A relocated
+    // page holding uninitialised memory, or a re-rotation that produced non-finite values, would
+    // show up here rather than as an unexplained downstream symptom.
+    const PagedKVLayerView layer = view.layer_view(0);
+    const std::size_t elements  = static_cast<std::size_t>(layer.k_pages.numel());
+    std::vector<float> host(elements);
+    CUDA_CHECK(cudaMemcpy(host.data(), layer.k_pages.data, host.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    std::size_t non_finite = 0;
+    std::size_t first_bad  = 0;
+    float lo               = 0.0F;
+    float hi               = 0.0F;
+    for (std::size_t i = 0; i < host.size(); ++i) {
+        if (!std::isfinite(host[i])) {
+            if (non_finite == 0) { first_bad = i; }
+            ++non_finite;
+            continue;
+        }
+        if (i == 0 || host[i] < lo) { lo = host[i]; }
+        if (i == 0 || host[i] > hi) { hi = host[i]; }
+    }
+    out << " k_plane0{elems=" << elements << " non_finite=" << non_finite;
+    if (non_finite != 0) { out << " first_bad_index=" << first_bad; }
+    out << " range=[" << lo << "," << hi << "]}";
+
+    // The block-table row attention resolves destinations through, read back from the device.
+    const std::size_t rows = static_cast<std::size_t>(layer.block_table.numel());
+    if (rows != 0) {
+        std::vector<std::int32_t> table(rows);
+        CUDA_CHECK(cudaMemcpy(table.data(), layer.block_table.data, rows * sizeof(std::int32_t),
+                              cudaMemcpyDeviceToHost));
+        out << " row[";
+        for (std::size_t i = 0; i < rows && i < 32; ++i) { out << (i ? "," : "") << table[i]; }
+        out << (rows > 32 ? ",..." : "") << "]";
+    }
+    std::cerr << out.str() << '\n';
+    std::cerr.flush();
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
