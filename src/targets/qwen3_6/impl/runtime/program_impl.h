@@ -765,6 +765,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
+            // Authorise this prompt's pages before anything that measures itself against the
+            // entitlement. `reassign_pages` rejects a remap wider than the allocation's *current*
+            // entitlement, so on a retained lane sized for a shorter prompt the relocation was
+            // failing against a number this very call is about to replace -- a 500 on a prompt shape
+            // the engine has ample capacity for. `trim_sequence_kv` below does not read the
+            // entitlement, so hoisting this above the branch changes nothing for the other path.
+            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                           request_plan.backend_kv_page_entitlement);
             if (apply_relocation) {
                 // Suffix Cache Reuse. The resident pages above the frontier hold the surviving run,
                 // so they are kept rather than trimmed and re-pointed at their new logical
@@ -812,8 +820,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             } else {
                 trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             }
-            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
-                                           request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
         } else {
