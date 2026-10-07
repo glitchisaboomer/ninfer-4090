@@ -240,18 +240,37 @@ void built_in_prompt(int blocks, int variant, Json& primed, Json& edited) {
     };
     const Json system_turn{{"role", "system"}, {"content", system}};
 
-    primed = Json::array({system_turn,
-                          user_turn("Deployment brief. " + original + " " + tail),
-                          assistant_turn("Understood. I have read the deployment records."),
-                          user_turn("SECTION TWO. Verification ran after every rollout."),
-                          assistant_turn("Noted."),
-                          user_turn(question)});
-    edited = Json::array({system_turn,
-                          user_turn("Deployment brief. " + revised + " " + tail),
-                          assistant_turn("Understood. I have read the deployment records."),
-                          user_turn("SECTION TWO. Verification ran after every rollout."),
-                          assistant_turn("Noted."),
-                          user_turn(question)});
+    // History that is identical in both conversations and comes *before* the edited turn. Without it
+    // the only shared prefix is the system prompt and the chat template's own scaffolding, which is
+    // a few dozen tokens: prefix reuse matches almost nothing, every request runs full_reset, and the
+    // run reports a near-zero divergence for a feature that never engaged. The edit has to sit in the
+    // middle of a conversation for there to be a prefix worth reusing and a suffix worth relocating.
+    //
+    // Four exchanges, deliberately longer than one KV page, so the reused prefix spans several pages
+    // and the relocated run starts well inside the prompt.
+    std::vector<Json> shared;
+    for (int turn = 0; turn < 4; ++turn) {
+        shared.push_back(user_turn("SECTION ZERO." + std::to_string(turn) +
+                                   " Standing instructions for the maintenance window: confirm every "
+                                   "figure against the records, name the window it belongs to, and "
+                                   "do not speculate about counts that are not stated."));
+        shared.push_back(assistant_turn("Understood section zero " + std::to_string(turn) +
+                                        ". I will confirm each figure against the records and will "
+                                        "say so when the records do not settle a question."));
+    }
+
+    const auto conversation = [&](const std::string& section) {
+        Json messages = Json::array({system_turn});
+        for (const Json& turn : shared) { messages.push_back(turn); }
+        messages.push_back(user_turn("Deployment brief. " + section + " " + tail));
+        messages.push_back(assistant_turn("Understood. I have read the deployment records."));
+        messages.push_back(user_turn("SECTION TWO. Verification ran after every rollout."));
+        messages.push_back(assistant_turn("Noted."));
+        messages.push_back(user_turn(question));
+        return messages;
+    };
+    primed = conversation(original);
+    edited = conversation(revised);
 }
 
 std::vector<SuitePrompt> load_prompts_file(const std::string& path) {

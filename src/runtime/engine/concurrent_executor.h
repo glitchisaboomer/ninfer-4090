@@ -333,6 +333,18 @@ private:
         std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
         AdmissionResources admission_resources;
         std::uint64_t remaining_service_work = 0;
+        // What the planner projected, and what each consumer has actually spent against it. A budget
+        // overrun has two possible causes -- the projection was too small, or the run took more steps
+        // than the projection assumed -- and they need different fixes, so the failure reports which.
+        std::uint64_t service_work_projected      = 0;
+        std::uint64_t service_work_spent_prefill  = 0;
+        std::uint64_t service_work_spent_decode   = 0;
+        // Snapshot of the plan the projection was derived from, taken where the budget is set. Read
+        // from `base_plan` at failure time instead would race that optional's own lifetime.
+        std::uint32_t service_work_prompt_tokens      = 0;
+        std::uint32_t service_work_reusable_tokens    = 0;
+        std::uint32_t service_work_relocated_tokens   = 0;
+        std::uint32_t service_work_output_tokens      = 0;
         std::uint64_t backfill_epoch         = 0;
         BackfillClass backfill_class         = BackfillClass::None;
 
@@ -550,13 +562,42 @@ private:
         invalidate_lane_plans(lane);
     }
 
-    void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {
+    // Which consumer of the service-work budget overran, so a failure can name it rather than
+    // reporting a bare shortfall. An enum and not a label: classifying by the first letter of a
+    // message string would silently mis-bucket the moment anyone reworded it.
+    enum class ServiceWorkConsumer { Prefill, Decode };
+
+    static const char* service_work_consumer_name(ServiceWorkConsumer consumer) {
+        return consumer == ServiceWorkConsumer::Prefill ? "a prefill step" : "a decode round";
+    }
+
+    void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work,
+                              ServiceWorkConsumer consumer) {
         if (work == 0 || work > request->remaining_service_work) {
-            throw std::logic_error("request service projection consumed " + std::to_string(work) +
-                                   " quanta with " +
-                                   std::to_string(request->remaining_service_work) + " remaining");
+            // Report the whole shape rather than just the shortfall. "consumed 1 with 0 remaining"
+            // alone cannot distinguish a projection that was too small from a run that took more
+            // steps than projected, and those are different defects.
+            throw std::logic_error(
+                "request service projection exhausted by " +
+                std::string(service_work_consumer_name(consumer)) + ": wanted " +
+                std::to_string(work) + " quantum(s), " +
+                std::to_string(request->remaining_service_work) + " remained of " +
+                std::to_string(request->service_work_projected) + " projected; prefill spent " +
+                std::to_string(request->service_work_spent_prefill) + ", decode spent " +
+                std::to_string(request->service_work_spent_decode) +
+                ", prompt_tokens=" + std::to_string(request->service_work_prompt_tokens) +
+                ", reusable_prompt_tokens=" +
+                std::to_string(request->service_work_reusable_tokens) +
+                ", relocated_prompt_tokens=" +
+                std::to_string(request->service_work_relocated_tokens) +
+                ", effective_output_tokens=" + std::to_string(request->service_work_output_tokens));
         }
         request->remaining_service_work -= work;
+        if (consumer == ServiceWorkConsumer::Prefill) {
+            request->service_work_spent_prefill += work;
+        } else {
+            request->service_work_spent_decode += work;
+        }
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -664,7 +705,7 @@ private:
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
-        consume_service_work(request, 1);
+        consume_service_work(request, 1, ServiceWorkConsumer::Prefill);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
@@ -890,7 +931,12 @@ private:
             request->generated_logprobs.reserve(summary.effective_output_tokens);
             request->lane                   = lane;
             request->admission_resources    = summary.admission;
-            request->remaining_service_work = summary.service_work_quanta;
+            request->remaining_service_work  = summary.service_work_quanta;
+            request->service_work_projected  = summary.service_work_quanta;
+            request->service_work_prompt_tokens    = summary.prompt_tokens;
+            request->service_work_reusable_tokens  = summary.reusable_prompt_tokens;
+            request->service_work_relocated_tokens = summary.relocated_prompt_tokens;
+            request->service_work_output_tokens    = summary.effective_output_tokens;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
@@ -1148,7 +1194,7 @@ private:
                                                        row_logprobs.begin(), row_logprobs.end());
                 }
                 request->budget->commit(accepted[row]);
-                consume_service_work(request, accepted[row]);
+                consume_service_work(request, accepted[row], ServiceWorkConsumer::Decode);
             }
             auto published = request->output.commit_preview();
             if (!request->first_token && accepted[row] != 0) {
