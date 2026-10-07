@@ -139,32 +139,119 @@ def post_completion(port, prompt, max_tokens, timeout):
 
 BLOCK_TOKENS = 64
 
+# The shape the planner's own unit tests prove viable is Scope A: [P R S] -> [P S]. The edit
+# *deletes* a middle region R, and the surviving region S runs to the very end of the prompt. A
+# test that instead grows the prompt, or that trails a question after S, exercises different
+# planner branches and can silently decline to engage.
+#
+# So: PREFIX is a fixed question plus briefing, MIDDLE is deleted by request B, and TAIL carries
+# the fact the question asks about and ends the prompt. B must answer identically to A, and it can
+# only do that if the relocated tail KV is correct.
+QUESTION = (
+    "Read the maintenance log below and answer in one sentence: how many minutes was the "
+    "approved rollback window?\n\n"
+)
 
-def solve_padding(port, max_tokens, timeout):
-    """Find a padding that puts the surviving tail on a 64-token boundary in both prompts.
+PREFIX_FILLER = [
+    "The briefing that follows is a long operational record.",
+    "It is repeated many times so that it occupies whole KV blocks.",
+    "Read it carefully before answering the question at the start.",
+    "Do not speculate beyond what the record actually states.",
+]
 
-    diff_prompt_edit matches whole blocks by hash, so the tail only survives if it starts at the
-    same block offset in both prompts. That means the two middles must differ in length by a whole
-    number of blocks. Character counts cannot predict token counts, so measure with the server and
-    adjust the padding until the delta is block aligned.
+MIDDLE_FILLER = [
+    "SECTION ONE. The migration moved the primary datastore onto a replicated cluster.",
+    "Consensus settings, leader election, and replica placement were all reviewed.",
+    "Nothing in this section affects the rollback window.",
+    "It is removed by the edit that request B applies.",
+]
+
+# The fact the question asks about, at the very end of the prompt so it is the surviving tail.
+TAIL_SENTENCES = [
+    "The approved rollback window is fourteen minutes.",
+    "Any rollback exceeding that window requires a change advisory.",
+    "Two rollbacks were performed during the observation period.",
+    "Both completed inside the approved window without incident.",
+    "The verification suite ran after every rollout.",
+    "Throughput stayed within the agreed band throughout.",
+    "No customer-visible incident was attributed to these changes.",
+    "The maintenance record closes with the operator sign-off.",
+]
+
+
+def _join(sentences, repeats):
+    return " ".join(sentences * repeats)
+
+
+PREFIX_PAD = "The record below is reproduced verbatim and in full."
+
+
+def _pad(sentences, units):
+    """Appends `units` copies of a dedicated filler to grow the segment deterministically.
+
+    The filler is unique to the prefix so that padding cannot create a block that also occurs in
+    the middle, which would give diff_prompt_edit a spurious survivor to latch onto.
     """
-    base = count_tokens(port, request_prompt("a"), max_tokens, timeout)
-    print(f"  prompt A tokenises to {base} tokens")
+    return _join(sentences, 1) + " " + _join([PREFIX_PAD], units)
 
-    best = None
-    for padding_words in range(0, 40):
-        other = count_tokens(port, request_prompt("b", padding_words), max_tokens, timeout)
-        delta = other - base
-        if delta > 0 and delta % BLOCK_TOKENS == 0:
-            print(f"  padding={padding_words} filler units -> prompt B is {other} tokens, "
-                  f"delta {delta} = {delta // BLOCK_TOKENS} block(s)")
-            return padding_words, other, base
-        if best is None or abs(delta % BLOCK_TOKENS) < abs(best[1] % BLOCK_TOKENS):
-            best = (padding_words, delta, other)
-    print(f"  WARNING: no padding produced a block-aligned delta in 40 attempts; "
-          f"closest was padding={best[0]} delta={best[1]}")
-    print("           SCR needs the surviving tail block aligned, so it will likely not engage.")
-    return None, best[2], base
+
+def prefix_text(units):
+    return QUESTION + _join(PREFIX_FILLER, 4) + _pad(MIDDLE_FILLER, units)
+
+
+def middle_text(units):
+    return " " + _join(MIDDLE_FILLER, 1) + " " + _join(MIDDLE_FILLER[1:], 3 + units)
+
+
+def tail_text():
+    return " " + _join(TAIL_SENTENCES, 3)
+
+
+def request_prompt(variant, prefix_units=0, middle_units=0):
+    """A = PREFIX + MIDDLE + TAIL, B = PREFIX + TAIL. Only A carries the middle."""
+    head = prefix_text(prefix_units)
+    if variant == "a":
+        return head + middle_text(middle_units) + tail_text()
+    return head + tail_text()
+
+
+def solve_alignment(port, max_tokens, timeout):
+    """Pad PREFIX and MIDDLE so TAIL starts on a 64-token boundary in both prompts.
+
+    diff_prompt_edit matches whole 64-token blocks by hash, so TAIL is only recognised as a
+    surviving run if it begins at a block boundary in the previous prompt as well as the current
+    one. That needs len(PREFIX) and len(PREFIX)+len(MIDDLE) both divisible by 64. Token counts
+    cannot be predicted from characters, so measure with the server's own tokenizer and search.
+    """
+    print("  aligning the surviving tail to a 64-token boundary...")
+
+    prefix_units = 0
+    for units in range(0, 60):
+        length = count_tokens(port, request_prompt("b", units), max_tokens, timeout)
+        if length % BLOCK_TOKENS == 0:
+            prefix_units = units
+            print(f"    PREFIX padded with {units} unit(s) -> {length} tokens, block aligned")
+            break
+    else:
+        print("    WARNING: could not block-align PREFIX in 60 attempts")
+        return None, 0
+
+    middle_units = 0
+    for units in range(0, 80):
+        length = count_tokens(port, request_prompt("a", prefix_units, units), max_tokens, timeout)
+        if length % BLOCK_TOKENS == 0:
+            middle_units = units
+            print(f"    MIDDLE padded with {units} unit(s) -> {length} tokens, block aligned")
+            break
+    else:
+        print("    WARNING: could not block-align MIDDLE in 80 attempts")
+        return prefix_units, None
+
+    tokens_b = count_tokens(port, request_prompt("b", prefix_units), max_tokens, timeout)
+    tokens_a = count_tokens(port, request_prompt("a", prefix_units, middle_units), max_tokens, timeout)
+    print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
+          f"MIDDLE = {tokens_a - tokens_b} tokens ({(tokens_a - tokens_b) // BLOCK_TOKENS} blocks)")
+    return prefix_units, middle_units
 
 
 def wait_for_health(port, proc, timeout):
@@ -232,16 +319,17 @@ def run_config(args, extra_flags, label):
                 print(f"  server not healthy: {why}", file=sys.stderr)
                 return None, []
 
-            padding, tokens_b, tokens_a = solve_padding(port, args.max_tokens, args.request_timeout)
+            prefix_units, middle_units = solve_alignment(port, args.max_tokens, args.request_timeout)
 
-            print("  request A (primes the KV cache)...")
-            _, _, usage_a = post_completion(port, request_prompt("a"), args.max_tokens,
-                                            args.request_timeout)
+            print("  request A (PREFIX + MIDDLE + TAIL, primes the KV cache)...")
+            _, _, usage_a = post_completion(port, request_prompt("a", prefix_units or 0,
+                                                                middle_units or 0),
+                                            args.max_tokens, args.request_timeout)
             time.sleep(1.0)
 
-            print("  request B (shares prefix and tail, differs in the middle)...")
+            print("  request B (PREFIX + TAIL: the middle is deleted, the tail survives)...")
             content_b, reasoning_b, usage_b = post_completion(
-                port, request_prompt("b", padding or 0), args.max_tokens, args.request_timeout
+                port, request_prompt("b", prefix_units or 0), args.max_tokens, args.request_timeout
             )
             time.sleep(1.0)
         finally:
@@ -259,9 +347,6 @@ def run_config(args, extra_flags, label):
         "reasoning": reasoning_b,
         "usage": usage_b,
         "usage_a": usage_a,
-        "tokens_a": tokens_a,
-        "tokens_b": tokens_b,
-        "padding": padding,
     }, records
 
 
