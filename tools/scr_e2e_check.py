@@ -98,8 +98,12 @@ def request_prompt(variant, padding_words=0):
     )
 
 
-def request_body(prompt, max_tokens):
-    return {
+def request_body(prompt, max_tokens, think):
+    # Thinking is disabled by default. This model reasons at length, so a thinking run can burn the
+    # whole token budget and never emit content, which turns the comparison into a test of how long
+    # the model talked rather than of what it retrieved. With thinking off, both passes must emit the
+    # answer directly and the KV contents decide whether it is right.
+    body = {
         "model": "local",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
@@ -107,6 +111,9 @@ def request_body(prompt, max_tokens):
         "max_tokens": max_tokens,
         "stream": False,
     }
+    if not think:
+        body["reasoning_effort"] = "none"
+    return body
 
 
 def post_json(port, path, payload, timeout):
@@ -120,18 +127,16 @@ def post_json(port, path, payload, timeout):
         return json.loads(response.read().decode("utf-8"))
 
 
-def count_tokens(port, prompt, max_tokens, timeout):
+def count_tokens(port, prompt, max_tokens, timeout, think):
     """Token count for `prompt` under the server's own tokenizer and chat template."""
-    payload = request_body(prompt, max_tokens)
+    payload = request_body(prompt, max_tokens, think)
     result = post_json(port, "/v1/messages/count_tokens", payload, timeout)
     return int(result["input_tokens"])
 
 
-def post_completion(port, prompt, max_tokens, timeout):
-    result = post_json(port, "/v1/chat/completions", request_body(prompt, max_tokens), timeout)
+def post_completion(port, prompt, max_tokens, timeout, think):
+    result = post_json(port, "/v1/chat/completions", request_body(prompt, max_tokens, think), timeout)
     message = result["choices"][0]["message"]
-    # A thinking model can spend the whole budget on reasoning, leaving content empty. Keep both so
-    # the comparison does not silently degenerate into comparing two empty strings.
     content = message.get("content") or ""
     reasoning = message.get("reasoning_content") or ""
     return content, reasoning, result["usage"]
@@ -215,7 +220,7 @@ def request_prompt(variant, prefix_units=0, middle_units=0):
     return head + tail_text()
 
 
-def solve_alignment(port, max_tokens, timeout):
+def solve_alignment(port, max_tokens, timeout, think):
     """Pad PREFIX and MIDDLE so TAIL starts on a 64-token boundary in both prompts.
 
     diff_prompt_edit matches whole 64-token blocks by hash, so TAIL is only recognised as a
@@ -227,7 +232,7 @@ def solve_alignment(port, max_tokens, timeout):
 
     prefix_units = 0
     for units in range(0, 60):
-        length = count_tokens(port, request_prompt("b", units), max_tokens, timeout)
+        length = count_tokens(port, request_prompt("b", units), max_tokens, timeout, think)
         if length % BLOCK_TOKENS == 0:
             prefix_units = units
             print(f"    PREFIX padded with {units} unit(s) -> {length} tokens, block aligned")
@@ -238,7 +243,7 @@ def solve_alignment(port, max_tokens, timeout):
 
     middle_units = 0
     for units in range(0, 80):
-        length = count_tokens(port, request_prompt("a", prefix_units, units), max_tokens, timeout)
+        length = count_tokens(port, request_prompt("a", prefix_units, units), max_tokens, timeout, think)
         if length % BLOCK_TOKENS == 0:
             middle_units = units
             print(f"    MIDDLE padded with {units} unit(s) -> {length} tokens, block aligned")
@@ -247,8 +252,8 @@ def solve_alignment(port, max_tokens, timeout):
         print("    WARNING: could not block-align MIDDLE in 80 attempts")
         return prefix_units, None
 
-    tokens_b = count_tokens(port, request_prompt("b", prefix_units), max_tokens, timeout)
-    tokens_a = count_tokens(port, request_prompt("a", prefix_units, middle_units), max_tokens, timeout)
+    tokens_b = count_tokens(port, request_prompt("b", prefix_units), max_tokens, timeout, think)
+    tokens_a = count_tokens(port, request_prompt("a", prefix_units, middle_units), max_tokens, timeout, think)
     print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
           f"MIDDLE = {tokens_a - tokens_b} tokens ({(tokens_a - tokens_b) // BLOCK_TOKENS} blocks)")
     return prefix_units, middle_units
@@ -319,18 +324,19 @@ def run_config(args, extra_flags, label):
                 print(f"  server not healthy: {why}", file=sys.stderr)
                 return None, []
 
-            prefix_units, middle_units = solve_alignment(port, args.max_tokens, args.request_timeout)
+            prefix_units, middle_units = solve_alignment(port, args.max_tokens,
+                                                        args.request_timeout, args.think)
 
             print("  request A (PREFIX + MIDDLE + TAIL, primes the KV cache)...")
             _, _, usage_a = post_completion(port, request_prompt("a", prefix_units or 0,
                                                                 middle_units or 0),
-                                            args.max_tokens, args.request_timeout)
+                                            args.max_tokens, args.request_timeout, args.think)
             time.sleep(1.0)
 
             print("  request B (PREFIX + TAIL: the middle is deleted, the tail survives)...")
             content_b, reasoning_b, usage_b = post_completion(
-                port, request_prompt("b", prefix_units or 0), args.max_tokens, args.request_timeout
-            )
+                port, request_prompt("b", prefix_units or 0), args.max_tokens,
+                args.request_timeout, args.think)
             time.sleep(1.0)
         finally:
             proc.terminate()
@@ -362,6 +368,11 @@ def main():
     parser.add_argument("--cwd", default=".", help="working directory for the server")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--think", action="store_true",
+                        help="keep thinking enabled. Off by default: this model reasons at length, "
+                             "so a thinking run can burn the whole token budget without ever "
+                             "emitting content, which tests how long the model talked rather than "
+                             "what it retrieved.")
     parser.add_argument("--startup-timeout", type=int, default=600)
     parser.add_argument("--request-timeout", type=int, default=900)
     args = parser.parse_args()
