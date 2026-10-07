@@ -4,9 +4,11 @@ Companion to `docs/SCR_ROADMAP.md`. That document describes the phases; this one
 concrete ways the runtime can apply a relocation plan, exactly where each attaches, and what has to
 be decided before either is written.
 
-Status: **the primitives exist and are committed; neither path is wired into the runtime yet.** A
-`ReusePath::SuffixRelocation` plan is currently applied as ordinary prefix reuse, so generated output
-is unchanged (`program_impl.h`, `start_prefill_lane`).
+Status: **Path A is written but has never been compiled.** `start_prefill_lane` replaces the common
+frontier trim with the page remap, re-rotates the relocated run once the block table is published, and
+stages the plan's two prefilled ranges, which the chunk walk skips the relocated run between. The
+whole change set was prepared without a CUDA toolchain, so none of that is verified. Path B is still
+unimplemented, and any plan without ranges falls back to ordinary prefix reuse.
 
 The two open design questions are now settled: Path A is the target, and the 27B's linear layers are
 handled by snapshot/restore. What remains is runtime wiring, which needs a machine with `nvcc` - see

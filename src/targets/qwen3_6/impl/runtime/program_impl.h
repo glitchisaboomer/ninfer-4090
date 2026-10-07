@@ -5,6 +5,7 @@
 #include "targets/qwen3_6/impl/runtime/prompt_lookup.h"
 #include "targets/qwen3_6/impl/runtime/yarn.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/gqa_kv_rerotate.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
@@ -473,15 +474,19 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
     const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
-    // Suffix Cache Reuse additionally needs the device to relocate resident KV for the
-    // surviving spans. That relocation is not implemented yet (roadmap Phase 4), so a
-    // SuffixRelocation plan is applied as ordinary prefix reuse: the prefix up to `base` is
-    // kept and every token after it is prefilled normally. Generated output is therefore
-    // identical to the pre-SCR path, and telemetry reports the path actually taken rather
+    // Suffix Cache Reuse can only be applied when the plan carries the ranges the staged prefill has
+    // to cover. `plan_tail_relocation` always yields a non-empty tail; the general selector does not
+    // supply one, so a plan without it falls back to ordinary prefix reuse. That keeps generated
+    // output identical to the pre-SCR path and lets telemetry report the path actually taken rather
     // than the path the plan requested.
+    const bool apply_relocation =
+        request_plan.reuse == ReusePath::SuffixRelocation &&
+        !request_plan.relocated_spans.empty() && !request_plan.relocated_tail.empty();
     const ReusePath applied_reuse =
-        request_plan.reuse == ReusePath::SuffixRelocation ? ReusePath::AppendAtFrontier
-                                                         : request_plan.reuse;
+        request_plan.reuse == ReusePath::SuffixRelocation
+            ? (apply_relocation ? ReusePath::SuffixRelocation : ReusePath::AppendAtFrontier)
+            : request_plan.reuse;
+    std::vector<PrefillRange> suffix_prefill_ranges;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp && !request_plan.disable_speculation
             ? std::min({draft_window,
@@ -740,7 +745,31 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                        sequence.dflash_context_frontier != base) {
                 throw std::logic_error("resident DFlash context is not at the append frontier");
             }
-            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            if (apply_relocation) {
+                // Suffix Cache Reuse. The resident pages above the frontier hold the surviving run,
+                // so they are kept rather than trimmed and re-pointed at their new logical
+                // positions. The pages the new prompt does not need pay for the ones prefill will
+                // write into, through the surplus reuse in `reassign_pages`. Cached K is re-rotated
+                // once the block table is published, further below.
+                if (!sequence.kv) {
+                    throw std::logic_error("suffix relocation has no KV allocation bundle");
+                }
+                const std::uint32_t prompt_tokens =
+                    static_cast<std::uint32_t>(prompt.token_ids.size());
+                const std::vector<std::int32_t> remap = qwen3_6::detail::plan_page_remap(
+                    sequence.kv->text.page_ids(), request_plan.relocated_spans, base, prompt_tokens);
+                if (remap.empty()) {
+                    throw std::logic_error("suffix relocation has no expressible page remap");
+                }
+                sequence.kv->text.reassign_pages(remap, device.stream);
+                suffix_prefill_ranges.clear();
+                if (!request_plan.relocated_head.empty()) {
+                    suffix_prefill_ranges.push_back(request_plan.relocated_head);
+                }
+                suffix_prefill_ranges.push_back(request_plan.relocated_tail);
+            } else {
+                trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            }
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
@@ -775,8 +804,31 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.ledger.resize(base);
         }
 
-        trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+        if (!apply_relocation) {
+            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+        }
+        // The relocation branch deliberately skipped this trim: it would discard the surviving pages
+        // the remap just re-pointed. `reassign_pages` has already returned everything the new prompt
+        // does not need, so nothing is leaked by not trimming here.
         bind_sequence_kv(sequence);
+        if (apply_relocation) {
+            // Cached K carries the rotation of the position a token held when it was prefilled, so
+            // the relocated run has to be re-rotated for its new positions. This runs after the bind
+            // above published the remapped block-table row, because the Op resolves a page through
+            // the block table at the new position.
+            const qwen3_6::PagedKVCacheView relocation_kv = text_kv_view(sequence);
+            for (const RelocatedSpan& span : request_plan.relocated_spans) {
+                const auto delta = static_cast<std::int32_t>(
+                    static_cast<std::int64_t>(span.dest_begin) -
+                    static_cast<std::int64_t>(span.source_begin));
+                for (int full_layer = 0; full_layer < TextConfig::full_attention_layers();
+                     ++full_layer) {
+                    ops::gqa_kv_rerotate_run(static_cast<std::int32_t>(span.dest_begin),
+                                             static_cast<std::int32_t>(span.tokens), delta,
+                                             relocation_kv.layer_view(full_layer), device.stream);
+                }
+            }
+        }
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
@@ -835,6 +887,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .prepare_mtp                      = request_plan.prepare_mtp,
             .reuse                            = applied_reuse,
             .mtp_bridge                       = request_plan.mtp_bridge,
+            .prefill_ranges                   = std::move(suffix_prefill_ranges),
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -1822,8 +1875,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // Suffix Cache Reuse prefills the ranges the plan reported and leaves the relocated run
+            // between them to resident KV, so the cursor skips over that run here.
+            const std::uint32_t resumed = staged.skip_relocated_runs(staged.cursor);
+            if (resumed != staged.cursor) {
+                staged.cursor          = resumed;
+                sequence.text_kv_valid = resumed;
+            }
+            const std::uint32_t range_end = staged.prefill_range_end(staged.cursor);
+            const std::uint32_t nominal   = std::min(prefill_chunk, range_end - staged.cursor);
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);

@@ -207,6 +207,29 @@ struct RequestControl {
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        // Prefilled ranges in prompt order. Empty means the single range `[base, prompt_tokens)`,
+        // which is what every reuse path except suffix relocation has. Suffix relocation fills this
+        // with the plan's two ranges, leaving the relocated run in between to be skipped.
+        std::vector<PrefillRange> prefill_ranges;
+
+        // End of the prefilled range containing `position`, or the prompt end when the caller only
+        // has the default range.
+        [[nodiscard]] std::uint32_t prefill_range_end(std::uint32_t position) const {
+            for (const PrefillRange& range : prefill_ranges) {
+                if (position >= range.begin && position < range.end) { return range.end; }
+            }
+            return prompt_tokens;
+        }
+
+        // A cursor that has completed a prefilled range resumes at the next one, skipping the
+        // relocated run in between.
+        [[nodiscard]] std::uint32_t skip_relocated_runs(std::uint32_t position) const {
+            for (const PrefillRange& range : prefill_ranges) {
+                if (position >= range.begin && position < range.end) { return position; }
+                if (position < range.begin) { return range.begin; }
+            }
+            return position;
+        }
     };
 
     std::optional<Prefill> prefill;
