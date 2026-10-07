@@ -354,8 +354,19 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    const std::size_t prefill_splits = (plan->vision ? plan->vision->uses.size() : 0ULL) +
-                                       (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL);
+    // Extra prefill steps that no token count can predict. Vision uses and turn-checkpoint captures
+    // each interrupt the chunk walk; so does a relocation, because it prefills two ranges with the
+    // surviving run skipped between them. The projection counts chunks over one contiguous span, so
+    // `ceil((head+tail)/chunk)` undercounts a two-range prefill by up to one: each range's last
+    // partial chunk is a whole step, and ceil(h/c) + ceil(t/c) exceeds ceil((h+t)/c) by at most one.
+    // Measured on hardware: a 6699-token prompt reusing 3008 relocated tokens prefilled 3691 tokens in
+    // six steps against a projected five, and the request died one quantum short at 68 of 68.
+    const std::size_t relocation_ranges =
+        static_cast<std::size_t>(plan->relocated_head.empty() ? 0 : 1) +
+        static_cast<std::size_t>(plan->relocated_tail.empty() ? 0 : 1);
+    const std::size_t prefill_splits =
+        (plan->vision ? plan->vision->uses.size() : 0ULL) +
+        (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL) + (relocation_ranges > 1 ? relocation_ranges - 1 : 0ULL);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->summary.reusable_prompt_tokens, prefill_chunk,
                                prefill_splits);
