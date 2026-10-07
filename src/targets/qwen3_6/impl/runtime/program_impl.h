@@ -766,6 +766,27 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 suffix_prefill_ranges.clear();
                 if (!request_plan.relocated_head.empty()) {
                     suffix_prefill_ranges.push_back(request_plan.relocated_head);
+                    // The linear-attention layers keep one fixed-size recurrent state for the whole
+                    // sequence rather than a per-token cache, so there is nothing to relocate and
+                    // nothing to re-rotate. The state left over from the previous prompt was
+                    // summarised over the *old* token sequence, including the region this edit just
+                    // deleted, so leaving it in place has 48 of 64 layers asserting that content the
+                    // prompt no longer contains. That is a contradiction rather than an
+                    // approximation, and it is what made the relocated run emit degenerate output.
+                    //
+                    // Zeroing is sufficient and needs no snapshot. The head range pushed just above
+                    // is prefilled from this point on, and feeding the new prefix into a zeroed
+                    // recurrence yields exactly the state a cold prefill of that prefix would
+                    // produce, which is what the paper's "snapshot the recurrent state before the
+                    // edit" recovers. The relocated run then contributes nothing to these layers,
+                    // which is the approximation the paper describes and measures as robust.
+                    //
+                    // Only when a head range exists to rebuild from. With an empty head the resident
+                    // prompt is a strict prefix of the new one, nothing was deleted, and the existing
+                    // state is already a valid state for the reused prefix.
+                    decoder->linear_attention.zero_slot(
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                        device.stream);
                 }
                 suffix_prefill_ranges.push_back(request_plan.relocated_tail);
             } else {
