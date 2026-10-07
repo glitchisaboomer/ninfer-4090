@@ -239,6 +239,12 @@ endforeach()
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
+# Pairs with the gqa_kv_rerotate component test: same Op, but every cache byte is written by
+# gqa_kv_append and every read goes through the attention kernels, so an addressing convention the
+# component test cannot disagree with is still exercised end to end.
+ninfer_add_op_test(ninfer_scr_relocation_integration_test
+  SOURCES ops/test_scr_relocation_integration.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
   SOURCES ops/test_bidirectional_gqa_attention.cpp
   LIBRARIES ninfer_ops)
