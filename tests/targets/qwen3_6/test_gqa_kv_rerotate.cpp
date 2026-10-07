@@ -180,20 +180,25 @@ struct Plane {
     }
 
     // Writes `value` for every head of `position`.
-    void write_row(std::int32_t position, const double* value) {
-        const std::int32_t phys = physical_page_of(position);
-        for (std::int32_t head = 0; head < kKvHeads; ++head) {
-            for (std::int32_t e = 0; e < kHeadDim; ++e) {
-                k_pages[k_index(phys, head, position % kPageSize, e)] = to_bf16(value[e]);
-            }
+    // Stages one head's row through host memory. k_pages is device memory, so every access has to
+    // cross the bus explicitly.
+    void write_head(std::int32_t position, std::int32_t head, const double* value) {
+        const std::size_t base = k_index(physical_page_of(position), head, position % kPageSize, 0);
+        std::vector<__nv_bfloat16> staging(static_cast<std::size_t>(kHeadDim));
+        for (std::int32_t e = 0; e < kHeadDim; ++e) {
+            staging[static_cast<std::size_t>(e)] = to_bf16(value[e]);
         }
+        CUDA_CHECK(cudaMemcpy(k_pages + base, staging.data(),
+                              staging.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
     }
 
-    // Reads back the row of one head at `position`.
-    void read_row(std::int32_t position, std::int32_t head, double* value) const {
-        const std::int32_t phys = physical_page_of(position);
+    void read_head(std::int32_t position, std::int32_t head, double* value) const {
+        const std::size_t base = k_index(physical_page_of(position), head, position % kPageSize, 0);
+        std::vector<__nv_bfloat16> staging(static_cast<std::size_t>(kHeadDim));
+        CUDA_CHECK(cudaMemcpy(staging.data(), k_pages + base,
+                              staging.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
         for (std::int32_t e = 0; e < kHeadDim; ++e) {
-            value[e] = to_double(k_pages[k_index(phys, head, position % kPageSize, e)]);
+            value[e] = to_double(staging[static_cast<std::size_t>(e)]);
         }
     }
 };
@@ -207,11 +212,13 @@ void check_relocation(Plane& plane, std::int32_t src_position, std::int32_t dst_
     const std::int32_t delta = dst_position - src_position;
 
     // Seed the cache with what a forward prefill at src_position leaves behind, rounded once to BF16.
-    std::array<double, kHeadDim> rotated{};
+    // Each head keeps its own rotated row: the check below compares every head against its own
+    // oracle, so seeding one shared row for all of them would compare heads against the wrong input.
+    std::vector<std::array<double, kHeadDim>> rotated(static_cast<std::size_t>(kKvHeads));
     for (std::int32_t head = 0; head < kKvHeads; ++head) {
         forward_rope_oracle(raw[static_cast<std::size_t>(head)].data(), src_position, freq,
-                            rotated.data());
-        plane.write_row(src_position, rotated.data());
+                            rotated[static_cast<std::size_t>(head)].data());
+        plane.write_head(src_position, head, rotated[static_cast<std::size_t>(head)].data());
     }
 
     ninfer::ops::gqa_kv_rerotate_run(dst_position, 1, delta,
@@ -223,13 +230,14 @@ void check_relocation(Plane& plane, std::int32_t src_position, std::int32_t dst_
     std::array<double, kHeadDim> got{};
     std::array<double, kHeadDim> oracle{};
     for (std::int32_t head = 0; head < kKvHeads; ++head) {
+        const std::array<double, kHeadDim>& seeded = rotated[static_cast<std::size_t>(head)];
         forward_rope_oracle(raw[static_cast<std::size_t>(head)].data(), dst_position, freq,
                             oracle.data());
-        plane.read_row(dst_position, head, got.data());
+        plane.read_head(dst_position, head, got.data());
         for (std::int32_t e = 0; e < kHeadDim; ++e) {
             if (e >= kRotaryElems) {
                 // Outside [0, 64) the Op must leave the row byte-identical.
-                const double untouched = to_double(to_bf16(rotated[e]));
+                const double untouched = to_double(to_bf16(seeded[static_cast<std::size_t>(e)]));
                 if (got[e] != untouched) {
                     fail(std::string(label) + ": element " + std::to_string(e) +
                          " outside [0,64) was modified");
@@ -263,7 +271,7 @@ void check_vector_entry_point(Plane& plane, std::int32_t src_position, std::int3
 
     std::array<double, kHeadDim> rotated{};
     forward_rope_oracle(raw[0].data(), src_position, freq, rotated.data());
-    plane.write_row(src_position, rotated.data());
+    plane.write_head(src_position, 0, rotated.data());
 
     std::int32_t* d_pos   = nullptr;
     std::int32_t* d_delta = nullptr;
@@ -283,7 +291,7 @@ void check_vector_entry_point(Plane& plane, std::int32_t src_position, std::int3
     std::array<double, kHeadDim> oracle{};
     std::array<double, kHeadDim> got{};
     forward_rope_oracle(raw[0].data(), dst_position, freq, oracle.data());
-    plane.read_row(dst_position, 0, got.data());
+    plane.read_head(dst_position, 0, got.data());
 
     double worst = 0.0;
     for (std::int32_t e = 0; e < kRotaryElems; ++e) {
@@ -311,14 +319,14 @@ void check_zero_delta(Plane& plane, std::int32_t position,
                       const std::vector<std::array<double, kHeadDim>>& raw, const FreqTable& freq) {
     std::array<double, kHeadDim> rotated{};
     forward_rope_oracle(raw[0].data(), position, freq, rotated.data());
-    plane.write_row(position, rotated.data());
+    plane.write_head(position, 0, rotated.data());
 
     ninfer::ops::gqa_kv_rerotate_run(position, 1, 0, std::span<const float, kRotaryPairs>(freq),
                                      plane.view(), nullptr);
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
 
     std::array<double, kHeadDim> got{};
-    plane.read_row(position, 0, got.data());
+    plane.read_head(position, 0, got.data());
     const int before = failures;
     for (std::int32_t e = 0; e < kRotaryElems; ++e) {
         if (got[e] != to_double(to_bf16(rotated[e]))) {
