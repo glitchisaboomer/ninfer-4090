@@ -102,6 +102,8 @@ std::string serve_usage_text(const char* argv0) {
            "                              of re-prefilling it (experimental; off by default)\n"
            "  --scr-max-spans <N>         Maximum surviving spans relocated per edit (default: " +
                std::to_string(kDefaultSuffixReuseMaxSpans) + ")\n"
+           "  --scr-mode <tail|segmented> Relocation shape to plan for: 'tail' uses one contiguous\n"
+           "                              surviving run, 'segmented' the general case (default: tail)\n"
            "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
            "Persistent Prompt Cache (DirectStorage DMA):\n"
            "  --disk-cache / --prompt-cache     Enable persistent multi-turn prompt caching to disk via DirectStorage DMA\n"
@@ -267,6 +269,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument(std::string(arg) + " must be positive");
             }
             options.suffix_reuse_max_spans = static_cast<std::uint32_t>(val);
+        } else if (arg == "--scr-mode" || arg == "--suffix-reuse-mode") {
+            const std::string mode(require_value(arg.c_str()));
+            if (mode == "tail") {
+                options.scr_plan_segmented = false;
+            } else if (mode == "segmented") {
+                options.scr_plan_segmented = true;
+            } else {
+                throw std::invalid_argument(std::string(arg) + " must be 'tail' or 'segmented'");
+            }
         } else if (arg == "--wddm-evictable-budget") {
             options.wddm_evictable_budget = true;
         } else if (arg == "--prompt-cache" || arg == "--disk-cache" || arg == "--enable-prompt-cache") {

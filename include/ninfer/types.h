@@ -158,6 +158,16 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// Which relocation shape the planner targets. Suffix Cache Reuse is an approximation either way;
+// this only decides how many prefilled ranges the runtime has to support, so the two can be
+// benchmarked against each other. See docs/SCR_RELOCATION_PATHS.md.
+enum class ScrRelocationMode : std::uint8_t {
+    // One contiguous surviving run, so the runtime prefills exactly two ranges around it.
+    Tail,
+    // The general case: disjoint surviving runs, which needs a segmented prefill.
+    Segmented,
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
@@ -169,6 +179,8 @@ struct ExecutionOptions {
     // Upper bound on relocated spans per edit. Reuse of the longest spans is preferred and
     // the remainder is re-prefilled, which bounds the approximation introduced at once.
     std::uint32_t suffix_reuse_max_spans = 6;
+    // Relocation shape to plan for. `Tail` is the only one the runtime can act on today.
+    ScrRelocationMode scr_mode = ScrRelocationMode::Tail;
 };
 
 struct OutputOptions {

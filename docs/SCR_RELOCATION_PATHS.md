@@ -199,14 +199,15 @@ with `nvcc` available.
 
 ## Switch for benchmarking
 
-To bench the paths against each other, the choice has to reach the plan:
+Wired: the choice reaches the plan through `ScrRelocationMode` on `ExecutionOptions`, mirrored into
+`ResolvedExecutionOptions`, `ServeOptions` and `RequestBasePlanImpl`, and surfaced as `--scr-mode
+tail|segmented`. The default is `tail`, and `tail` is the only mode the runtime can act on, so
+`segmented` currently produces a plan the runtime ignores exactly as `tail` does. The remaining items
+below are what still has to happen:
 
-- add an execution option (e.g. `ExecutionOptions::scr_mode`) and mirror it into
-  `ResolvedExecutionOptions`, `ServeOptions`, `RequestBasePlanImpl`;
-- surface it as `--scr-mode tail|segmented` in `serve_options.cpp`, validated like the other
-  enumerated flags;
-- default to `tail`, and have the planner reject a plan whose `relocated_spans` do not satisfy the
-  selected mode's condition, falling back to `AppendAtFrontier` rather than relocating partially;
+- have the planner reject a plan whose `relocated_spans` do not satisfy the selected mode's
+  condition, falling back to `AppendAtFrontier` rather than relocating partially. `tail` already gets
+  this from `plan_tail_relocation`; `segmented` has no such check yet;
 - report the mode in the server-start record and `prefix_relocated_tokens` in the completion record,
   which is already wired.
 

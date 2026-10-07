@@ -101,6 +101,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->enable_suffix_cache_reuse      = options.enable_suffix_cache_reuse;
     base->suffix_reuse_max_spans         = options.suffix_reuse_max_spans;
+    base->scr_mode                       = options.scr_mode;
     base->token_mask                     = options.token_mask;
     base->disable_speculation            = options.disable_speculation;
     const std::uint32_t reserved_context_tokens =
@@ -256,20 +257,36 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const qwen3_6::detail::PromptEditDiff diff = qwen3_6::detail::diff_prompt_edit(
             sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
 
-        // Selection rules live with the detector so they stay unit-testable on the host. The plan is
-        // the widest one the runtime can act on, a single contiguous run: `reuse_base` is the
-        // prefix-reuse frontier, so a destination below it is already covered by ordinary prefix
-        // reuse, and everything the run does not cover is prefilled from the two reported ranges.
-        const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
-            diff, sequence.text_kv_valid, plan->reuse_base,
-            static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans);
+        // Selection rules live with the detector so they stay unit-testable on the host. `reuse_base`
+        // is the prefix-reuse frontier, so a destination below it is already covered by ordinary
+        // prefix reuse. In tail mode everything the run does not cover is prefilled from the two
+        // reported ranges; in segmented mode the ranges stay empty and the runtime is expected to
+        // prefill an arbitrary set of ranges instead, which it cannot do yet.
+        std::vector<RelocatedSpan> plan_spans;
+        qwen3_6::detail::PrefillRange plan_head;
+        qwen3_6::detail::PrefillRange plan_tail;
+        if (base.scr_mode == ninfer::ScrRelocationMode::Segmented) {
+            plan_spans = qwen3_6::detail::plan_relocations(
+                diff, sequence.text_kv_valid, plan->reuse_base, base.suffix_reuse_max_spans);
+        } else {
+            const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
+                diff, sequence.text_kv_valid, plan->reuse_base,
+                static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans);
+            if (tail.viable) {
+                plan_head  = tail.head;
+                plan_tail  = tail.tail;
+                plan_spans = tail.spans;
+            }
+        }
 
-        if (tail.viable) {
+        if (!plan_spans.empty()) {
+            std::uint64_t relocated = 0;
+            for (const RelocatedSpan& span : plan_spans) { relocated += span.tokens; }
             plan->reuse                           = ReusePath::SuffixRelocation;
-            plan->relocated_head                  = tail.head;
-            plan->relocated_tail                  = tail.tail;
-            plan->summary.relocated_prompt_tokens = tail.relocated_tokens();
-            plan->relocated_spans                 = tail.spans;
+            plan->relocated_head                  = plan_head;
+            plan->relocated_tail                  = plan_tail;
+            plan->relocated_spans                 = std::move(plan_spans);
+            plan->summary.relocated_prompt_tokens = static_cast<std::uint32_t>(relocated);
         }
     }
 

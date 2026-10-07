@@ -23,6 +23,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.allow_prefix_reuse        = options.execution.allow_prefix_reuse;
     resolved.execution.enable_suffix_cache_reuse = options.execution.enable_suffix_cache_reuse;
     resolved.execution.suffix_reuse_max_spans    = options.execution.suffix_reuse_max_spans;
+    resolved.execution.scr_mode                  = options.execution.scr_mode;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.structured_output                 = std::move(options.structured_output);

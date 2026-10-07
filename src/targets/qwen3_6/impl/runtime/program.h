@@ -65,6 +65,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     bool allow_prefix_reuse = false;
     bool enable_suffix_cache_reuse = false;
     std::uint32_t suffix_reuse_max_spans = 0;
+    ninfer::ScrRelocationMode scr_mode = ninfer::ScrRelocationMode::Tail;
     std::vector<std::uint32_t> token_mask;
     bool disable_speculation = false;
 };

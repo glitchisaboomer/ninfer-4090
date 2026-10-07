@@ -51,6 +51,9 @@ struct ServeOptions {
     // correctness validation (roadmap Phase 5.5) has been run against real artifacts.
     bool enable_suffix_cache_reuse       = false;
     std::uint32_t suffix_reuse_max_spans = kDefaultSuffixReuseMaxSpans;
+    // Kept as a bool rather than the engine enum so this header stays free of engine types; it is
+    // translated when the request options are built.
+    bool scr_plan_segmented = false;
     bool enable_prompt_cache               = false;
     std::string prompt_cache_dir           = "";
     std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB default
