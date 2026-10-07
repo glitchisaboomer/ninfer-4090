@@ -906,7 +906,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                 ? diag_table[static_cast<std::size_t>(dest_page)]
                                 : -1;
                         relocated_page_probes.push_back(
-                            {dest_page, scr_page_fingerprint(diag_layer, physical)});
+                            {dest_page, scr_page_row_fingerprints(diag_layer, physical)});
                     }
                 }
             }
@@ -1419,6 +1419,34 @@ float ProgramImplCore::scr_page_fingerprint(const PagedKVLayerView& layer,
     return total;
 }
 
+std::vector<float> ProgramImplCore::scr_page_row_fingerprints(const PagedKVLayerView& layer,
+                                                              std::int32_t physical_page) const {
+    // The plane is page-major, then kv_head, then page_offset, then head_dim, so the page-relative
+    // element index divided by head_dim names the row directly.
+    const std::size_t rows =
+        static_cast<std::size_t>(layer.num_kv_heads) * kPagedKVPageSize;
+    std::vector<float> totals(rows, 0.0F);
+    if (physical_page < 0 || physical_page >= layer.k_pages.ne[3]) { return totals; }
+
+    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t elements    = page_stride / sizeof(std::uint16_t);
+    const std::size_t head_dim    = static_cast<std::size_t>(layer.head_dim);
+    if (head_dim == 0) { return totals; }
+    std::vector<std::uint16_t> host(elements);
+    CUDA_CHECK(cudaMemcpy(host.data(),
+                          static_cast<const char*>(layer.k_pages.data) +
+                              static_cast<std::size_t>(physical_page) * page_stride,
+                          host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+    for (std::size_t i = 0; i < elements; ++i) {
+        std::uint32_t bits = static_cast<std::uint32_t>(host[i]) << 16;
+        float value        = 0.0F;
+        std::memcpy(&value, &bits, sizeof(value));
+        const std::size_t row = i / head_dim;
+        if (row < totals.size()) { totals[row] += std::fabs(value); }
+    }
+    return totals;
+}
+
 
 void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
                                          std::uint32_t prompt_tokens, std::uint32_t base,
@@ -1537,20 +1565,82 @@ void ProgramImplCore::log_scr_relocation_integrity(
                               cudaMemcpyDeviceToHost));
     }
 
+    const auto page_total = [](const std::vector<float>& row_fingerprints) {
+        float total = 0.0F;
+        for (const float value : row_fingerprints) { total += value; }
+        return total;
+    };
+
     std::ostringstream out;
     out << "[scr-diag] post-prefill integrity";
-    std::size_t intact = 0;
+    std::size_t intact_pages = 0;
     for (const auto& probe : probes) {
-        const std::size_t logical = static_cast<std::size_t>(probe.logical_page);
+        const std::size_t logical  = static_cast<std::size_t>(probe.logical_page);
         const std::int32_t physical = logical < rows ? table[logical] : -1;
-        const float after = scr_page_fingerprint(layer, physical);
-        const bool is_intact = probe.fingerprint >= 0.0F && after == probe.fingerprint;
-        if (is_intact) { ++intact; }
-        out << " dest_page{" << probe.logical_page << "->phys=" << physical
-            << " rotated=" << probe.fingerprint << " after_prefill=" << after
-            << (is_intact ? " intact" : " CHANGED") << "}";
+        const std::vector<float> after = scr_page_row_fingerprints(layer, physical);
+
+        // Row-level diff. Naming the rows is the point: a re-rotation preserves sum|x| closely and so
+        // shows up as every row of every head drifting a little, while one prefilled token replaces
+        // exactly one row per kv head and shows up as four whole rows that changed a lot.
+        const std::size_t page_first =
+            static_cast<std::size_t>(probe.logical_page) * kPagedKVPageSize;
+        std::size_t changed = 0;
+        std::size_t shown   = 0;
+        float largest       = 0.0F;
+        std::ostringstream rows_out;
+        const std::size_t row_count = std::min(probe.row_fingerprints.size(), after.size());
+        for (std::size_t row = 0; row < row_count; ++row) {
+            const float expected = probe.row_fingerprints[row];
+            const float observed = after[row];
+            if (expected == observed) { continue; }
+            ++changed;
+            largest = std::max(largest, std::fabs(observed - expected));
+            if (shown < 6) {
+                rows_out << (shown == 0 ? "" : " ") << "kv_head=" << row / kPagedKVPageSize
+                         << ",pos=" << (page_first + row % kPagedKVPageSize)
+                         << ",rotated=" << expected << ",now=" << observed;
+                ++shown;
+            }
+        }
+        const bool is_intact = changed == 0;
+        if (is_intact) { ++intact_pages; }
+        out << " dest_page{" << probe.logical_page << "->phys=" << physical << " total{rotated="
+            << page_total(probe.row_fingerprints) << ",after_prefill=" << page_total(after)
+            << (is_intact ? ",intact}" : ",CHANGED}")
+            << " changed_rows=" << changed << " of " << row_count << " max_row_delta=" << largest
+            << (shown == 0 ? "" : " rows{" + rows_out.str() + "}") << "}";
     }
-    out << " summary{" << intact << "/" << probes.size() << " intact}";
+    out << " summary{" << intact_pages << "/" << probes.size() << " intact}";
+    std::cerr << out.str() << '\n';
+    std::cerr.flush();
+}
+
+void ProgramImplCore::log_scr_prefill_chunk(std::uint32_t cursor, std::uint32_t nominal,
+                                             std::uint32_t range_end, std::uint32_t resumed,
+                                             const qwen3_6::PagedKVCacheView& view) const {
+    if (!scr_diagnostics_enabled()) { return; }
+
+    // The extent the chunk makes visible, and the block-table entries attention resolves at and just
+    // past its frontier. An entry at or below `visible` decides whether the last key is inside the
+    // window; one just past it is what a read that overruns would pick up instead.
+    const std::uint32_t visible = cursor + nominal;
+    const PagedKVLayerView layer = view.layer_view(0);
+    const std::size_t rows       = static_cast<std::size_t>(layer.block_table.numel());
+    std::vector<std::int32_t> table(rows);
+    if (rows != 0) {
+        CUDA_CHECK(cudaMemcpy(table.data(), layer.block_table.data, rows * sizeof(std::int32_t),
+                              cudaMemcpyDeviceToHost));
+    }
+    const auto entry = [&](std::uint32_t position) -> std::int32_t {
+        const std::size_t page = static_cast<std::size_t>(position) / kPagedKVPageSize;
+        return page < rows ? table[page] : -1;
+    };
+
+    std::ostringstream out;
+    out << "[scr-diag] chunk cursor=" << cursor << " nominal=" << nominal << " range_end=" << range_end
+        << " resumed=" << resumed << " visible=" << visible
+        << " page[first]=" << entry(cursor) << " page[last_visible]=" << entry(visible - 1)
+        << " page[one_past]=" << (visible < cursor + 2 * kPagedKVPageSize ? entry(visible) : -2);
     std::cerr << out.str() << '\n';
     std::cerr.flush();
 }
@@ -2131,6 +2221,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             const std::uint32_t range_end = staged.prefill_range_end(staged.cursor);
             const std::uint32_t nominal   = std::min(prefill_chunk, range_end - staged.cursor);
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
+            if (scr_diagnostics_enabled() && !staged.relocated_page_probes.empty()) {
+                log_scr_prefill_chunk(staged.cursor, nominal, range_end, resumed,
+                                      text_kv_view(sequence));
+            }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (speculative_backend == SpeculativeBackend::DFlash) {

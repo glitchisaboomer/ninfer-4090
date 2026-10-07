@@ -188,9 +188,15 @@ struct SequenceState {
 // those pages has finished. The relocation diagnostic's before/after pair brackets only the
 // re-rotation, so without this nothing observes whether prefill then overwrote a page it was
 // supposed to leave alone.
+//
+// The fingerprints are per row rather than per page. A page-level sum|x| says that a page changed
+// without saying what wrote to it, and the two candidate writers look identical from a scalar: a
+// re-rotation preserves sum|x| to within a fraction of a percent, while a prefilled token replaces
+// four whole rows. Row granularity is what separates them, and it names the position and head.
 struct RelocatedPageProbe {
     std::int32_t logical_page = -1;
-    float fingerprint         = -1.0F;
+    // Indexed kv_head * kPagedKVPageSize + page_offset, matching the plane's page-relative layout.
+    std::vector<float> row_fingerprints;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -500,6 +506,11 @@ private:
     [[nodiscard]] float scr_page_fingerprint(const PagedKVLayerView& layer,
                                              std::int32_t physical_page) const;
 
+    // sum|x| per (kv_head, page_offset) row of one physical page. Strictly finer than
+    // scr_page_fingerprint, which collapses the whole page to one number.
+    [[nodiscard]] std::vector<float> scr_page_row_fingerprints(const PagedKVLayerView& layer,
+                                                              std::int32_t physical_page) const;
+
     // The other half of the relocation diagnostic, run once the prefill that consumes the relocated
     // pages has finished. log_scr_relocation brackets only the re-rotation, so it cannot see a
     // relocated page that prefill later overwrites -- which is the one failure mode the integration
@@ -508,6 +519,14 @@ private:
     // page that survived the prefill reads identical and a page that did not names the damage.
     void log_scr_relocation_integrity(const qwen3_6::PagedKVCacheView& view,
                                       std::span<const RelocatedPageProbe> probes) const;
+
+    // One line per prefill chunk the relocation branch drives, so the trace shows the ranges, the
+    // cursor skip across the relocated run, and the key extent each chunk makes visible to attention.
+    // The relocated page surviving prefill intact does not by itself mean attention read it, and this
+    // is the only place that states how far the visible extent reached.
+    void log_scr_prefill_chunk(std::uint32_t cursor, std::uint32_t nominal,
+                               std::uint32_t range_end, std::uint32_t resumed,
+                               const qwen3_6::PagedKVCacheView& view) const;
 
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
