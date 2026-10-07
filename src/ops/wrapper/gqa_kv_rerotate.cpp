@@ -91,4 +91,20 @@ void gqa_kv_rerotate(const Tensor& positions, const Tensor& rope_deltas, PagedKV
     detail::gqa_kv_rerotate_launch(positions, rope_deltas, cache, cache.num_kv_heads, stream);
 }
 
+void gqa_kv_rerotate_run(std::int32_t first_position, std::int32_t tokens, std::int32_t delta,
+                         PagedKVLayerView cache, cudaStream_t stream) {
+    constexpr const char* op = "gqa_kv_rerotate_run";
+    const std::int32_t capacity = validate_text_k_cache(cache, op);
+    if (first_position < 0) {
+        throw std::invalid_argument(std::string(op) + ": first position must be nonnegative");
+    }
+    if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
+    if (static_cast<std::int64_t>(first_position) + static_cast<std::int64_t>(tokens) >
+        static_cast<std::int64_t>(capacity)) {
+        throw std::invalid_argument(std::string(op) + ": the run exceeds KV cache capacity");
+    }
+    detail::gqa_kv_rerotate_run_launch(first_position, tokens, delta, cache, cache.num_kv_heads,
+                                       stream);
+}
+
 } // namespace ninfer::ops

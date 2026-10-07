@@ -68,4 +68,39 @@ __global__ void gqa_kv_rerotate_kernel(const std::int32_t* __restrict__ position
     }
 }
 
+// Same rotation for one contiguous run of logical positions carrying the same delta, which is the
+// shape a suffix relocation produces: surviving blocks move together by a fixed position offset. One
+// warp owns one position of the run, so no positions or deltas tensor is needed.
+template <int KVHeads>
+__global__ void gqa_kv_rerotate_run_kernel(std::int32_t first_position, std::int32_t tokens,
+                                          std::int32_t delta,
+                                          __nv_bfloat16* __restrict__ cache_k,
+                                          const std::int32_t* __restrict__ block_table) {
+    const int offset = static_cast<int>(blockIdx.x);
+    if (offset >= tokens) { return; }
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+
+    const std::int32_t position = first_position + offset;
+
+    int physical_page = 0;
+    if (lane == 0) { physical_page = paged_kv_physical_page(block_table, position); }
+    physical_page = __shfl_sync(0xffffffffu, physical_page, 0);
+
+    const int page_offset = position & kPagedKVPageMask;
+    const int pair        = lane;
+    float sine            = 0.0F;
+    float cosine          = 0.0F;
+    sincosf(static_cast<float>(delta) * kTextRopeInvFrequency[pair], &sine, &cosine);
+
+    for (int kv_head = 0; kv_head < KVHeads; ++kv_head) {
+        __nv_bfloat16* row =
+            cache_k + paged_kv_element_offset<kGqaRerotateHeadDim, KVHeads>(physical_page, kv_head,
+                                                                           page_offset, 0);
+        const float first  = __bfloat162float(row[pair]);
+        const float second = __bfloat162float(row[pair + kGqaRerotateHalf]);
+        row[pair]                   = __float2bfloat16_rn(first * cosine - second * sine);
+        row[pair + kGqaRerotateHalf] = __float2bfloat16_rn(second * cosine + first * sine);
+    }
+}
+
 } // namespace ninfer::ops

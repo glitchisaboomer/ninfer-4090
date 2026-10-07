@@ -64,4 +64,19 @@ namespace ninfer::ops {
 void gqa_kv_rerotate(const Tensor& positions, const Tensor& rope_deltas, PagedKVLayerView cache,
                      cudaStream_t stream);
 
+/**
+ * Op: the same re-rotation for one contiguous run of logical positions sharing a delta.
+ *
+ * A suffix relocation moves a run of surviving blocks together by a fixed position offset, so the run
+ * is `[first_position, first_position + tokens)` and every one of its positions is rotated by the same
+ * `delta`. Passing that run as scalars avoids staging per-token position and delta vectors on the
+ * device for what is a uniform shift.
+ *
+ * `tokens` must be positive and the whole run must lie inside the cache capacity, and the block table
+ * must already map every position of the run. Validation, geometry, numerics, effects, ordering, and
+ * workspace are otherwise the same as gqa_kv_rerotate.
+ */
+void gqa_kv_rerotate_run(std::int32_t first_position, std::int32_t tokens, std::int32_t delta,
+                         PagedKVLayerView cache, cudaStream_t stream);
+
 } // namespace ninfer::ops

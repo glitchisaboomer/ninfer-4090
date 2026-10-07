@@ -39,4 +39,32 @@ void gqa_kv_rerotate_launch(const Tensor& positions, const Tensor& rope_deltas,
     throw std::invalid_argument("gqa_kv_rerotate: Text KV geometry requires 4 or 2 KV heads");
 }
 
+namespace {
+
+template <int KVHeads>
+void launch_run_mode(std::int32_t first_position, std::int32_t tokens, std::int32_t delta,
+                     PagedKVLayerView cache, cudaStream_t stream) {
+    auto* cache_k             = static_cast<__nv_bfloat16*>(cache.k_pages.data);
+    const auto* table         = static_cast<const std::int32_t*>(cache.block_table.data);
+    gqa_kv_rerotate_run_kernel<KVHeads><<<tokens, kRerotateThreads, 0, stream>>>(
+        first_position, tokens, delta, cache_k, table);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void gqa_kv_rerotate_run_launch(std::int32_t first_position, std::int32_t tokens,
+                                std::int32_t delta, PagedKVLayerView cache, std::int32_t kv_heads,
+                                cudaStream_t stream) {
+    if (kv_heads == 4) {
+        launch_run_mode<4>(first_position, tokens, delta, cache, stream);
+        return;
+    }
+    if (kv_heads == 2) {
+        launch_run_mode<2>(first_position, tokens, delta, cache, stream);
+        return;
+    }
+    throw std::invalid_argument("gqa_kv_rerotate: Text KV geometry requires 4 or 2 KV heads");
+}
+
 } // namespace ninfer::ops::detail

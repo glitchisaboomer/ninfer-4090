@@ -89,6 +89,27 @@ on a 64 boundary at or below `prompt_tokens`, and the leftover block is prefille
 
 In `start_prefill_lane`, on `ReusePath::SuffixRelocation` with `relocated_spans` non-empty:
 
+### The relocation is not a reuse branch
+
+A first reading suggests this belongs in the `AppendAtFrontier` reuse branch, beside the other reuse
+paths. It does not, because `start_prefill_lane` runs this for *every* path once the branches are done:
+
+```
+  trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+  bind_sequence_kv(sequence);
+  materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+```
+
+That `trim_sequence_kv(sequence, base, ...)` keeps `base` tokens, so it discards exactly the pages above
+the frontier - which is where the whole surviving run lives. The relocation therefore has to *replace*
+that trim, not sit before it, and `reassign_pages` has to run before `bind_sequence_kv` so binding
+publishes the remapped block-table row. The rotary fix-up has to run after that publish, because the Op
+resolves a page through the block table at the new position.
+
+One thing that does *not* need changing: the ledger. The same common block assigns
+`prompt.token_ids` to `sequence.ledger` after every path, so the relocated tokens are already recorded
+and no path sets it explicitly.
+
 The plan needs to carry the two prefilled boundaries, not just the spans: `head_begin`
 (= `prefix_reuse_tokens`), `head_end` (= the run's first destination), `tail_begin` (= the run's
 last destination end) and `tail_end` (= `prompt_tokens`). `RequestPlanImpl` has the spans today and
