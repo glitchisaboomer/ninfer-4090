@@ -73,6 +73,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     layout.rope_pos   = add_tensor(builder, DType::I32, {1}, "step rope position");
     layout.rope_delta = add_tensor(builder, DType::I32, {1}, "step rope delta");
     layout.logits     = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
+    layout.logprob    = add_tensor(builder, DType::FP32, {1}, "step logprob");
     layout.text_kv_table_row    = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     layout.backend_kv_table_row = add_tensor(builder, DType::I32, {1}, "step backend KV table row");
     return layout;
@@ -102,11 +103,14 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
-    sampled_tokens = Tensor(static_cast<unsigned char*>(egress.data) +
-                                offsetof(OrdinaryDecodeEgress, sampled_tokens),
-                            DType::I32, {count});
-    logits         = layout.logits.bind(backing);
-    hidden         = layout.hidden.bind(backing);
+    sampled_tokens   = Tensor(static_cast<unsigned char*>(egress.data) +
+                                  offsetof(OrdinaryDecodeEgress, sampled_tokens),
+                              DType::I32, {count});
+    sampled_logprobs = Tensor(static_cast<unsigned char*>(egress.data) +
+                                  offsetof(OrdinaryDecodeEgress, sampled_logprobs),
+                              DType::FP32, {count});
+    logits           = layout.logits.bind(backing);
+    hidden           = layout.hidden.bind(backing);
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -350,6 +354,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     rope_pos             = layout.rope_pos.bind(backing);
     rope_delta           = layout.rope_delta.bind(backing);
     logits               = layout.logits.bind(backing);
+    logprob              = layout.logprob.bind(backing);
     text_kv_table_row    = layout.text_kv_table_row.bind(backing);
     backend_kv_table_row = layout.backend_kv_table_row.bind(backing);
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }

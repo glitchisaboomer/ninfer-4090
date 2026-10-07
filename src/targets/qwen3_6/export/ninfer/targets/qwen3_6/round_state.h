@@ -39,6 +39,12 @@ struct OrdinaryDecodeIngress {
 
 struct OrdinaryDecodeEgress {
     std::array<TokenId, kMaximumConcurrency> sampled_tokens{};
+    // Next-token logprob of the corresponding `sampled_tokens` entry, over the same token domain
+    // the sampler used. Emitted for every decode round, unconditionally: Phase 5.5 of
+    // docs/SCR_ROADMAP.md measures the reuse paths' divergence in nats, and a flag that only
+    // switched this off would fork the captured CUDA graph for no measurable gain against a decode
+    // step's weight traffic.
+    std::array<float, kMaximumConcurrency> sampled_logprobs{};
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
@@ -148,6 +154,9 @@ struct RoundStateLayout {
     TensorRegion rope_pos;
     TensorRegion rope_delta;
     TensorRegion logits;
+    // Logprob of the token a prefill picked from `logits`. Prefill has no egress POD to carry it,
+    // so the single value rides the round state and is drained next to `token`.
+    TensorRegion logprob;
     TensorRegion text_kv_table_row;
     TensorRegion backend_kv_table_row;
     std::optional<MtpPrefillStateLayout> mtp;
@@ -167,6 +176,7 @@ struct OrdinaryDecodeState {
     Tensor lanes;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
+    Tensor sampled_logprobs;
     Tensor logits;
     Tensor hidden;
 
@@ -278,6 +288,7 @@ struct RoundState {
     Tensor rope_pos;
     Tensor rope_delta;
     Tensor logits;
+    Tensor logprob;
     Tensor text_kv_table_row;
     Tensor backend_kv_table_row;
     std::optional<MtpPrefillState> mtp;

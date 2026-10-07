@@ -407,6 +407,13 @@ enum class PrefixReusePath : std::uint8_t {
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
+    // Logprob the model assigned to each entry of `generated_token_ids`, in the same order.
+    // Element i is the logprob of `generated_token_ids[i]` given everything before it, over the
+    // sampler's token domain. Always the same size as `generated_token_ids`; a token whose producing
+    // path does not measure logprobs (the MTP/DFlash licensed tokens) is reported as NaN rather than
+    // being dropped, so the two vectors never describe different tokens. Phase 5.5 of
+    // docs/SCR_ROADMAP.md measures Suffix Cache Reuse with this; the served API does not expose it.
+    std::vector<float> generated_logprobs;
     std::string content;
     std::string reasoning;
     std::uint32_t reasoning_tokens     = 0;

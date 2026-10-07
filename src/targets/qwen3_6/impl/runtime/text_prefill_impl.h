@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/logprob_of_choice.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 
@@ -152,6 +153,11 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
+    // A fully reused prefix still needs the first generated token's logprob, or the reuse paths
+    // would be compared from their second token on. Emitted before the workspace reset, on the
+    // same stream, so it reads the logits column the sampler just consumed.
+    ops::logprob_of_choice(logits, state.execution.io.token, TextConfig::token_domain,
+                           state.execution.io.logprob, state.execution.device.stream);
     state.execution.work.reset();
 }
 

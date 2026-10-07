@@ -75,12 +75,18 @@ struct BeginSummary {
 
 struct GeneratedRound {
     std::span<const TokenId> tokens;
+    // Next-token logprob of each entry in `tokens`, in the same order, or empty when the target
+    // produced the round without measuring one. A non-empty span always matches `tokens` in size.
+    std::span<const float> logprobs;
 };
 
 struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
     std::span<const std::int32_t> row_counts;
     std::uint32_t row_stride = 1;
+    // Same ragged layout as `tokens`: row r's logprobs start at r * row_stride. Empty means the
+    // target did not measure this round's logprobs at all, never that they are zero.
+    std::span<const float> logprobs;
 };
 
 struct PrefillStepResult {

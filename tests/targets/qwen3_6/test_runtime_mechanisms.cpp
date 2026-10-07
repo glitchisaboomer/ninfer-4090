@@ -9,8 +9,11 @@
 #include "targets/qwen3_6/impl/runtime/yarn.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <new>
 #include <string_view>
 #include <vector>
 
@@ -144,6 +147,61 @@ void test_round_layout() {
            "K=15 DFlash storage is backend-owned");
     expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
            "DFlash layout does not allocate MTP storage");
+}
+
+// Phase 5.5 of docs/SCR_ROADMAP.md scores the reuse paths with per-token logprobs, so every
+// generated token needs a logprob beside it: the sampled one in the ordinary decode egress, and
+// the prompt's first token in the round state (prefill has no egress POD to carry it). Both are
+// bound here over a host backing, which is all this mechanism needs -- it is pointer arithmetic,
+// not device work -- so a missing bind, wrong dtype, or dropped layout region fails the build's
+// test suite rather than surfacing as a gap in a quality run.
+void test_round_logprob_binding() {
+    ninfer::LayoutBuilder builder;
+    constexpr std::int32_t capacity = 4;
+    q36::RoundStateLayout layout    = q36::begin_round_state_layout(
+        builder, q36::RoundStateSpec{
+                     .hidden = 32, .output_rows = 128, .batch_capacity = capacity});
+    q36::complete_round_state_layout(builder, layout);
+    const std::size_t bytes = builder.finish(256);
+
+    expect(layout.logprob.dtype == ninfer::DType::FP32 && layout.logprob.shape[0] == 1,
+           "round layout carries one FP32 prefill logprob");
+    expect(layout.ordinary.has_value(), "ordinary round layout is present for the scalar case");
+
+    // The layout's regions are 256-byte aligned, so the backing must be too.
+    void* memory = ::operator new(bytes, std::align_val_t{256});
+    std::memset(memory, 0, bytes);
+    q36::RoundState state(ninfer::DeviceSpan{memory, bytes}, layout);
+
+    expect(state.logprob.dtype == ninfer::DType::FP32 && state.logprob.ne[0] == 1 &&
+               state.logprob.ne[1] == 1 && state.logprob.data != nullptr,
+           "round state binds the prefill logprob as FP32 [1]");
+
+    expect(state.ordinary.has_value(), "bound round state has ordinary decode storage");
+    const q36::OrdinaryDecodeState& ordinary = *state.ordinary;
+    expect(ordinary.sampled_logprobs.dtype == ninfer::DType::FP32 &&
+               ordinary.sampled_logprobs.ne[0] == capacity &&
+               ordinary.sampled_logprobs.ne[1] == 1,
+           "ordinary egress binds one FP32 logprob per decode row");
+
+    const auto* egress = static_cast<const unsigned char*>(ordinary.egress.data);
+    const auto* logprobs = static_cast<const unsigned char*>(ordinary.sampled_logprobs.data);
+    expect(egress != nullptr && logprobs >= egress &&
+               logprobs < egress + layout.ordinary->egress.bytes,
+           "ordinary logprobs live inside the decode egress region");
+    expect(ordinary.sampled_tokens.data != ordinary.sampled_logprobs.data,
+           "ordinary logprobs do not alias the sampled tokens");
+
+    // The logprob array covers the full domain, not only the live batch, so its region cannot be
+    // sized from a batch-dependent prefix.
+    expect(static_cast<std::size_t>(logprobs - egress) ==
+               offsetof(q36::OrdinaryDecodeEgress, sampled_logprobs) &&
+               sizeof(q36::OrdinaryDecodeEgress) ==
+                   offsetof(q36::OrdinaryDecodeEgress, sampled_logprobs) +
+                       sizeof(std::array<float, ninfer::kMaximumConcurrency>),
+           "ordinary egress POD carries the logprobs at their declared offset");
+
+    ::operator delete(memory, std::align_val_t{256});
 }
 
 void test_mtp_alignment() {
@@ -319,6 +377,7 @@ int main() {
     test_topology();
     test_decoder_layout();
     test_round_layout();
+    test_round_logprob_binding();
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
