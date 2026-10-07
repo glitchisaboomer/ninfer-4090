@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -273,10 +275,34 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan_spans = qwen3_6::detail::plan_relocations(
                 diff, sequence.text_kv_valid, plan->reuse_base, base.suffix_reuse_max_spans);
         } else {
+            qwen3_6::detail::TailRelocationTrace trace;
             const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
                 diff, sequence.text_kv_valid, plan->reuse_base,
                 static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans,
-                base.turn_rewrite_boundary);
+                base.turn_rewrite_boundary, &trace);
+            if (scr_diagnostics_enabled() && !tail.viable) {
+                // A refusal the planner made silently is the hardest kind to diagnose: the suite
+                // reports the path it took, never the reason it declined, and a run can relocate one
+                // request out of twelve for reasons that look identical to not having tried.
+                std::ostringstream declined;
+                declined << "[scr-diag] declined prompt_tokens=" << trace.prompt_tokens
+                         << " reuse_base=" << trace.prefix_reuse_tokens
+                         << " resident_kv=" << trace.resident_kv_tokens
+                         << " max_spans=" << trace.max_spans
+                         << " limit=" << trace.limit
+                         << " boundary=" << (trace.boundary_supplied ? "yes" : "no")
+                         << " spans_seen=" << trace.spans_seen
+                         << " candidates=" << trace.candidates.size();
+                if (trace.early_exit != nullptr) { declined << " early_exit=" << trace.early_exit; }
+                if (trace.declined != nullptr) { declined << " declined=" << trace.declined; }
+                for (const auto& reject : trace.rejected) {
+                    declined << " reject{" << reject.reason << " old=[" << reject.old_begin << ","
+                             << reject.old_end << ") new_begin=" << reject.new_begin
+                             << " tokens=" << reject.tokens << "}";
+                }
+                std::cerr << declined.str() << '\n';
+                std::cerr.flush();
+            }
             if (tail.viable) {
                 plan_head  = tail.head;
                 plan_tail  = tail.tail;

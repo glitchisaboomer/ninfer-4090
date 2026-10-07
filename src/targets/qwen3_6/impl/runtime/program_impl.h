@@ -36,15 +36,6 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Off unless NINFER_SCR_DIAG is set, so the relocation diagnostic costs nothing in production.
-bool scr_diagnostics_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_SCR_DIAG");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    return enabled;
-}
-
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(label);

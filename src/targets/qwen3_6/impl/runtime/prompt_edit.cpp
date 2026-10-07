@@ -96,9 +96,22 @@ std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
 TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_t resident_kv_tokens,
                                        std::uint32_t prefix_reuse_tokens,
                                        std::uint32_t prompt_tokens, std::uint32_t max_spans,
-                                       std::optional<std::uint32_t> turn_rewrite_boundary) {
+                                       std::optional<std::uint32_t> turn_rewrite_boundary,
+                                       TailRelocationTrace* trace) {
     TailRelocationPlan plan;
+    if (trace != nullptr) {
+        *trace = TailRelocationTrace{};
+        trace->prompt_tokens       = prompt_tokens;
+        trace->prefix_reuse_tokens = prefix_reuse_tokens;
+        trace->resident_kv_tokens  = resident_kv_tokens;
+        trace->max_spans           = max_spans;
+    }
     if (max_spans == 0 || prompt_tokens == 0 || prompt_tokens <= prefix_reuse_tokens) {
+        if (trace != nullptr) {
+            trace->early_exit = (max_spans == 0)       ? "max_spans == 0"
+                                : (prompt_tokens == 0) ? "empty prompt"
+                                                      : "prompt is not longer than the prefix frontier";
+        }
         return plan;
     }
 
@@ -109,28 +122,56 @@ TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_
     // token stays valid.
     std::uint32_t limit = prompt_tokens - 1;
     if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
+    if (trace != nullptr) {
+        trace->limit             = limit;
+        trace->boundary_supplied = turn_rewrite_boundary.has_value();
+        trace->spans_seen        = diff.spans.size();
+    }
 
     std::vector<RelocatedSpan> candidates;
     for (const SurvivingSpan& span : diff.spans) {
+        const TailRelocationReject observed{.old_begin = span.old_begin,
+                                            .old_end   = span.old_end(),
+                                            .new_begin = span.new_begin,
+                                            .tokens    = span.tokens};
+        const auto drop = [&](const char* reason) {
+            if (trace != nullptr) {
+                TailRelocationReject rejected = observed;
+                rejected.reason              = reason;
+                trace->rejected.push_back(rejected);
+            }
+        };
         // The leading span is ordinary prefix reuse, already expressed by the planner's reuse base.
-        if (span.old_begin == 0 && span.new_begin == 0) { continue; }
+        if (span.old_begin == 0 && span.new_begin == 0) { drop("leading span is prefix reuse"); continue; }
         // Relocation needs the resident KV entry to still exist.
-        if (span.old_end() > resident_kv_tokens) { continue; }
+        if (span.old_end() > resident_kv_tokens) {
+            drop("source beyond the resident KV");
+            continue;
+        }
         // A destination at or below the prefix-reuse frontier is already covered by prefix reuse.
-        if (span.new_begin < prefix_reuse_tokens) { continue; }
-        if (span.tokens == 0 || span.new_begin >= limit) { continue; }
+        if (span.new_begin < prefix_reuse_tokens) { drop("destination below the prefix frontier"); continue; }
+        if (span.tokens == 0) { drop("empty span"); continue; }
+        if (span.new_begin >= limit) {
+            drop("destination at or beyond the rewrite boundary");
+            continue;
+        }
         // The span is trimmed back to the last whole block ending before the limit. Trimming keeps
         // the span block aligned, and only one span can be affected because surviving spans are
         // disjoint, so it cannot break a run's adjacency.
         const std::uint32_t room   = limit - span.new_begin;
         const std::uint32_t fit    = (room / kPromptEditBlockTokens) * kPromptEditBlockTokens;
         const std::uint32_t tokens = std::min(span.tokens, fit);
-        if (tokens == 0) { continue; }
+        if (tokens == 0) { drop("no whole block fits before the rewrite boundary"); continue; }
+        if (tokens < span.tokens) { drop("trimmed to whole blocks before the rewrite boundary"); }
         candidates.push_back(RelocatedSpan{.source_begin = span.old_begin,
                                            .dest_begin   = span.new_begin,
                                            .tokens       = tokens});
     }
-    if (candidates.empty()) { return plan; }
+    if (trace != nullptr) { trace->candidates = candidates; }
+    if (candidates.empty()) {
+        if (trace != nullptr) { trace->declined = "no surviving span survived the limits"; }
+        return plan;
+    }
 
     std::sort(candidates.begin(), candidates.end(),
               [](const RelocatedSpan& a, const RelocatedSpan& b) {
@@ -174,7 +215,10 @@ TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_
         run_begin = run_end;
     }
 
-    if (best.empty()) { return plan; }
+    if (best.empty()) {
+        if (trace != nullptr) { trace->declined = "candidates existed but no run was selected"; }
+        return plan;
+    }
 
     plan.viable = true;
     plan.head   = PrefillRange{.begin = prefix_reuse_tokens, .end = best.front().dest_begin};

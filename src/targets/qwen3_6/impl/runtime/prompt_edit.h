@@ -1,5 +1,6 @@
 #pragma once
 
+
 // Host-side detection of token spans that survive a context edit.
 //
 // This is the Phase 1-2 half of Suffix Cache Reuse (SCR): it answers "which whole
@@ -16,9 +17,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <vector>
+
+// Relocation diagnostics are off unless NINFER_SCR_DIAG is set, so a refusal costs nothing in
+// production. Defined here rather than in the runtime because the planner needs it too: a relocation
+// that is declined is exactly as interesting as one that is applied, and until this existed only the
+// application was observable.
+inline bool scr_diagnostics_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SCR_DIAG");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 
 namespace ninfer::targets::qwen3_6::detail {
 
@@ -119,6 +133,38 @@ struct PrefillRange {
 // This is the shape the roadmap calls Scope A, and it is the widest plan the runtime can act on
 // without prefilling a disjoint set of many ranges: the relocated spans are contiguous, so exactly
 // two prefilled ranges remain.
+// Why a surviving span could not be relocated. Stable labels: they appear in the diagnostic and are
+// what a reader matches against to tell "the edit left nothing to reuse" from "the reuse was found
+// and then thrown away by a limit".
+struct TailRelocationReject {
+    const char* reason = "";
+    std::uint32_t old_begin = 0;
+    std::uint32_t old_end   = 0;
+    std::uint32_t new_begin = 0;
+    std::uint32_t tokens    = 0;
+};
+
+// What the planner decided, whether or not it relocated anything. Filled on every call so that a
+// decline is as inspectable as an application: the relocation diagnostic only prints when a relocation
+// is applied, which left every refusal invisible and made a suite that relocated one request out of
+// twelve indistinguishable from one that relocated nothing.
+struct TailRelocationTrace {
+    std::uint32_t prompt_tokens       = 0;
+    std::uint32_t prefix_reuse_tokens = 0;
+    std::uint32_t resident_kv_tokens  = 0;
+    std::uint32_t max_spans           = 0;
+    // The token no span may reach, and whether a turn-rewrite boundary supplied it. A boundary far
+    // below the prompt end is the usual reason a long prompt relocates only a fraction of itself.
+    std::uint32_t limit            = 0;
+    bool boundary_supplied        = false;
+    const char* early_exit        = nullptr;
+    std::size_t spans_seen         = 0;
+    std::vector<TailRelocationReject> rejected;
+    std::vector<RelocatedSpan> candidates;
+    // Set when candidates existed but none was selected.
+    const char* declined = nullptr;
+};
+
 struct TailRelocationPlan {
     // False when no contiguous surviving run is usable; the caller must then treat the prompt as an
     // ordinary prefix-reuse append.
@@ -172,7 +218,8 @@ struct TailRelocationPlan {
                                                       std::uint32_t prompt_tokens,
                                                       std::uint32_t max_spans,
                                                       std::optional<std::uint32_t> turn_rewrite_boundary =
-                                                          std::nullopt);
+                                                          std::nullopt,
+                                                      TailRelocationTrace* trace = nullptr);
 
 // Sentinel for a logical page with no resident physical page, so it has to come from the pool when a
 // remap is applied. The value matches PagedKVAllocation's acquire sentinel; the runtime static_asserts
