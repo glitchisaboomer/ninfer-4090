@@ -142,9 +142,18 @@ void check(const std::vector<std::vector<double>>& columns,
     double worst         = 0.0;
     std::int32_t worst_t = -1;
     for (std::size_t t = 0; t < state.host_out.size(); ++t) {
-        // Only the valid domain participates, so the oracle sees the same prefix the Op reduced.
-        std::vector<double> column(columns[t].begin(),
-                                   columns[t].begin() + static_cast<std::ptrdiff_t>(valid_rows));
+        // The oracle must reduce the values the Op actually reads, which are the BF16-rounded ones
+        // staged into the plane above -- not the FP64 values the test generated. The numerical
+        // contract is explicit that BF16 inputs are interpreted after their storage boundary, and the
+        // rounding is not a rounding error of the Op: it is the caller's storage decision, and it moves
+        // the answer by up to half a BF16 ulp of the chosen logit, which for a logit near 5 is ~0.01
+        // nats against a result of magnitude ~9. Measuring the rounding would bury the reduction's own
+        // error, which is what this file exists to bound.
+        std::vector<double> column;
+        column.reserve(static_cast<std::size_t>(valid_rows));
+        for (std::int32_t v = 0; v < valid_rows; ++v) {
+            column.push_back(to_double(to_bf16(columns[t][static_cast<std::size_t>(v)])));
+        }
         const double expected = oracle_logprob(column, picks[t]);
         const double error    =
             std::fabs(state.host_out[t] - expected) / std::max(1.0, std::fabs(expected));
