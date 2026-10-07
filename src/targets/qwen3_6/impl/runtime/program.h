@@ -183,6 +183,16 @@ struct SequenceState {
     std::uint32_t last_disk_snapshot_tokens = 0;
 };
 
+// Diagnostic only, and only populated when NINFER_SCR_DIAG is set. One probe per relocated
+// destination page, fingerprinted after the re-rotation and re-checked once the prefill that consumes
+// those pages has finished. The relocation diagnostic's before/after pair brackets only the
+// re-rotation, so without this nothing observes whether prefill then overwrote a page it was
+// supposed to leave alone.
+struct RelocatedPageProbe {
+    std::int32_t logical_page = -1;
+    float fingerprint         = -1.0F;
+};
+
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
@@ -212,6 +222,8 @@ struct RequestControl {
         // which is what every reuse path except suffix relocation has. Suffix relocation fills this
         // with the plan's two ranges, leaving the relocated run in between to be skipped.
         std::vector<PrefillRange> prefill_ranges;
+
+        std::vector<RelocatedPageProbe> relocated_page_probes;
 
         // End of the prefilled range containing `position`, or the prompt end when the caller only
         // has the default range.
@@ -487,6 +499,16 @@ private:
 
     [[nodiscard]] float scr_page_fingerprint(const PagedKVLayerView& layer,
                                              std::int32_t physical_page) const;
+
+    // The other half of the relocation diagnostic, run once the prefill that consumes the relocated
+    // pages has finished. log_scr_relocation brackets only the re-rotation, so it cannot see a
+    // relocated page that prefill later overwrites -- which is the one failure mode the integration
+    // test does not cover, because it exercises the Op and the kernels rather than the sequencing.
+    // Reports each relocated destination page's fingerprint alongside its post-rotation value, so a
+    // page that survived the prefill reads identical and a page that did not names the damage.
+    void log_scr_relocation_integrity(const qwen3_6::PagedKVCacheView& view,
+                                      std::span<const RelocatedPageProbe> probes) const;
+
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
 

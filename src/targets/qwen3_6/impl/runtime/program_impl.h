@@ -504,6 +504,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     std::vector<PrefillRange> suffix_prefill_ranges;
     // The page remap the applied relocation used, retained so the diagnostic below can report it.
     std::vector<std::int32_t> scr_remap;
+    // Carried on the Prefill state rather than a local, because the check that consumes it runs in
+    // advance_prefill, not in this function.
+    std::vector<RelocatedPageProbe> relocated_page_probes;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp && !request_plan.disable_speculation
             ? std::min({draft_window,
@@ -880,6 +883,33 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                              device.stream);
                 }
             }
+            if (scr_diagnostics_enabled()) {
+                // Fingerprint the relocated destination pages as the prefill will find them, so the
+                // post-prefill check can prove they survived it. Resolved through the published block
+                // table, the same way the prefill resolves them.
+                const PagedKVLayerView diag_layer =
+                    relocation_kv.layer_view(0);
+                const std::size_t diag_rows =
+                    static_cast<std::size_t>(diag_layer.block_table.numel());
+                std::vector<std::int32_t> diag_table(diag_rows);
+                if (diag_rows != 0) {
+                    CUDA_CHECK(cudaMemcpy(diag_table.data(), diag_layer.block_table.data,
+                                          diag_rows * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+                }
+                for (const RelocatedSpan& span : request_plan.relocated_spans) {
+                    for (std::uint32_t offset = 0; offset < span.tokens;
+                         offset += kPagedKVPageSize) {
+                        const std::int32_t dest_page = static_cast<std::int32_t>(
+                            (span.dest_begin + offset) / kPagedKVPageSize);
+                        const std::int32_t physical =
+                            dest_page >= 0 && static_cast<std::size_t>(dest_page) < diag_rows
+                                ? diag_table[static_cast<std::size_t>(dest_page)]
+                                : -1;
+                        relocated_page_probes.push_back(
+                            {dest_page, scr_page_fingerprint(diag_layer, physical)});
+                    }
+                }
+            }
             log_scr_relocation(request_plan, prompt_tokens, base, scr_remap, relocation_kv,
                                fingerprints_before);
         }
@@ -942,6 +972,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .reuse                            = applied_reuse,
             .mtp_bridge                       = request_plan.mtp_bridge,
             .prefill_ranges                   = std::move(suffix_prefill_ranges),
+            .relocated_page_probes            = std::move(relocated_page_probes),
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -1487,6 +1518,39 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
             out << (page == tail_first ? "" : ",") << table[page];
         }
     }
+    std::cerr << out.str() << '\n';
+    std::cerr.flush();
+}
+
+void ProgramImplCore::log_scr_relocation_integrity(
+    const qwen3_6::PagedKVCacheView& view,
+    std::span<const RelocatedPageProbe> probes) const {
+    if (!scr_diagnostics_enabled() || probes.empty()) { return; }
+
+    // Resolve each destination through the published block table rather than naming a physical page,
+    // so this reads whatever the prefill's own view reads.
+    const PagedKVLayerView layer = view.layer_view(0);
+    const std::size_t rows       = static_cast<std::size_t>(layer.block_table.numel());
+    std::vector<std::int32_t> table(rows);
+    if (rows != 0) {
+        CUDA_CHECK(cudaMemcpy(table.data(), layer.block_table.data, rows * sizeof(std::int32_t),
+                              cudaMemcpyDeviceToHost));
+    }
+
+    std::ostringstream out;
+    out << "[scr-diag] post-prefill integrity";
+    std::size_t intact = 0;
+    for (const auto& probe : probes) {
+        const std::size_t logical = static_cast<std::size_t>(probe.logical_page);
+        const std::int32_t physical = logical < rows ? table[logical] : -1;
+        const float after = scr_page_fingerprint(layer, physical);
+        const bool is_intact = probe.fingerprint >= 0.0F && after == probe.fingerprint;
+        if (is_intact) { ++intact; }
+        out << " dest_page{" << probe.logical_page << "->phys=" << physical
+            << " rotated=" << probe.fingerprint << " after_prefill=" << after
+            << (is_intact ? " intact" : " CHANGED") << "}";
+    }
+    out << " summary{" << intact << "/" << probes.size() << " intact}";
     std::cerr << out.str() << '\n';
     std::cerr.flush();
 }
@@ -2113,6 +2177,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+            if (scr_diagnostics_enabled() && !staged.relocated_page_probes.empty()) {
+                // The prefill has now consumed the relocated pages. Report whether they survived it.
+                // The integration test proves the Op agrees with the production write and read paths,
+                // so a relocated page that changes here was overwritten by the sequencing rather
+                // than mis-rotated, and this is the only observation that can tell those apart.
+                log_scr_relocation_integrity(text_kv_view(sequence), staged.relocated_page_probes);
+            }
         } else {
             mark_workspace_usage(workspace_plan.ordinary_round);
             if (!sequence.tail_hidden_valid) {
