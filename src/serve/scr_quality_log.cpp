@@ -183,4 +183,23 @@ std::string format_scr_quality_report(
     return targets::qwen3_6::detail::format_scr_quality_json(report, thresholds);
 }
 
+std::vector<std::string> build_scr_quality_server_arguments(
+    const std::string& artifact, int port, std::uint32_t max_context, const std::string& log_path,
+    bool scr, std::span<const std::string> extra) {
+    // ninfer-serve reads the artifact from argv[1] and starts option parsing at argv[2], so the
+    // artifact is positional. Passing --model instead leaves argv[1] unset, which the server reports
+    // as an unknown argument only after it has printed its whole usage text.
+    std::vector<std::string> args{artifact,
+                                  "--port", std::to_string(port),
+                                  "--max-context", std::to_string(max_context),
+                                  // One active slot, so a request's result cannot interleave with
+                                  // another's and the log stays in the order the prompts were sent.
+                                  "--max-concurrency", "1",
+                                  "--request-log-jsonl", log_path};
+    args.push_back(scr ? "--scr" : "--no-scr");
+    if (scr) { args.insert(args.end(), {"--scr-mode", "tail"}); }
+    args.insert(args.end(), extra.begin(), extra.end());
+    return args;
+}
+
 } // namespace ninfer::serve

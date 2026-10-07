@@ -5,6 +5,7 @@
 // known -- the arithmetic itself is the target's own, tested separately.
 
 #include "serve/scr_quality_log.h"
+#include "serve/serve_options.h"
 #include "targets/qwen3_6/impl/runtime/scr_quality.h"
 
 #include <cmath>
@@ -206,6 +207,81 @@ void test_report_scores_and_fails_honestly() {
            "an empty pair produces no report");
 }
 
+
+// The argv a measurement phase hands to ninfer-serve, checked against the server's own parser rather
+// than against a reading of its usage text. The two disagree in exactly one way that matters:
+// ninfer-serve takes the artifact as its first positional argument, so an invocation that passes
+// --model leaves argv[1] unset and the server exits at argument-parse time. Spawned from a harness
+// that failure surfaces as a health-check timeout minutes later, having loaded nothing, and the
+// process output is the only evidence. Feeding the argv to parse_serve_options makes it a unit test.
+void test_server_arguments_are_a_valid_invocation() {
+    const std::string artifact = "models/qwen3_8_27b.ninfer";
+    const std::vector<std::string> extra{"--kv-dtype", "bf16"};
+
+    // The real parser, not a reading of the usage text. The two disagree in exactly one way that
+    // matters: ninfer-serve reads the artifact from argv[1] and starts options at argv[2], so an
+    // invocation passing --model leaves argv[1] unset and the server exits at argument-parse time.
+    // Spawned from a harness, that failure surfaces as a health-check timeout minutes later with
+    // nothing loaded and the server's usage text as the only evidence.
+    const auto parse = [&artifact](const std::vector<std::string>& tail) {
+        std::vector<std::string> argv{"ninfer-serve"};
+        argv.insert(argv.end(), tail.begin(), tail.end());
+        std::vector<char*> raw;
+        raw.reserve(argv.size() + 1);
+        for (std::string& argument : argv) { raw.push_back(argument.data()); }
+        raw.push_back(nullptr);
+        return ninfer::serve::parse_serve_options(static_cast<int>(raw.size()) - 1, raw.data());
+    };
+
+    for (const bool scr : {true, false}) {
+        const std::string what = scr ? "scr" : "baseline";
+        const std::vector<std::string> tail = ninfer::serve::build_scr_quality_server_arguments(
+            artifact, 18080, 8192, "run/scr.jsonl", scr, extra);
+
+        ninfer::serve::ServeOptions options;
+        try {
+            options = parse(tail);
+        } catch (const std::exception& error) {
+            expect(false, "the " + what + " phase argv is not a valid ninfer-serve invocation: " +
+                 std::string(error.what()));
+            continue;
+        }
+
+        expect(!tail.empty() && tail.front() == artifact,
+               what + ": the artifact must be the first argument");
+        expect(options.artifact_path == artifact,
+               what + ": artifact_path is \"" + options.artifact_path + "\" rather than \"" +
+                   artifact + "\"");
+        expect(options.port == 18080, what + ": port did not survive the round trip");
+        expect(options.max_context == 8192u, what + ": max_context did not survive the round trip");
+        expect(options.request_log_jsonl == "run/scr.jsonl",
+               what + ": the request log path did not survive the round trip");
+        expect(options.max_concurrency == 1u,
+               what + ": a phase must run one slot at a time or the log order is not send order");
+
+        // The flags that make each phase mean what it claims, asserted as parsed state rather than
+        // by scanning the argument list: the parser is the contract, and re-reading argv here would
+        // only test this file against itself.
+        expect(options.enable_suffix_cache_reuse == scr,
+               what + ": enable_suffix_cache_reuse does not match the phase");
+        expect(!options.scr_plan_segmented, what + ": the phase must plan a tail relocation");
+    }
+
+    // The baseline has to be a full prefill. With prefix reuse left on, the two phases share a cache
+    // and would agree for reasons that have nothing to do with relocation -- which reads as a pass.
+    const std::vector<std::string> with_baseline_flags{"--no-prefix-reuse"};
+    const ninfer::serve::ServeOptions baseline = parse(
+        ninfer::serve::build_scr_quality_server_arguments(artifact, 18081, 8192,
+                                                          "run/baseline.jsonl", false,
+                                                          with_baseline_flags));
+    expect(!baseline.allow_prefix_reuse,
+           "baseline: prefix reuse is still enabled, so the phases would agree for reasons "
+           "unrelated to relocation");
+    expect(!baseline.enable_suffix_cache_reuse, "baseline: Suffix Cache Reuse is still enabled");
+    expect(baseline.port == 18081, "baseline: the second phase must not reuse the first phase's "
+                                   "port");
+}
+
 } // namespace
 
 int main() {
@@ -214,6 +290,7 @@ int main() {
     test_malformed_records_are_refused();
     test_pairing_requires_comparable_runs();
     test_report_scores_and_fails_honestly();
+    test_server_arguments_are_a_valid_invocation();
     if (failures != 0) {
         std::cerr << failures << " SCR quality log checks failed\n";
         return 1;

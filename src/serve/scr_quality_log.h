@@ -8,6 +8,12 @@
 // It reads the schema that src/serve/request_log.cpp writes and nothing else, so the wire protocols
 // stay unchanged and no second copy of the roadmap's thresholds exists: the arithmetic stays in
 // qwen3_6::detail::evaluate_scr_quality.
+//
+// It also owns how a measurement run asks ninfer-serve to produce that log, because the argument
+// contract between the two is otherwise only checked by spawning a server and waiting for it to
+// start: ninfer-serve takes the artifact as its first *positional* argument, so an invocation that
+// passes --model is rejected before anything is loaded, and the harness fails at health-check time
+// with a 900-second timeout instead of at argument-parse time.
 
 #include "ninfer/types.h"
 #include "targets/qwen3_6/impl/runtime/scr_quality.h"
@@ -51,5 +57,16 @@ pair_scr_quality_samples(std::span<const LoggedCompletion> scr,
 [[nodiscard]] std::string format_scr_quality_report(
     std::span<const LoggedCompletion> scr, std::span<const LoggedCompletion> baseline,
     const targets::qwen3_6::detail::ScrQualityThresholds& thresholds);
+
+// Builds the argv for one measurement phase, excluding argv[0].
+//
+// The baseline phase disables prefix reuse as well as Suffix Cache Reuse, because the roadmap scores
+// against the full-prefill path and two servers whose prefix caches differ would otherwise agree for
+// reasons that have nothing to do with relocation. `extra` is appended verbatim so a caller can add
+// flags without this function having to know about them; it is appended last so it cannot displace
+// the flags that make the run mean what it claims.
+[[nodiscard]] std::vector<std::string> build_scr_quality_server_arguments(
+    const std::string& artifact, int port, std::uint32_t max_context, const std::string& log_path,
+    bool scr, std::span<const std::string> extra = {});
 
 } // namespace ninfer::serve

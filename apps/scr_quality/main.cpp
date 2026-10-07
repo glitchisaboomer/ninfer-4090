@@ -434,19 +434,16 @@ std::string read_file(const std::string& path) {
 void run_phase(const Options& options, const std::vector<SuitePrompt>& prompts, bool scr, int port,
                const std::string& log_path) {
     std::remove(log_path.c_str());
-    std::vector<std::string> args{"--model", options.model,
-                                  "--port", std::to_string(port),
-                                  "--max-context", std::to_string(options.max_context),
-                                  "--max-concurrency", "1",
-                                  "--request-log-jsonl", log_path};
-    args.push_back(scr ? "--scr" : "--no-scr");
-    if (scr) { args.insert(args.end(), {"--scr-mode", "tail"}); }
-    for (const std::string& extra : split_whitespace(options.server_args)) { args.push_back(extra); }
-    if (!scr) {
-        for (const std::string& extra : split_whitespace(options.baseline_server_args)) {
-            args.push_back(extra);
+    const std::vector<std::string> extra = [&] {
+        std::vector<std::string> args = split_whitespace(options.server_args);
+        if (!scr) {
+            const std::vector<std::string> baseline = split_whitespace(options.baseline_server_args);
+            args.insert(args.end(), baseline.begin(), baseline.end());
         }
-    }
+        return args;
+    }();
+    const std::vector<std::string> args = ninfer::serve::build_scr_quality_server_arguments(
+        options.model, port, static_cast<std::uint32_t>(options.max_context), log_path, scr, extra);
 
     ServerProcess server(options.exe, args);
     server.start();
