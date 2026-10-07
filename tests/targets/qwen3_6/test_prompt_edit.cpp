@@ -1,0 +1,307 @@
+// Phase 1-2 SCR checks: surviving-span detection over an edited prompt.
+//
+// The detector is host-only and dependency-free, so this file also builds with a plain
+// host compiler:
+//   g++ -std=c++20 -I src -I include
+//       src/targets/qwen3_6/impl/runtime/prompt_edit.cpp
+//       tests/targets/qwen3_6/test_prompt_edit.cpp -o /tmp/test_prompt_edit
+
+#include "targets/qwen3_6/impl/runtime/prompt_edit.h"
+
+#include <cstdint>
+#include <exception>
+#include <iostream>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+using ninfer::TokenId;
+using ninfer::targets::qwen3_6::detail::diff_prompt_edit;
+using ninfer::targets::qwen3_6::detail::kPromptEditBlockTokens;
+using ninfer::targets::qwen3_6::detail::PromptEditDiff;
+using ninfer::targets::qwen3_6::detail::SurvivingSpan;
+
+using Tokens = std::vector<TokenId>;
+
+int failures = 0;
+
+void expect(bool condition, std::string_view message) {
+    if (condition) { return; }
+    ++failures;
+    std::cerr << "FAIL: " << message << '\n';
+}
+
+template <class Callable>
+void expect_throws_std_invalid_argument(Callable&& callable, std::string_view message) {
+    try {
+        callable();
+    } catch (const std::invalid_argument&) {
+        return;
+    } catch (const std::exception&) {
+        expect(false, message);
+        return;
+    }
+    expect(false, message);
+}
+
+// One block whose tokens are `value * 1000 + block_index`, so a segment is identified by
+// its label and its blocks stay distinct from each other.
+Tokens segment(std::int32_t label, std::uint32_t blocks) {
+    Tokens out;
+    out.reserve(static_cast<std::size_t>(blocks) * kPromptEditBlockTokens);
+    for (std::uint32_t block = 0; block < blocks; ++block) {
+        for (std::uint32_t i = 0; i < kPromptEditBlockTokens; ++i) {
+            out.push_back(label * 1000 + static_cast<std::int32_t>(block));
+        }
+    }
+    return out;
+}
+
+// `blocks` identical blocks, so the same block value appears more than once.
+Tokens repeated(std::int32_t value, std::uint32_t blocks) {
+    Tokens out;
+    out.reserve(static_cast<std::size_t>(blocks) * kPromptEditBlockTokens);
+    for (std::uint32_t block = 0; block < blocks; ++block) {
+        for (std::uint32_t i = 0; i < kPromptEditBlockTokens; ++i) { out.push_back(value); }
+    }
+    return out;
+}
+
+void append(Tokens& out, const Tokens& part) {
+    out.insert(out.end(), part.begin(), part.end());
+}
+
+std::uint32_t block_tokens(std::uint32_t blocks) {
+    return blocks * kPromptEditBlockTokens;
+}
+
+bool spans_equal(const std::vector<SurvivingSpan>& left, const std::vector<SurvivingSpan>& right) {
+    if (left.size() != right.size()) { return false; }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (left[i].old_begin != right[i].old_begin || left[i].new_begin != right[i].new_begin ||
+            left[i].tokens != right[i].tokens) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Spans must be ordered and disjoint in both prompts. Every reuse path depends on this.
+void expect_disjoint(const PromptEditDiff& diff, std::string_view message) {
+    for (std::size_t i = 0; i < diff.spans.size(); ++i) {
+        const SurvivingSpan& span = diff.spans[i];
+        if (span.tokens == 0 || span.tokens % kPromptEditBlockTokens != 0) {
+            expect(false, message);
+            return;
+        }
+        if (i == 0) { continue; }
+        const SurvivingSpan& previous = diff.spans[i - 1];
+        if (span.old_begin < previous.old_end() || span.new_begin < previous.new_end()) {
+            expect(false, message);
+            return;
+        }
+    }
+}
+
+void test_identical_prompts() {
+    const Tokens prompt = segment(1, 3);
+    const PromptEditDiff diff = diff_prompt_edit(prompt, prompt);
+
+    expect(diff.spans.size() == 1, "identical prompts produce one span");
+    expect(diff.reusable_tokens == block_tokens(3), "identical prompts reuse every whole block");
+    expect(diff.leading_prefix_tokens() == block_tokens(3), "identical prompts are all prefix");
+    expect(diff.relocated_tokens() == 0, "identical prompts relocate nothing");
+    expect_disjoint(diff, "identical prompt spans are disjoint");
+}
+
+void test_reasoning_stripping() {
+    // Scope A shape: [P R S] -> [P S]. The stripped run is `R`; `S` survives and moves.
+    Tokens previous;
+    append(previous, segment(1, 2)); // prefix
+    append(previous, segment(2, 2)); // stripped reasoning
+    append(previous, segment(3, 2)); // preserved suffix
+
+    Tokens current;
+    append(current, segment(1, 2));
+    append(current, segment(3, 2));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+
+    const std::vector<SurvivingSpan> expected{
+        SurvivingSpan{.old_begin = 0, .new_begin = 0, .tokens = block_tokens(2)},
+        SurvivingSpan{.old_begin = block_tokens(4), .new_begin = block_tokens(2),
+                      .tokens = block_tokens(2)},
+    };
+    expect(spans_equal(diff.spans, expected), "reasoning stripping yields prefix plus relocated suffix");
+    expect(diff.reusable_tokens == block_tokens(4), "reasoning stripping reuses prefix and suffix");
+    expect(diff.leading_prefix_tokens() == block_tokens(2), "reasoning stripping prefix length");
+    expect(diff.relocated_tokens() == block_tokens(2), "reasoning stripping relocates the suffix");
+    expect_disjoint(diff, "reasoning stripping spans are disjoint");
+}
+
+void test_in_place_replacement() {
+    // Paper example: [A B C] -> [A B' C]. Only A and C survive.
+    Tokens previous;
+    append(previous, segment(1, 2));
+    append(previous, segment(2, 1));
+    append(previous, segment(3, 2));
+
+    Tokens current;
+    append(current, segment(1, 2));
+    append(current, segment(9, 1));
+    append(current, segment(3, 2));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+
+    const std::vector<SurvivingSpan> expected{
+        SurvivingSpan{.old_begin = 0, .new_begin = 0, .tokens = block_tokens(2)},
+        SurvivingSpan{.old_begin = block_tokens(3), .new_begin = block_tokens(3),
+                      .tokens = block_tokens(2)},
+    };
+    expect(spans_equal(diff.spans, expected), "in-place replacement keeps the surviving suffix at its old offset");
+    expect(diff.reusable_tokens == block_tokens(4), "in-place replacement reuses both surviving regions");
+    expect(diff.relocated_tokens() == block_tokens(2), "in-place replacement relocates the suffix");
+}
+
+void test_multiple_surviving_spans() {
+    // Appendix B: one edit can leave several surviving spans after the edit point.
+    Tokens previous;
+    append(previous, segment(1, 1));
+    append(previous, segment(2, 1));
+    append(previous, segment(3, 1));
+    append(previous, segment(4, 1));
+    append(previous, segment(5, 1));
+
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(8, 1));
+    append(current, segment(3, 1));
+    append(current, segment(9, 1));
+    append(current, segment(5, 1));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+
+    const std::vector<SurvivingSpan> expected{
+        SurvivingSpan{.old_begin = 0, .new_begin = 0, .tokens = block_tokens(1)},
+        SurvivingSpan{.old_begin = block_tokens(2), .new_begin = block_tokens(2),
+                      .tokens = block_tokens(1)},
+        SurvivingSpan{.old_begin = block_tokens(4), .new_begin = block_tokens(4),
+                      .tokens = block_tokens(1)},
+    };
+    expect(spans_equal(diff.spans, expected), "three surviving spans are detected");
+    expect(diff.reusable_tokens == block_tokens(3), "three surviving spans reuse three blocks");
+    expect(diff.relocated_tokens() == block_tokens(2), "first span is the prefix, the rest are relocated");
+    expect_disjoint(diff, "multiple spans are disjoint");
+}
+
+void test_block_split_forfeits_partial_block() {
+    // A one-token insertion inside the second block misaligns the rest of that block. The
+    // partial block is forfeited, which is the accepted cost of block-granular matching.
+    Tokens previous = segment(1, 2);
+    Tokens current  = segment(1, 2);
+    current.insert(current.begin() + static_cast<std::ptrdiff_t>(kPromptEditBlockTokens + 3), 777);
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+
+    expect(diff.spans.size() == 1, "block split leaves one aligned span");
+    expect(diff.reusable_tokens == block_tokens(1), "block split forfeits the partial block");
+    expect(diff.reusable_tokens % kPromptEditBlockTokens == 0, "reuse is block aligned");
+    expect_disjoint(diff, "block split spans are disjoint");
+}
+
+void test_partial_tail_is_never_reused() {
+    Tokens previous = segment(1, 1);
+    Tokens current  = segment(1, 1);
+    for (std::int32_t i = 0; i < 5; ++i) {
+        previous.push_back(40 + i);
+        current.push_back(40 + i);
+    }
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+
+    expect(diff.reusable_tokens == block_tokens(1), "trailing partial block is not reused");
+    expect(diff.spans.size() == 1, "trailing partial block does not add a span");
+}
+
+void test_repeated_blocks_stay_monotone() {
+    // Duplicate block values exercise the monotone walk: a block must never be reused
+    // twice, and the shortened current prompt must not claim a third block.
+    const Tokens previous = repeated(7, 3);
+    const Tokens current  = repeated(7, 2);
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+
+    expect(diff.spans.size() == 1, "repeated blocks collapse into one span");
+    expect(diff.spans.front().old_begin == 0, "repeated blocks start at zero");
+    expect(diff.spans.front().tokens == block_tokens(2), "repeated blocks stop at the shorter prompt");
+    expect(diff.reusable_tokens == block_tokens(2), "repeated blocks never reuse a block twice");
+    expect_disjoint(diff, "repeated block spans are disjoint");
+
+    // The current prompt repeats the block more often than the previous prompt holds it.
+    // The single old block may feed exactly one new position; the surplus must be treated
+    // as new content instead of re-pointing at an already-used block.
+    const Tokens narrow = repeated(7, 1);
+    const Tokens wider  = repeated(7, 3);
+
+    const PromptEditDiff grown = diff_prompt_edit(narrow, wider);
+
+    expect(grown.spans.size() == 1, "a repeated block is reclaimed at most once");
+    expect(grown.reusable_tokens == block_tokens(1), "surplus repeated blocks are not rewritten as reuse");
+    if (!grown.spans.empty()) {
+        expect(grown.spans.front().old_begin == 0 && grown.spans.front().new_begin == 0,
+               "the reclaimed repeated block maps to the first new position");
+    }
+    expect_disjoint(grown, "grown repeated block spans are disjoint");
+}
+
+void test_empty_and_degenerate_inputs() {
+    const Tokens prompt = segment(1, 2);
+
+    expect(diff_prompt_edit({}, {}).spans.empty(), "empty prompts have no spans");
+    expect(diff_prompt_edit(prompt, {}).spans.empty(), "empty current prompt has no spans");
+    expect(diff_prompt_edit({}, prompt).spans.empty(), "empty previous prompt has no spans");
+
+    const Tokens shorter_than_one_block{kPromptEditBlockTokens - 1, 1};
+    expect(diff_prompt_edit(shorter_than_one_block, shorter_than_one_block).spans.empty(),
+           "prompts shorter than one block have no spans");
+
+    expect_throws_std_invalid_argument(
+        [&] { (void)diff_prompt_edit(prompt, prompt, 0); },
+        "zero block size must be rejected");
+}
+
+void test_determinism() {
+    Tokens previous;
+    append(previous, segment(1, 2));
+    append(previous, segment(2, 3));
+    Tokens current;
+    append(current, segment(1, 2));
+    append(current, segment(2, 1));
+
+    const PromptEditDiff first  = diff_prompt_edit(previous, current);
+    const PromptEditDiff second = diff_prompt_edit(previous, current);
+
+    expect(spans_equal(first.spans, second.spans), "detection is deterministic");
+    expect(first.reusable_tokens == second.reusable_tokens, "reusable token count is deterministic");
+}
+
+} // namespace
+
+int main() {
+    test_identical_prompts();
+    test_reasoning_stripping();
+    test_in_place_replacement();
+    test_multiple_surviving_spans();
+    test_block_split_forfeits_partial_block();
+    test_partial_tail_is_never_reused();
+    test_repeated_blocks_stay_monotone();
+    test_empty_and_degenerate_inputs();
+    test_determinism();
+    if (failures != 0) {
+        std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";
+        return 1;
+    }
+    std::cout << "Qwen3.6 prompt edit checks passed\n";
+    return 0;
+}
