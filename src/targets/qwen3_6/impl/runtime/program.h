@@ -504,15 +504,21 @@ private:
     void log_scr_relocation(const RequestPlanImpl& request_plan, std::uint32_t prompt_tokens,
                             std::uint32_t base, std::span<const std::int32_t> remap,
                             const qwen3_6::PagedKVCacheView& view,
-                            std::span<const float> fingerprints_before) const;
+                            std::span<const float> fingerprints_before, cudaStream_t stream) const;
 
+    // `stream` is required and must be the stream the Kernels were launched on. A blocking
+    // cudaMemcpy on the legacy default stream does not drain a non-blocking stream, so reading
+    // without it returns whatever was resident before the launches -- which is how this diagnostic
+    // reported a re-rotation as never having happened.
     [[nodiscard]] float scr_page_fingerprint(const PagedKVLayerView& layer,
-                                             std::int32_t physical_page) const;
+                                             std::int32_t physical_page,
+                                             cudaStream_t stream) const;
 
     // sum|x| per (kv_head, page_offset) row of one physical page. Strictly finer than
     // scr_page_fingerprint, which collapses the whole page to one number.
     [[nodiscard]] std::vector<float> scr_page_row_fingerprints(const PagedKVLayerView& layer,
-                                                              std::int32_t physical_page) const;
+                                                              std::int32_t physical_page,
+                                                              cudaStream_t stream) const;
 
     // The other half of the relocation diagnostic, run once the prefill that consumes the relocated
     // pages has finished. log_scr_relocation brackets only the re-rotation, so it cannot see a
@@ -521,7 +527,8 @@ private:
     // Reports each relocated destination page's fingerprint alongside its post-rotation value, so a
     // page that survived the prefill reads identical and a page that did not names the damage.
     void log_scr_relocation_integrity(const qwen3_6::PagedKVCacheView& view,
-                                      std::span<const RelocatedPageProbe> probes) const;
+                                      std::span<const RelocatedPageProbe> probes,
+                                      cudaStream_t stream) const;
 
     // One line per prefill chunk the relocation branch drives, so the trace shows the ranges, the
     // cursor skip across the relocated run, and the key extent each chunk makes visible to attention.
@@ -529,7 +536,7 @@ private:
     // is the only place that states how far the visible extent reached.
     void log_scr_prefill_chunk(std::uint32_t base, std::uint32_t cursor, std::uint32_t nominal,
                                std::uint32_t range_end, std::uint32_t resumed,
-                               const qwen3_6::PagedKVCacheView& view) const;
+                               const qwen3_6::PagedKVCacheView& view, cudaStream_t stream) const;
 
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
