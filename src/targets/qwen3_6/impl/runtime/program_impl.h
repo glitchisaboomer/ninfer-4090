@@ -36,6 +36,15 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// Off unless NINFER_SCR_DIAG is set, so the relocation diagnostic costs nothing in production.
+bool scr_diagnostics_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SCR_DIAG");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(label);
@@ -847,6 +856,18 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             // above published the remapped block-table row, because the Op resolves a page through
             // the block table at the new position.
             const qwen3_6::PagedKVCacheView relocation_kv = text_kv_view(sequence);
+            std::vector<float> fingerprints_before;
+            if (scr_diagnostics_enabled()) {
+                const PagedKVLayerView diag_layer = relocation_kv.layer_view(0);
+                for (const RelocatedSpan& span : request_plan.relocated_spans) {
+                    for (std::uint32_t offset = 0; offset < span.tokens; offset += kPagedKVPageSize) {
+                        fingerprints_before.push_back(scr_page_fingerprint(
+                            diag_layer,
+                            static_cast<std::int32_t>((span.source_begin + offset) /
+                                                      kPagedKVPageSize)));
+                    }
+                }
+            }
             for (const RelocatedSpan& span : request_plan.relocated_spans) {
                 const auto delta = static_cast<std::int32_t>(
                     static_cast<std::int64_t>(span.dest_begin) -
@@ -859,7 +880,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                              device.stream);
                 }
             }
-            log_scr_relocation(request_plan, prompt_tokens, base, scr_remap, relocation_kv);
+            log_scr_relocation(request_plan, prompt_tokens, base, scr_remap, relocation_kv,
+                               fingerprints_before);
         }
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
@@ -1341,24 +1363,28 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
     return decoder->text_kv.execution_view(sequence.kv->text);
 }
 
-// Suffix-relocation diagnostics. Off unless NINFER_SCR_DIAG is set, so it costs nothing in
+// Suffix-relocation diagnostics. Off unless scr_diagnostics_enabled(), so it costs nothing in
 // production. Writes to stderr, which the e2e script folds into the server log.
-//
-// The relocated path has produced wildly wrong output (the model emitting a stop token as its first
-// token) while every component tests clean in isolation, so this reports what the runtime actually
-// did rather than what an external observer infers from the reuse path and token counts.
-bool scr_diagnostics_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_SCR_DIAG");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    return enabled;
+float ProgramImplCore::scr_page_fingerprint(const PagedKVLayerView& layer,
+                                            std::int32_t physical_page) const {
+    const std::int64_t elements =
+        static_cast<std::int64_t>(kPagedKVPageSize) * layer.k_pages.ne[0] * layer.k_pages.ne[2];
+    if (physical_page < 0 || physical_page >= layer.k_pages.ne[3]) { return -1.0F; }
+    std::vector<float> host(static_cast<std::size_t>(elements));
+    CUDA_CHECK(cudaMemcpy(host.data(), static_cast<const char*>(layer.k_pages.data) +
+                                             static_cast<std::int64_t>(physical_page) * elements * 4,
+                          host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    float total = 0.0F;
+    for (const float value : host) { total += std::fabs(value); }
+    return total + 1000.0F * (host.front() + host.back());
 }
+
 
 void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
                                          std::uint32_t prompt_tokens, std::uint32_t base,
                                          std::span<const std::int32_t> remap,
-                                         const qwen3_6::PagedKVCacheView& view) const {
+                                         const qwen3_6::PagedKVCacheView& view,
+                                         std::span<const float> fingerprints_before) const {
     if (!scr_diagnostics_enabled()) { return; }
 
     std::ostringstream out;
@@ -1369,7 +1395,10 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
             << " tok=" << span.tokens << " delta="
             << (static_cast<std::int64_t>(span.dest_begin) -
                 static_cast<std::int64_t>(span.source_begin))
-            << "}";
+            << " src_pages=" << span.source_begin / kPagedKVPageSize << ".."
+            << (span.source_end() - 1) / kPagedKVPageSize << " dst_pages="
+            << span.dest_begin / kPagedKVPageSize << ".."
+            << (span.dest_end() - 1) / kPagedKVPageSize << "}";
     }
     out << " head{" << request_plan.relocated_head.begin << "," << request_plan.relocated_head.end
         << "} tail{" << request_plan.relocated_tail.begin << "," << request_plan.relocated_tail.end
@@ -1378,11 +1407,28 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
     for (std::size_t i = 0; i < remap.size(); ++i) { out << (i ? "," : "") << remap[i]; }
     out << "]";
 
+    const PagedKVLayerView layer = view.layer_view(0);
+
+    // The relocated pages, fingerprinted before and after the re-rotation.
+    std::size_t fp_index = 0;
+    for (const RelocatedSpan& span : request_plan.relocated_spans) {
+        for (std::uint32_t offset = 0; offset < span.tokens; offset += kPagedKVPageSize) {
+            const std::int32_t source_page =
+                static_cast<std::int32_t>((span.source_begin + offset) / kPagedKVPageSize);
+            const std::int32_t dest_page =
+                static_cast<std::int32_t>((span.dest_begin + offset) / kPagedKVPageSize);
+            const float before =
+                fp_index < fingerprints_before.size() ? fingerprints_before[fp_index] : -1.0F;
+            out << " page{src=" << source_page << " dst=" << dest_page << " before=" << before
+                << " after=" << scr_page_fingerprint(layer, source_page) << "}";
+            ++fp_index;
+        }
+    }
+
     // Read back the first full-attention K plane and report its finiteness and range. A relocated
     // page holding uninitialised memory, or a re-rotation that produced non-finite values, would
     // show up here rather than as an unexplained downstream symptom.
-    const PagedKVLayerView layer = view.layer_view(0);
-    const std::size_t elements  = static_cast<std::size_t>(layer.k_pages.numel());
+    const std::size_t elements = static_cast<std::size_t>(layer.k_pages.numel());
     std::vector<float> host(elements);
     CUDA_CHECK(cudaMemcpy(host.data(), layer.k_pages.data, host.size() * sizeof(float),
                           cudaMemcpyDeviceToHost));
@@ -1403,15 +1449,28 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
     if (non_finite != 0) { out << " first_bad_index=" << first_bad; }
     out << " range=[" << lo << "," << hi << "]}";
 
-    // The block-table row attention resolves destinations through, read back from the device.
+    // The device block-table row, reported around the relocated destinations rather than from the
+    // front, since those entries decide whether attention finds the relocated K at all.
     const std::size_t rows = static_cast<std::size_t>(layer.block_table.numel());
     if (rows != 0) {
         std::vector<std::int32_t> table(rows);
         CUDA_CHECK(cudaMemcpy(table.data(), layer.block_table.data, rows * sizeof(std::int32_t),
                               cudaMemcpyDeviceToHost));
-        out << " row[";
-        for (std::size_t i = 0; i < rows && i < 32; ++i) { out << (i ? "," : "") << table[i]; }
-        out << (rows > 32 ? ",..." : "") << "]";
+        out << " row_len=" << rows << " row[0..3]=" << table[0] << "," << table[1] << "," << table[2]
+            << "," << table[3];
+        for (const RelocatedSpan& span : request_plan.relocated_spans) {
+            const std::size_t first = span.dest_begin / kPagedKVPageSize;
+            const std::size_t last  = (span.dest_end() - 1) / kPagedKVPageSize;
+            out << " dst_row[" << first << ".." << last << "]=";
+            for (std::size_t page = first; page <= last && page < rows; ++page) {
+                out << (page == first ? "" : ",") << table[page];
+            }
+        }
+        const std::size_t tail_first = request_plan.relocated_tail.begin / kPagedKVPageSize;
+        out << " tail_row[" << tail_first << "]=";
+        for (std::size_t page = tail_first; page < rows && page < tail_first + 4; ++page) {
+            out << (page == tail_first ? "" : ",") << table[page];
+        }
     }
     std::cerr << out.str() << '\n';
     std::cerr.flush();

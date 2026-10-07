@@ -477,11 +477,16 @@ private:
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
 
     // Suffix-relocation diagnostic. No-op unless NINFER_SCR_DIAG is set. Reports the applied plan,
-    // the page remap, and whether the relocated K plane is finite, since the relocation path has
-    // produced badly wrong output while every component tests clean in isolation.
+    // the page remap, per-page fingerprints taken before and after the re-rotation, and whether the
+    // relocated K plane is finite, since the relocation path has produced badly wrong output while
+    // every component tests clean in isolation.
     void log_scr_relocation(const RequestPlanImpl& request_plan, std::uint32_t prompt_tokens,
                             std::uint32_t base, std::span<const std::int32_t> remap,
-                            const qwen3_6::PagedKVCacheView& view) const;
+                            const qwen3_6::PagedKVCacheView& view,
+                            std::span<const float> fingerprints_before) const;
+
+    [[nodiscard]] float scr_page_fingerprint(const PagedKVLayerView& layer,
+                                             std::int32_t physical_page) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
 
