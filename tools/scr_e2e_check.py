@@ -223,10 +223,16 @@ def middle_text(units):
     return " " + _join(MIDDLE_FILLER, 1) + " " + _join(MIDDLE_FILLER[1:], 3 + units)
 
 
+# How many times the tail block is repeated. This is the length of the relocated run, so it is the
+# knob for bisecting a mechanical fault (fails at any size) from an approximation that only degrades
+# once the relocated run is a large fraction of the prompt. The script reports the token count.
+TAIL_REPEATS = 3
+
+
 def tail_text():
     if FACT_PLACEMENT == "prefix":
-        return " " + _join(TAIL_SENTENCES[2:], 3)
-    return " " + _join(TAIL_SENTENCES, 3)
+        return " " + _join(TAIL_SENTENCES[2:], TAIL_REPEATS)
+    return " " + _join(TAIL_SENTENCES, TAIL_REPEATS)
 
 
 def request_prompt(variant, prefix_units=0, middle_units=0):
@@ -271,8 +277,15 @@ def solve_alignment(port, max_tokens, timeout, think):
 
     tokens_b = count_tokens(port, request_prompt("b", prefix_units), max_tokens, timeout, think)
     tokens_a = count_tokens(port, request_prompt("a", prefix_units, middle_units), max_tokens, timeout, think)
+    # Split prompt A at the start of the middle: before it is the shared prefix, after it is the
+    # relocated run plus the deleted middle. So the run is (tokens_a - tokens_b) short of that.
+    head_only = request_prompt("a", prefix_units, middle_units).split("SECTION ONE")[0]
+    prefix_only = count_tokens(port, head_only, max_tokens, timeout, think)
+    tail_tokens = tokens_b - prefix_only
     print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
           f"MIDDLE = {tokens_a - tokens_b} tokens ({(tokens_a - tokens_b) // BLOCK_TOKENS} blocks)")
+    print(f"    relocated run is about {tail_tokens} tokens ({tail_tokens // BLOCK_TOKENS} blocks), "
+          f"roughly {100 * tail_tokens // max(tokens_b, 1)}% of the prompt")
     return prefix_units, middle_units
 
 
@@ -392,6 +405,11 @@ def main():
                              "rebuilt linear-attention state can reach it. If 'prefix' passes and "
                              "'tail' fails, relocation is working and the approximation is simply "
                              "too coarse at this relocated fraction.")
+    parser.add_argument("--tail-repeats", type=int, default=3,
+                        help="length of the relocated run, in repeats of the tail block. The knob for "
+                             "bisecting a mechanical fault, which fails at any size, from an "
+                             "approximation that only bites once the run is a large share of the "
+                             "prompt. The script prints the resulting token count and share.")
     parser.add_argument("--think", action="store_true",
                         help="keep thinking enabled. Off by default: this model reasons at length, "
                              "so a thinking run can burn the whole token budget without ever "
@@ -409,8 +427,9 @@ def main():
     # Split on whitespace. Deliberately not shlex: on Windows a backslash path would be mangled by
     # POSIX-style escape handling, and the server arguments here never need quoting.
     args.base_args_list = args.base_args.split()
-    global FACT_PLACEMENT
+    global FACT_PLACEMENT, TAIL_REPEATS
     FACT_PLACEMENT = args.fact_in
+    TAIL_REPEATS = args.tail_repeats
 
     artifact = next((a for a in args.base_args_list if a.lower().endswith(".ninfer")), None)
     if artifact is None:
