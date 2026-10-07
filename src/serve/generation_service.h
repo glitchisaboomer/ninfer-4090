@@ -48,6 +48,14 @@ struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
+    // Exactly the tokens this request delivered and the logprob the model gave each one, in
+    // generation order. Phase 5.5 of docs/SCR_ROADMAP.md compares Suffix Cache Reuse against the
+    // full-prefill path with these, and the request JSONL log is where they are published: the wire
+    // protocols stay unchanged, and a run only pays for them when the log is enabled. A token whose
+    // producing path measures no logprob carries NaN, so the two vectors always describe the same
+    // tokens; the JSON writer emits null for those rather than a number JSON cannot represent.
+    std::vector<ninfer::TokenId> generated_token_ids;
+    std::vector<float> generated_logprobs;
     int prompt_tokens                  = 0;
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;

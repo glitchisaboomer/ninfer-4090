@@ -467,6 +467,10 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
+    // Retained for the request log rather than the response: the delivered tokens and their
+    // logprobs are diagnostic-only, so no protocol translation has to learn about them.
+    outcome.generated_token_ids = std::move(result.generated_token_ids);
+    outcome.generated_logprobs  = std::move(result.generated_logprobs);
     outcome.finish_reason     = result.finish_reason;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -489,6 +490,19 @@ std::string format_request_start_json(const std::string& server_instance_id,
     return record.dump();
 }
 
+// The delivered tokens and their logprobs, in generation order. A logprob is null when the
+// producing path measured none (the MTP/DFlash licensed tokens): NaN is not representable in JSON,
+// and writing a number there would claim a measurement that does not exist.
+Json generated_tokens_json(const GenerationOutcome& outcome) {
+    Json tokens   = Json::array();
+    Json logprobs = Json::array();
+    for (const ninfer::TokenId token : outcome.generated_token_ids) { tokens.push_back(token); }
+    for (const float logprob : outcome.generated_logprobs) {
+        logprobs.push_back(std::isfinite(logprob) ? Json(logprob) : Json(nullptr));
+    }
+    return Json{{"token_ids", std::move(tokens)}, {"logprobs", std::move(logprobs)}};
+}
+
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
@@ -504,7 +518,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_relocated_tokens", outcome.metrics.prefix_relocated_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
-             {"tool_call_count", outcome.tool_calls.size()}};
+             {"tool_call_count", outcome.tool_calls.size()},
+             {"generated", generated_tokens_json(outcome)}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},

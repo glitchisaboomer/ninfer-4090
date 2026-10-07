@@ -193,6 +193,9 @@ ninfer_add_test(ninfer_serve_options_test
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_scr_quality_log_test
+  SOURCES test_scr_quality_log.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_serve_ui_test
   SOURCES test_serve_ui.cpp
   LIBRARIES ninfer_serve)

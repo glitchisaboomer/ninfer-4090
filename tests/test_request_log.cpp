@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -226,6 +227,11 @@ int main() {
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    // The delivered tokens and their logprobs, with one deliberately unmeasured token in the middle:
+    // Phase 5.5 of docs/SCR_ROADMAP.md reads them from this record, and a NaN must reach the file as
+    // null rather than as a number that claims a measurement nobody made.
+    outcome.generated_token_ids = {11, 22, 33};
+    outcome.generated_logprobs  = {0.5f, std::numeric_limits<float>::quiet_NaN(), -1.25f};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -235,6 +241,12 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
+    failures += check(done.at("result").at("generated").at("token_ids") ==
+                          Json::array({11, 22, 33}),
+                      "generated token ids missing from the request log");
+    failures += check(done.at("result").at("generated").at("logprobs") ==
+                          Json::array({0.5, nullptr, -1.25}),
+                      "generated logprobs missing, or an unmeasured token was written as a number");
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");

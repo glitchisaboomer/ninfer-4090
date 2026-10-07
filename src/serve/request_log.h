@@ -17,7 +17,9 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 8;
+// 9: request_done records carry the delivered tokens and their logprobs under result.generated,
+//    which Phase 5.5 of docs/SCR_ROADMAP.md scores beyond the response text.
+inline constexpr int kRequestLogSchemaVersion        = 9;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {

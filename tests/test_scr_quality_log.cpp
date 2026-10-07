@@ -1,0 +1,223 @@
+// Phase 5.5 of docs/SCR_ROADMAP.md, served end: the request JSONL log is the only channel that
+// carries per-token logprobs out of ninfer-serve, so the reader that turns it into scoring input is
+// the place a quality run can silently go wrong. These checks are all host-side: no CUDA, no model,
+// no server. The logprobs are fabricated, which is what makes the expected divergence exactly
+// known -- the arithmetic itself is the target's own, tested separately.
+
+#include "serve/scr_quality_log.h"
+#include "targets/qwen3_6/impl/runtime/scr_quality.h"
+
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+namespace scr_quality = ninfer::targets::qwen3_6::detail;
+
+int failures = 0;
+
+void expect(bool condition, std::string_view message) {
+    if (condition) { return; }
+    ++failures;
+    std::cerr << "FAIL: " << message << '\n';
+}
+
+void expect_invalid(std::string_view message, const std::function<void()>& body) {
+    try {
+        body();
+    } catch (const std::invalid_argument&) {
+        return;
+    } catch (const std::exception& error) {
+        ++failures;
+        std::cerr << "FAIL: " << message << " threw the wrong type: " << error.what() << '\n';
+        return;
+    }
+    ++failures;
+    std::cerr << "FAIL: " << message << " did not throw\n";
+}
+
+// One request_done record with the schema the server writes. `logprobs` takes the JSON spelling
+// directly so a null (an unmeasured logprob) can be expressed.
+std::string record(std::uint64_t request_id, int prompt_tokens, std::uint32_t cache_hit_tokens,
+                   std::uint32_t relocated_tokens, std::string_view reuse_path,
+                   std::string_view token_ids, std::string_view logprobs) {
+    return std::string{"{\"schema_version\":9,\"event\":\"request_done\",\"request\":{\"request_id\":"} +
+           std::to_string(request_id) + "},\"result\":{\"prompt_tokens\":" +
+           std::to_string(prompt_tokens) +
+           ",\"prefix_cache_hit_tokens\":" + std::to_string(cache_hit_tokens) +
+           ",\"prefix_relocated_tokens\":" + std::to_string(relocated_tokens) +
+           ",\"prefix_reuse_path\":\"" + std::string(reuse_path) +
+           "\",\"generated\":{\"token_ids\":" + std::string(token_ids) +
+           ",\"logprobs\":" + std::string(logprobs) + "}}}";
+}
+
+std::string joined(const std::vector<std::string>& lines) {
+    std::string out;
+    for (const std::string& line : lines) { out += line + "\n"; }
+    return out;
+}
+
+void test_parse_reads_only_completion_records() {
+    const std::string log = joined({
+        "{\"schema_version\":9,\"event\":\"server_start\"}",
+        record(7, 512, 64, 64, "suffix_relocation", "[11,22,33]", "[0.5,0.25,0.125]"),
+        "{\"schema_version\":9,\"event\":\"throughput\"}",
+        record(8, 600, 32, 32, "append_at_frontier", "[44]", "[0.5]"),
+    });
+    const std::vector<ninfer::serve::LoggedCompletion> completions =
+        ninfer::serve::parse_completion_log(log);
+
+    expect(completions.size() == 2, "only request_done records become completions");
+    expect(completions[0].request_id == 7 && completions[0].prompt_tokens == 512,
+           "request id and prompt token count are read");
+    expect(completions[0].prefix_relocated_tokens == 64 &&
+               completions[0].prefix_reuse_path == "suffix_relocation",
+           "reuse telemetry is read");
+    expect(completions[0].generated_token_ids == std::vector<ninfer::TokenId>({11, 22, 33}),
+           "generated token ids are read in order");
+    expect(completions[0].generated_logprobs.size() == 3 &&
+               completions[0].generated_logprobs[0] == 0.5f &&
+               completions[0].generated_logprobs[2] == 0.125f,
+           "generated logprobs are read in order");
+    expect(completions[1].prefix_reuse_path == "append_at_frontier",
+           "a non-relocating path is read as written");
+}
+
+void test_null_logprob_is_unmeasured() {
+    const std::string log =
+        record(1, 100, 64, 64, "suffix_relocation", "[1,2]", "[null,0.5]") + "\n";
+    const auto completions = ninfer::serve::parse_completion_log(log);
+    expect(completions.size() == 1 && completions[0].generated_logprobs.size() == 2,
+           "a null logprob keeps the token it belongs to");
+    expect(std::isnan(completions[0].generated_logprobs[0]),
+           "a null logprob becomes NaN, which is how an unmeasured token is carried");
+    expect(completions[0].generated_logprobs[1] == 0.5f, "the measured logprob is unaffected");
+}
+
+void test_malformed_records_are_refused() {
+    expect_invalid("a length mismatch between tokens and logprobs", [] {
+        (void)ninfer::serve::parse_completion_log(
+            record(1, 100, 64, 64, "suffix_relocation", "[1,2]", "[0.5]") + "\n");
+    });
+    expect_invalid("a newer schema version", [] {
+        (void)ninfer::serve::parse_completion_log(
+            "{\"schema_version\":99,\"event\":\"request_done\",\"request\":{\"request_id\":1},"
+            "\"result\":{\"prompt_tokens\":1,\"prefix_cache_hit_tokens\":0,"
+            "\"prefix_relocated_tokens\":0,\"prefix_reuse_path\":\"full_reset\"}}\n");
+    });
+    expect_invalid("a line that is not JSON", [] {
+        (void)ninfer::serve::parse_completion_log("{not json}\n");
+    });
+    expect_invalid("a record missing its reuse telemetry", [] {
+        (void)ninfer::serve::parse_completion_log(
+            "{\"schema_version\":9,\"event\":\"request_done\",\"request\":{\"request_id\":1},"
+            "\"result\":{\"prompt_tokens\":1}}\n");
+    });
+    expect_invalid("a logprob that is neither a number nor null", [] {
+        (void)ninfer::serve::parse_completion_log(
+            record(1, 100, 64, 64, "suffix_relocation", "[1]", "[\"high\"]") + "\n");
+    });
+    expect_invalid("a token id that is not an integer", [] {
+        (void)ninfer::serve::parse_completion_log(
+            record(1, 100, 64, 64, "suffix_relocation", "[\"1\"]", "[0.5]") + "\n");
+    });
+}
+
+void test_pairing_requires_comparable_runs() {
+    const auto scr      = ninfer::serve::parse_completion_log(
+        record(1, 800, 64, 64, "suffix_relocation", "[1,2,3]", "[0.5,0.5,0.5]") + "\n");
+    const auto baseline = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", "[1,2,3]", "[0.5,0.5,0.5]") + "\n");
+    const auto samples = ninfer::serve::pair_scr_quality_samples(scr, baseline);
+    expect(samples.size() == 1, "one prompt produces one comparison sample");
+    expect(samples[0].baseline_logprobs.size() == 3 && samples[0].scr_logprobs.size() == 3,
+           "the sample carries both paths' logprobs");
+    expect(samples[0].baseline_tokens.size() == 3 && samples[0].scr_tokens.size() == 3,
+           "the sample carries both paths' tokens");
+
+    expect_invalid("a different number of completions", [&] {
+        const auto short_log = ninfer::serve::parse_completion_log(
+            record(2, 900, 32, 32, "suffix_relocation", "[9]", "[0.1]") + "\n");
+        (void)ninfer::serve::pair_scr_quality_samples(scr, short_log);
+    });
+
+    expect_invalid("two different prompts", [&] {
+        const auto other = ninfer::serve::parse_completion_log(
+            record(1, 799, 0, 0, "full_reset", "[1,2,3]", "[0.5,0.5,0.5]") + "\n");
+        (void)ninfer::serve::pair_scr_quality_samples(scr, other);
+    });
+
+    // The one failure that matters most: a run in which Suffix Cache Reuse never engaged must not
+    // be scored, because two full prefills agree and would read as a pass.
+    expect_invalid("a run that relocated nothing", [&] {
+        const auto no_reuse = ninfer::serve::parse_completion_log(
+            record(1, 800, 0, 0, "full_reset", "[1,2,3]", "[0.5,0.5,0.5]") + "\n");
+        const auto base     = ninfer::serve::parse_completion_log(
+            record(1, 800, 0, 0, "full_reset", "[1,2,3]", "[0.5,0.5,0.5]") + "\n");
+        (void)ninfer::serve::pair_scr_quality_samples(no_reuse, base);
+    });
+}
+
+void test_report_scores_and_fails_honestly() {
+    const scr_quality::ScrQualityThresholds thresholds;
+
+    // Identical paths: the divergence is exactly zero and every leading token agrees.
+    const std::string tokens = "[1,2,3,4,5]";
+    const std::string probs  = "[0.5,0.25,-0.125,-1.5,2.0]";
+    const auto scr = ninfer::serve::parse_completion_log(
+        record(1, 800, 64, 64, "suffix_relocation", tokens, probs) + "\n");
+    const auto baseline = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", tokens, probs) + "\n");
+    const std::string passing =
+        ninfer::serve::format_scr_quality_report(scr, baseline, thresholds);
+    expect(passing.find("\"all_passed\":true") != std::string::npos,
+           "identical runs pass with the target's own thresholds");
+    expect(passing.find("\"mean_logprob_divergence\":0.000000") != std::string::npos,
+           "identical runs report zero divergence");
+    expect(passing.find("\"greedy_agreement\":1.000000") != std::string::npos,
+           "identical runs report full agreement");
+
+    // A baseline token swapped at the first position: agreement drops and the divergence is the
+    // exact mean absolute difference the roadmap's threshold is written against.
+    const auto flipped = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", "[2,2,3,4,5]", probs) + "\n");
+    const std::string failing =
+        ninfer::serve::format_scr_quality_report(scr, flipped, thresholds);
+    expect(failing.find("\"all_passed\":false") != std::string::npos,
+           "a flipped token fails the comparison");
+    expect(failing.find("\"greedy_agreement\":0.800000") != std::string::npos,
+           "agreement is measured over the compared prefix");
+
+    // An unmeasured logprob is NaN, so it can never read as agreement.
+    const auto unmeasured = ninfer::serve::parse_completion_log(
+        record(1, 800, 0, 0, "full_reset", tokens, "[null,0.25,-0.125,-1.5,2.0]") + "\n");
+    const std::string nan_report =
+        ninfer::serve::format_scr_quality_report(scr, unmeasured, thresholds);
+    expect(nan_report.find("\"all_passed\":false") != std::string::npos,
+           "a run carrying unmeasured logprobs fails rather than passing");
+
+    expect(ninfer::serve::format_scr_quality_report({}, {}, thresholds).empty(),
+           "an empty pair produces no report");
+}
+
+} // namespace
+
+int main() {
+    test_parse_reads_only_completion_records();
+    test_null_logprob_is_unmeasured();
+    test_malformed_records_are_refused();
+    test_pairing_requires_comparable_runs();
+    test_report_scores_and_fails_honestly();
+    if (failures != 0) {
+        std::cerr << failures << " SCR quality log checks failed\n";
+        return 1;
+    }
+    std::cout << "SCR quality log checks passed\n";
+    return 0;
+}
