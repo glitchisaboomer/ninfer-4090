@@ -285,10 +285,49 @@ Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 88-test sui
    and six validation rejections. Errors are measured in BF16 ulp of the operand pair rather than
    of the result, because a rotation can cancel toward zero; the allowance is 4 ulp against a
    measured worst case of 1.79, while a sign-flipped variant costs 4222.
-3. End-to-end relocation wiring in `program_impl.h` -- **outstanding**. `tools/scr_e2e_check.py`
-   drives a live server over prompts that share a prefix and a suffix and differ in the middle, and
-   refuses to report a pass unless the server logs `reuse=suffix_relocation`.
-4. Phase 5.5 quality harness -- **not started**. `eval/ninfer_eval` has no `--scr` support.
+3. `gqa_kv_rerotate` against the production write and read paths -- **done**,
+   `tests/ops/test_scr_relocation_integration.cpp`. The Op's own oracle test seeds the K plane
+   through `paged_kv_element_offset`, which is the same addressing the Op uses, so it cannot detect
+   the Op and the cache writer disagreeing about that convention. This test writes every cache byte
+   with `gqa_kv_append` and reads through `gqa_attention_cached` and `gqa_attention`, against a
+   permuted block table. A relocated cache comes out operationally indistinguishable from a directly
+   prefilled one (7.2e-4 relative L2) while a skipped re-rotation registers at 2.3e-1, so the check
+   is not blind.
+4. End-to-end relocation wiring in `program_impl.h` -- **wiring defect found and fixed**, see below.
+   `tools/scr_e2e_check.py` drives a live server over prompts that share a prefix and a suffix and
+   differ in the middle, and refuses to report a pass unless the server logs `reuse=suffix_relocation`.
+5. Phase 5.5 quality harness -- **not started**. `eval/ninfer_eval` has no `--scr` support`.
+
+### The defect: the chunk's base position was captured before the cursor skipped the relocated run
+
+Symptom: every relocation produced a single stop token and empty content, while `--no-scr` answered
+correctly, and it did so for a relocated run of **one** 64-token block out of 3864 (1.7% of the
+prompt). Scaling the run to 2, 5 and 10 blocks changed nothing, which ruled out the stale-state
+approximation and pointed at the sequencing.
+
+Cause: `advance_prefill` builds its `schedule::PrefillContext` from `staged.cursor` on entry, and that
+becomes `PrefillContext::text_kv_base` -- the base position the chunk prefills at, which seeds
+`positions`, sets `visible`, and decides which page `gqa_kv_append` writes. Further down the same
+invocation, `skip_relocated_runs` advances `staged.cursor` across the relocated run. On the single
+entry where that skip fires, the two diverged, and the chunk prefilled a whole relocated run early.
+With a one-block run that is 64 tokens, so the 24-token tail landed at positions `[3776, 3800)`
+instead of `[3840, 3864)`: it overwrote the first 24 positions of the relocated page, the prompt's
+real last 24 positions were never written at all, and the sample was taken from the hidden state of
+position 3799, which the prompt no longer ends at.
+
+Two copies of one position, with nothing downstream comparing them. The fix propagates the skip into
+`text_kv_base`, and `advance_prefill` now asserts the two agree before dispatching a chunk, so a
+future divergence throws instead of quietly prefilling at the wrong positions.
+
+What found it: fingerprinting each relocated destination page **after** the prefill that consumes it.
+The existing diagnostic's before/after pair bracketed only the re-rotation, so a page that prefill
+subsequently overwrote read as perfectly healthy -- which is why every component test passed while
+the feature produced nothing. A per-row fingerprint then reported `changed_rows=96 of 256`, and 96 is
+exactly 24 tokens x 4 KV heads, which is not a coincidence and does not need interpreting further.
+
+Per-chunk tracing reported `cursor=3840 nominal=24` and looked clean, because it printed the
+post-skip cursor. It now prints `base` alongside `cursor` and derives `visible` from `base`, so the
+divergence shows as `base=3776 cursor=3840` instead of hiding behind a plausible-looking extent.
 
 ### A latent defect that the unit tests could not have caught
 

@@ -1615,15 +1615,17 @@ void ProgramImplCore::log_scr_relocation_integrity(
     std::cerr.flush();
 }
 
-void ProgramImplCore::log_scr_prefill_chunk(std::uint32_t cursor, std::uint32_t nominal,
-                                             std::uint32_t range_end, std::uint32_t resumed,
+void ProgramImplCore::log_scr_prefill_chunk(std::uint32_t base, std::uint32_t cursor,
+                                             std::uint32_t nominal, std::uint32_t range_end,
+                                             std::uint32_t resumed,
                                              const qwen3_6::PagedKVCacheView& view) const {
     if (!scr_diagnostics_enabled()) { return; }
 
-    // The extent the chunk makes visible, and the block-table entries attention resolves at and just
-    // past its frontier. An entry at or below `visible` decides whether the last key is inside the
-    // window; one just past it is what a read that overruns would pick up instead.
-    const std::uint32_t visible = cursor + nominal;
+    // `visible` and the resolved pages are derived from `base`, which is the value the kernels
+    // actually prefill at, and never from `cursor`. Reporting cursor here is what let the stale-base
+    // bug read as a clean trace: the cursor had already jumped, so the printed extent looked right
+    // while the chunk wrote a page earlier. Any disagreement between the two is the bug.
+    const std::uint32_t visible = base + nominal;
     const PagedKVLayerView layer = view.layer_view(0);
     const std::size_t rows       = static_cast<std::size_t>(layer.block_table.numel());
     std::vector<std::int32_t> table(rows);
@@ -1637,9 +1639,9 @@ void ProgramImplCore::log_scr_prefill_chunk(std::uint32_t cursor, std::uint32_t 
     };
 
     std::ostringstream out;
-    out << "[scr-diag] chunk cursor=" << cursor << " nominal=" << nominal << " range_end=" << range_end
-        << " resumed=" << resumed << " visible=" << visible
-        << " page[first]=" << entry(cursor) << " page[last_visible]=" << entry(visible - 1)
+    out << "[scr-diag] chunk base=" << base << " cursor=" << cursor << " nominal=" << nominal
+        << " range_end=" << range_end << " resumed=" << resumed << " visible=" << visible
+        << " page[first]=" << entry(base) << " page[last_visible]=" << entry(visible - 1)
         << " page[one_past]=" << (visible < cursor + 2 * kPagedKVPageSize ? entry(visible) : -2);
     std::cerr << out.str() << '\n';
     std::cerr.flush();
@@ -2217,13 +2219,29 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (resumed != staged.cursor) {
                 staged.cursor          = resumed;
                 sequence.text_kv_valid = resumed;
+                // The PrefillContext above captured text_kv_base from the cursor as it stood on entry,
+                // before this skip. That value is the base position the chunk prefills at: it seeds
+                // `positions`, it sets `visible`, and it decides which page gqa_kv_append writes, so a
+                // stale one prefills at the wrong positions. On the single entry where the skip fires
+                // that put the chunk a whole relocated run early -- here one page -- so the tail's 24
+                // tokens landed inside the relocated run, overwriting its first 24 positions, while
+                // the prompt's real last 24 positions were never written at all. The sample then came
+                // from the hidden state of a position the prompt no longer ends at.
+                schedule_state.text_kv_base = resumed;
+            }
+            // The base a chunk prefills at and the cursor tracking it must not diverge. They are two
+            // copies of one position, and nothing downstream compares them, so a divergence prefills
+            // at one position while reporting progress at another and silently writes the wrong page.
+            // Assert it here rather than let the symptom surface as bad generations.
+            if (schedule_state.text_kv_base != staged.cursor) {
+                throw std::logic_error("staged prefill base does not match the prefill cursor");
             }
             const std::uint32_t range_end = staged.prefill_range_end(staged.cursor);
             const std::uint32_t nominal   = std::min(prefill_chunk, range_end - staged.cursor);
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             if (scr_diagnostics_enabled() && !staged.relocated_page_probes.empty()) {
-                log_scr_prefill_chunk(staged.cursor, nominal, range_end, resumed,
-                                      text_kv_view(sequence));
+                log_scr_prefill_chunk(schedule_state.text_kv_base, staged.cursor, nominal, range_end,
+                                      resumed, text_kv_view(sequence));
             }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);

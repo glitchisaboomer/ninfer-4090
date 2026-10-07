@@ -524,7 +524,7 @@ private:
     // cursor skip across the relocated run, and the key extent each chunk makes visible to attention.
     // The relocated page surviving prefill intact does not by itself mean attention read it, and this
     // is the only place that states how far the visible extent reached.
-    void log_scr_prefill_chunk(std::uint32_t cursor, std::uint32_t nominal,
+    void log_scr_prefill_chunk(std::uint32_t base, std::uint32_t cursor, std::uint32_t nominal,
                                std::uint32_t range_end, std::uint32_t resumed,
                                const qwen3_6::PagedKVCacheView& view) const;
 
