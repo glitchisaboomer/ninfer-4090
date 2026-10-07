@@ -245,6 +245,12 @@ ninfer_add_op_test(ninfer_gqa_attention_test
 ninfer_add_op_test(ninfer_scr_relocation_integration_test
   SOURCES ops/test_scr_relocation_integration.cpp
   LIBRARIES ninfer_ops)
+# Log-probability of the chosen token, against an FP64 log-softmax oracle. Phase 5.5 of
+# docs/SCR_ROADMAP.md scores the two reuse paths in nats, so this measures the quantity that score
+# consumes rather than the argmax it is often confused with.
+ninfer_add_op_test(ninfer_logprob_of_choice_test
+  SOURCES ops/test_logprob_of_choice.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
   SOURCES ops/test_bidirectional_gqa_attention.cpp
   LIBRARIES ninfer_ops)

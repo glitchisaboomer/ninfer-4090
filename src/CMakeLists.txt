@@ -60,6 +60,7 @@ target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
+  ops/launcher/logprob_of_choice.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/embed_gather.cu
@@ -176,6 +177,7 @@ add_library(ninfer_ops STATIC
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
+  ops/wrapper/logprob_of_choice.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/embedding.cpp
