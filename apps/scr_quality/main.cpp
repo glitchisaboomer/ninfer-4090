@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +64,9 @@ extern char** environ;
 namespace {
 
 using Json = nlohmann::json;
+using ninfer::targets::qwen3_6::detail::ScrQualityPromptResult;
+using ninfer::targets::qwen3_6::detail::ScrQualityReport;
+using ninfer::targets::qwen3_6::detail::ScrQualitySample;
 
 // The prose that makes up the shared tail. Ordinary sentences on purpose: the tail has to fill KV
 // pages and survive the edit, and its content is irrelevant to the comparison.
@@ -100,6 +104,10 @@ struct Options {
     int prompts_per_k        = 1;
     std::vector<int> k_blocks{1, 2, 3, 6, 12, 64};
     bool keep_logs = false;
+    // NINFER_SCR_DIAG=1 for the spawned servers: the runtime's own account of what relocation did,
+    // which is the only channel that shows the applied plan, the page remap, and any refusal the
+    // planner made. Without it the harness can only report what it asked for, never what happened.
+    bool scr_diag = false;
 };
 
 struct SuitePrompt {
@@ -126,7 +134,10 @@ struct SuitePrompt {
               << "  --api-key <key>               bearer token, when the server requires one\n"
               << "  --json <file|->               report file; "-" writes it to stdout instead\n"
               << "                                (default: <work-dir>/scr-quality.json)\n"
-              << "  --keep-logs                   leave the request logs in place on success\n";
+              << "  --keep-logs                   leave the request logs in place on success\n"
+              << "  --scr-diag                    set NINFER_SCR_DIAG=1 for the spawned servers, so each\n"
+                 "                                prints its applied relocation plan, page remap, and any\n"
+                 "                                planner refusal to this console\n";
     std::exit(2);
 }
 
@@ -195,6 +206,8 @@ Options parse_options(int argc, char** argv) {
             options.prompts_per_k = positive_int(value_of(index), "--prompts-per-k");
         } else if (arg == "--keep-logs") {
             options.keep_logs = true;
+        } else if (arg == "--scr-diag") {
+            options.scr_diag = true;
         } else if (arg == "--k-blocks") {
             options.k_blocks.clear();
             for (const std::string& part : split_commas(value_of(index))) {
@@ -437,7 +450,7 @@ void wait_for_health(const Options& options, int port, ServerProcess& server) {
     throw std::runtime_error("ninfer-serve did not become healthy on port " + std::to_string(port));
 }
 
-void post_chat(const Options& options, int port, const Json& messages, const std::string& label) {
+Json post_chat(const Options& options, int port, const Json& messages, const std::string& label) {
     httplib::Client client("127.0.0.1", port);
     client.set_connection_timeout(5, 0);
     client.set_read_timeout(options.request_timeout_secs, 0);
@@ -448,7 +461,57 @@ void post_chat(const Options& options, int port, const Json& messages, const std
         throw std::runtime_error("request " + label + " returned HTTP " +
                                  std::to_string(response->status) + ": " + response->body);
     }
+    try {
+        return Json::parse(response->body);
+    } catch (const Json::exception& error) {
+        throw std::runtime_error("request " + label + " returned a body that is not JSON: " +
+                                 error.what());
+    }
 }
+
+// One chat reply's prose and disposition. The scorer compares tokens and logprobs; this is what the
+// model actually said -- the part a reader can judge directly, without decoding token ids. Two runs
+// that flip a token at position 6 but still answer the question identically are a different finding
+// from two runs whose answers disagree, and the scored report alone cannot tell them apart.
+struct ChatReply {
+    std::string content;
+    std::string reasoning;
+    std::string finish_reason;
+};
+
+// `content` is null whenever the model produced only reasoning, and null is not a string, so the
+// field is read defensively rather than with `at` + `get`, which would throw on the null.
+std::string string_field(const Json& object, const char* key) {
+    const auto it = object.find(key);
+    if (it == object.end() || it->is_null()) { return {}; }
+    if (!it->is_string()) {
+        throw std::runtime_error(std::string("chat reply field ") + key +
+                                 " is neither a string nor null");
+    }
+    return it->get<std::string>();
+}
+
+ChatReply extract_reply(const Json& body, const std::string& label) {
+    try {
+        const Json& choice = body.at("choices").at(0);
+        ChatReply reply;
+        reply.content       = string_field(choice.at("message"), "content");
+        reply.reasoning     = string_field(choice.at("message"), "reasoning_content");
+        reply.finish_reason = string_field(choice, "finish_reason");
+        return reply;
+    } catch (const Json::exception& error) {
+        throw std::runtime_error("reply for " + label + " is missing fields the harness needs: " +
+                                 error.what());
+    }
+}
+
+// Primed and edited replies of one prompt, both kept: the primed reply is the request that seeds the
+// resident KV, so a primed reply that differs between phases means the two sides did not start from
+// the same state and nothing downstream of it is a clean A/B.
+struct PhaseExchange {
+    ChatReply primed;
+    ChatReply edited;
+};
 
 std::string read_file(const std::string& path) {
     std::ifstream input(path, std::ios::binary);
@@ -461,8 +524,14 @@ std::string read_file(const std::string& path) {
 // One server run over the whole suite. Both phases send [pre-edit, edited] for every prompt, so the
 // two logs describe the same requests in the same order and pairing stays positional. The baseline
 // phase needs prefix reuse off as well, which is what makes its edited reply a full prefill.
-void run_phase(const Options& options, const std::vector<SuitePrompt>& prompts, bool scr, int port,
-               const std::string& log_path) {
+//
+// Returns both replies of every prompt: the scored comparison says where the token streams parted,
+// and this is what the two runs actually answered -- the thing a reader can judge without decoding
+// token ids. `label` is how the phase names itself in every line it prints; the baseline and the
+// control run the same flags, and printing both as "baseline" made them read as one phase.
+std::vector<PhaseExchange> run_phase(const Options& options, const std::vector<SuitePrompt>& prompts,
+                                     bool scr, int port, const std::string& log_path,
+                                     const char* label) {
     std::remove(log_path.c_str());
     const std::vector<std::string> extra = [&] {
         std::vector<std::string> args = split_whitespace(options.server_args);
@@ -479,20 +548,43 @@ void run_phase(const Options& options, const std::vector<SuitePrompt>& prompts, 
     server.start();
     wait_for_health(options, port, server);
     std::size_t sent = 0;
+    std::vector<PhaseExchange> exchanges;
+    exchanges.reserve(prompts.size());
     for (const SuitePrompt& prompt : prompts) {
-        post_chat(options, port, prompt.primed_messages, prompt.name + " prime");
-        post_chat(options, port, prompt.edited_messages, prompt.name + " edited");
+        const Json primed_body =
+            post_chat(options, port, prompt.primed_messages, prompt.name + " prime");
+        const Json edited_body =
+            post_chat(options, port, prompt.edited_messages, prompt.name + " edited");
+        exchanges.push_back(PhaseExchange{extract_reply(primed_body, prompt.name + " prime"),
+                                          extract_reply(edited_body, prompt.name + " edited")});
         sent += 2;
-        std::cerr << "[" << (scr ? "scr" : "baseline") << "] " << prompt.name << " done (" << sent
-                  << " of " << prompts.size() * 2 << " requests)\n";
+        std::cerr << "[" << label << "] " << prompt.name << " done (" << sent << " of "
+                  << prompts.size() * 2 << " requests)\n";
     }
     server.terminate();
+    return exchanges;
 }
+
+// Reuse telemetry for one prompt pair, kept beside the scores: a report that says how far the runs
+// drifted without saying how much was reused cannot be read as the K curve the roadmap asks for,
+// and `reused=0` with `relocated>0` is a shape that has to be explained rather than guessed at.
+struct ReuseInfo {
+    std::string name;
+    std::int32_t primed_prompt_tokens     = 0;
+    std::int32_t prompt_tokens            = 0;
+    std::int32_t edit_offset              = 0;
+    std::uint32_t prefix_cache_hit_tokens = 0;
+    std::uint32_t prefix_relocated_tokens = 0;
+    std::string prefix_reuse_path;
+};
 
 // The edited record of each prompt pair, in suite order, with the telemetry that says whether the
 // regime the roadmap cares about (a long reused prefix, a long relocated suffix) was exercised.
-std::vector<ninfer::serve::LoggedCompletion>
-select_edited(const std::vector<ninfer::serve::LoggedCompletion>& completions, bool scr) {
+// `label` names the phase in every line printed; `reuse` receives the same telemetry in structured
+// form so it can ride in the report instead of only in stderr.
+std::vector<ninfer::serve::LoggedCompletion> select_edited(
+    const std::vector<ninfer::serve::LoggedCompletion>& completions, const char* label, bool scr,
+    const std::vector<SuitePrompt>& prompts, std::vector<ReuseInfo>& reuse) {
     std::vector<ninfer::serve::LoggedCompletion> selected;
     selected.reserve(completions.size() / 2);
     std::vector<std::size_t> misaligned;
@@ -511,14 +603,21 @@ select_edited(const std::vector<ninfer::serve::LoggedCompletion>& completions, b
         constexpr std::int32_t kPageTokens = 64; // kPagedKVPageSize
         const std::int32_t offset = edited.prompt_tokens - primed.prompt_tokens;
         const bool aligned        = offset % kPageTokens == 0;
-        std::cerr << "[" << (scr ? "scr" : "baseline") << "] prompt " << (index / 2)
+        const std::size_t prompt_index = index / 2;
+        const std::string name = prompt_index < prompts.size()
+                                     ? prompts[prompt_index].name
+                                     : "prompt " + std::to_string(prompt_index);
+        std::cerr << "[" << label << "] " << name
                   << ": prompt_tokens=" << edited.prompt_tokens
                   << " primed=" << primed.prompt_tokens
                   << " edit_offset=" << offset << (aligned ? "" : " NOT_PAGE_ALIGNED")
                   << " reused=" << edited.prefix_cache_hit_tokens
                   << " relocated=" << edited.prefix_relocated_tokens
                   << " path=" << edited.prefix_reuse_path << "\n";
-        if (!aligned && scr) { misaligned.push_back(index / 2); }
+        if (!aligned && scr) { misaligned.push_back(prompt_index); }
+        reuse.push_back(ReuseInfo{name, primed.prompt_tokens, edited.prompt_tokens, offset,
+                                  edited.prefix_cache_hit_tokens, edited.prefix_relocated_tokens,
+                                  edited.prefix_reuse_path});
         selected.push_back(edited);
     }
     if (!misaligned.empty()) {
@@ -577,6 +676,239 @@ void print_curve(const char* title, const std::vector<SuitePrompt>& prompts,
     }
 }
 
+// --- diagnostics the scored report cannot carry ------------------------------------------------
+//
+// The report says *where* the token streams parted and how far the logprobs moved before it did. It
+// does not say which token each side chose at the flip, how confident either side was there, how
+// much was actually reused, or what the two runs answered -- and those are the four things a reader
+// needs before the pass/fail column means anything.
+
+// Index of the first character at which the two strings differ, or npos when they are equal.
+std::size_t first_diff(const std::string& left, const std::string& right) {
+    const std::size_t common = std::min(left.size(), right.size());
+    std::size_t index        = 0;
+    while (index < common && left[index] == right[index]) { ++index; }
+    if (index == common && left.size() == right.size()) { return std::string::npos; }
+    return index;
+}
+
+// Six decimals, and "n/a" for anything not finite. The scorer prints nan, which is honest in a
+// numeric field, but here the value sits beside strings where nan would read as a measurement
+// rather than as an absence.
+std::string metric(double value) {
+    if (!std::isfinite(value)) { return "n/a"; }
+    std::ostringstream out;
+    out.precision(6);
+    out << std::fixed << value;
+    return out.str();
+}
+
+std::string margin_at(const std::vector<float>& margins, std::size_t index) {
+    if (index >= margins.size()) { return "n/a"; }
+    return metric(static_cast<double>(margins[index]));
+}
+
+// One line of a reply, capped and flattened: this is a diagnosis, not a transcript, and the
+// excerpt exists to be read next to its twin.
+std::string excerpt(const std::string& text, std::size_t limit = 200) {
+    std::string flat = text.substr(0, limit);
+    for (char& character : flat) {
+        if (character == '\n' || character == '\r' || character == '\t') { character = ' '; }
+    }
+    if (text.size() > limit) { flat += "..."; }
+    return "'" + flat + "'";
+}
+
+// The flip itself, with the numbers that decide what it means. Margin is best-minus-second-best in
+// nats: a flip behind a margin of a thousandth is a coin tipped by any perturbation at all, a flip
+// against a wide margin is a decision the reuse path actually moved. Position 0 comes along too,
+// because d(first) in the report is measured there and is only readable against the margin beside
+// it. Values come straight from the request log; a server whose log predates the margin field
+// prints n/a rather than borrowing a margin from a neighbouring position.
+void print_divergence_detail(const std::vector<SuitePrompt>& prompts,
+                             const std::vector<ScrQualitySample>& samples,
+                             const ScrQualityReport& scored) {
+    std::cerr << "\nFIRST-FLIP DETAIL  (measurement: --scr vs --no-scr)\n"
+                 "\n  margin = best-minus-second-best logit gap, in nats.\n";
+    for (std::size_t i = 0; i < scored.prompts.size() && i < samples.size(); ++i) {
+        const ScrQualityPromptResult& result = scored.prompts[i];
+        const ScrQualitySample& sample        = samples[i];
+        const std::size_t overlap =
+            std::min({sample.baseline_tokens.size(), sample.scr_tokens.size(),
+                      sample.baseline_logprobs.size(), sample.scr_logprobs.size()});
+        const std::string name =
+            i < prompts.size() ? prompts[i].name : "prompt " + std::to_string(i);
+        std::cerr << "\n  " << name;
+        if (overlap == 0) {
+            std::cerr << ": no comparable tokens\n";
+            continue;
+        }
+        std::cerr << "\n    pos0    logprob --no-scr " << metric(sample.baseline_logprobs[0])
+                  << "  --scr " << metric(sample.scr_logprobs[0])
+                  << "   margin --no-scr " << margin_at(sample.baseline_margins, 0)
+                  << "  --scr " << margin_at(sample.scr_margins, 0);
+        const std::size_t flip = result.first_divergence_index;
+        if (flip < overlap) {
+            std::cerr << "\n    flip@" << flip << "  --no-scr token " << sample.baseline_tokens[flip]
+                      << " logprob " << metric(sample.baseline_logprobs[flip]) << " margin "
+                      << margin_at(sample.baseline_margins, flip) << "   |  --scr token "
+                      << sample.scr_tokens[flip] << " logprob "
+                      << metric(sample.scr_logprobs[flip]) << " margin "
+                      << margin_at(sample.scr_margins, flip);
+        } else {
+            std::cerr << "\n    no flip within the " << overlap << " comparable token(s)";
+        }
+        std::cerr << "\n";
+    }
+}
+
+// The two paths' prose, side by side. The scorer reports where the token streams parted; this
+// reports what that was worth -- whether both runs still answered the question the same way, and
+// the first character at which the text reads differently.
+//
+// The primed replies are checked too: they seed the resident KV, so a primed reply that differs
+// between phases means the two sides did not start from the same state and the pair is not a clean
+// A/B. The control is checked against the baseline for the same reason in reverse: two identical
+// configurations that produce different prose would make the floor a text question as well as a
+// logprob one.
+void print_output_comparison(const std::vector<SuitePrompt>& prompts,
+                             const std::vector<PhaseExchange>& baseline,
+                             const std::vector<PhaseExchange>& scr,
+                             const std::vector<PhaseExchange>& control) {
+    std::cerr << "\nGENERATED OUTPUT  (--no-scr vs --scr, edited request)\n";
+    std::size_t identical      = 0;
+    std::size_t primed_same    = 0;
+    std::size_t control_same   = 0;
+    const std::size_t measured =
+        std::min({prompts.size(), baseline.size(), scr.size()});
+    for (std::size_t i = 0; i < measured; ++i) {
+        const ChatReply& base = baseline[i].edited;
+        const ChatReply& test = scr[i].edited;
+        const bool same = base.content == test.content && base.reasoning == test.reasoning;
+        const bool primed_match = baseline[i].primed.content == scr[i].primed.content &&
+                                  baseline[i].primed.reasoning == scr[i].primed.reasoning;
+        const bool control_match = i < control.size() &&
+                                   control[i].edited.content == base.content &&
+                                   control[i].edited.reasoning == base.reasoning;
+        identical += same ? 1U : 0U;
+        primed_same += primed_match ? 1U : 0U;
+        control_same += control_match ? 1U : 0U;
+
+        const std::size_t diff = first_diff(base.content, test.content);
+        std::cerr << "\n  " << prompts[i].name << ": "
+                  << (same ? "content identical" : "CONTENT DIFFERS");
+        if (diff != std::string::npos) {
+            std::cerr << " (first differing character " << diff << ")";
+        }
+        std::cerr << ", finish --no-scr="
+                  << (base.finish_reason.empty() ? "?" : base.finish_reason)
+                  << " --scr=" << (test.finish_reason.empty() ? "?" : test.finish_reason);
+        if (!primed_match) {
+            std::cerr << "\n    PRIMED replies differ between phases: the resident KV was seeded "
+                         "differently,\n    so this pair is not a clean A/B";
+        }
+        if (!control_match) {
+            std::cerr << "\n    CONTROL prose differs from baseline: two identical "
+                         "configurations produced\n    different text here";
+        }
+        std::cerr << "\n    --no-scr: " << excerpt(base.content)
+                  << "\n    --scr    : " << excerpt(test.content);
+        if (!base.reasoning.empty() || !test.reasoning.empty()) {
+            std::cerr << "\n    reasoning --no-scr: " << excerpt(base.reasoning)
+                      << "\n    reasoning --scr    : " << excerpt(test.reasoning);
+        }
+    }
+    std::cerr << "\n  edited content identical on " << identical << "/" << measured
+              << " prompt(s); primed replies identical on " << primed_same << "/" << measured
+              << "; control matched baseline on " << control_same << "/" << measured << "\n";
+}
+
+// `reused=` in the per-prompt lines is prefix_cache_hit_tokens, which the runtime sets from
+// `reuse_base`: the length of the prefix that matches the resident sequence *in full*. An
+// in-the-middle edit defeats that match however long the shared head is, so the line reads 0 while
+// hundreds of tokens are in fact reused -- the reuse that happened is what `relocated=` counts, and
+// the head before the edit is re-prefilled by the relocation plan. Stated once, explicitly,
+// because "nothing was reused" is the natural -- and wrong -- reading of the line.
+void print_reuse_explainer(const std::vector<ReuseInfo>& scr_reuse) {
+    bool relocated_without_prefix_hit = false;
+    for (const ReuseInfo& entry : scr_reuse) {
+        if (entry.prefix_relocated_tokens > 0 && entry.prefix_cache_hit_tokens == 0) {
+            relocated_without_prefix_hit = true;
+            break;
+        }
+    }
+    if (!relocated_without_prefix_hit) { return; }
+    std::cerr << "\n  On `reused=0`: prefix_cache_hit_tokens is the *exact-prefix* frontier "
+                 "(reuse_base) -- the length\n  up to which the new prompt equals the resident "
+                 "sequence in full. Any in-the-middle edit defeats\n  that match however long the "
+                 "shared head is, so it reports 0 while the reuse that actually\n  happened is in "
+                 "`relocated=`/prefix_relocated_tokens; the head before the edit is re-prefilled\n"
+                 "  by the relocation plan. Re-run with --scr-diag to see the applied plan, "
+                 "including that\n  head range, and any refusal the planner made.\n";
+}
+
+// The reuse telemetry as JSON, one entry per prompt per phase. It rides in the report because the
+// thresholds are read against it: divergence that grows with the relocated span is a different
+// finding from divergence that does not, and the K axis of the roadmap's Figure 13 lives here.
+std::string reuse_section(const std::vector<ReuseInfo>& scr, const std::vector<ReuseInfo>& baseline,
+                          const std::vector<ReuseInfo>& control) {
+    const auto entries = [](const std::vector<ReuseInfo>& phase) {
+        Json array = Json::array();
+        for (const ReuseInfo& entry : phase) {
+            array.push_back(Json{{"name", entry.name},
+                                 {"primed_prompt_tokens", entry.primed_prompt_tokens},
+                                 {"prompt_tokens", entry.prompt_tokens},
+                                 {"edit_offset", entry.edit_offset},
+                                 {"prefix_cache_hit_tokens", entry.prefix_cache_hit_tokens},
+                                 {"prefix_relocated_tokens", entry.prefix_relocated_tokens},
+                                 {"prefix_reuse_path", entry.prefix_reuse_path}});
+        }
+        return array;
+    };
+    return Json{{"scr", entries(scr)},
+                {"baseline", entries(baseline)},
+                {"control", entries(control)}}
+        .dump();
+}
+
+// The two paths' actual prose, in the report rather than only on stderr: the artifact gets read
+// again later, and "both runs still said the same answer" is not derivable from token ids by
+// whoever reads it then. `first_diff_char` is -1 when the contents are identical.
+std::string outputs_section(const std::vector<SuitePrompt>& prompts,
+                            const std::vector<PhaseExchange>& baseline,
+                            const std::vector<PhaseExchange>& scr,
+                            const std::vector<PhaseExchange>& control) {
+    const auto reply = [](const ChatReply& value) {
+        return Json{{"content", value.content},
+                    {"reasoning", value.reasoning},
+                    {"finish_reason", value.finish_reason}};
+    };
+    Json array = Json::array();
+    for (std::size_t i = 0; i < prompts.size() && i < baseline.size() && i < scr.size(); ++i) {
+        const ChatReply& base = baseline[i].edited;
+        const ChatReply& test = scr[i].edited;
+        const std::size_t diff = first_diff(base.content, test.content);
+        const std::int64_t diff_char =
+            diff == std::string::npos ? -1 : static_cast<std::int64_t>(diff);
+        Json entry{{"name", prompts[i].name},
+                   {"identical", base.content == test.content && base.reasoning == test.reasoning},
+                   {"first_diff_char", diff_char},
+                   {"primed_identical", baseline[i].primed.content == scr[i].primed.content &&
+                                             baseline[i].primed.reasoning ==
+                                                 scr[i].primed.reasoning},
+                   {"baseline", reply(base)},
+                   {"scr", reply(test)}};
+        if (i < control.size()) {
+            entry["control_identical"] =
+                control[i].edited.content == base.content &&
+                control[i].edited.reasoning == base.reasoning;
+            entry["control"] = reply(control[i].edited);
+        }
+        array.push_back(std::move(entry));
+    }
+    return array.dump();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -592,17 +924,33 @@ int main(int argc, char** argv) {
                                             : options.json_out;
         std::cerr << "suite: " << prompts.size() << " prompt(s); report to " << report_path
                   << "\n";
+        if (options.scr_diag) {
+            // The spawned servers inherit this environment, so one variable turns on the runtime's
+            // own account of every relocation: applied plan, page remap, bound block-table row,
+            // re-rotation fingerprint, and any refusal the planner made. They print it to this
+            // console because they share it with us -- nothing is parsed back out of it; the
+            // report's job is to be readable without a second run.
+#if defined(_WIN32)
+            _putenv_s("NINFER_SCR_DIAG", "1");
+#else
+            ::setenv("NINFER_SCR_DIAG", "1", 1);
+#endif
+            std::cerr << "NINFER_SCR_DIAG=1 for the spawned servers (--scr-diag)\n";
+        }
 
-        run_phase(options, prompts, true, options.port, scr_log);
+        const std::vector<PhaseExchange> scr_exchange =
+            run_phase(options, prompts, true, options.port, scr_log, "scr");
         // A separate port keeps each later phase off a socket still in TIME_WAIT.
-        run_phase(options, prompts, false, options.port + 1, baseline_log);
+        const std::vector<PhaseExchange> baseline_exchange =
+            run_phase(options, prompts, false, options.port + 1, baseline_log, "baseline");
         // The control is the baseline configuration run a second time. Without it the measurement has
         // no noise floor, and every divergence it reports is unattributable: the same spread is
         // produced by two runs that differ in nothing. The 2026-10-08 sweep is the case in point --
         // d(first) varied from 1.8e-4 to 7.5e-2 nats with no relationship to how much context was
         // reused, which is what a floor of comparable size looks like and not what a relocation error
        // that grows with the reused region looks like.
-        run_phase(options, prompts, false, options.port + 2, control_log);
+        const std::vector<PhaseExchange> control_exchange =
+            run_phase(options, prompts, false, options.port + 2, control_log, "control");
 
         const auto load = [&](const std::string& path, const char* phase) {
             const std::vector<ninfer::serve::LoggedCompletion> completions =
@@ -613,12 +961,16 @@ int main(int argc, char** argv) {
             }
             return completions;
         };
+        std::vector<ReuseInfo> scr_reuse;
+        std::vector<ReuseInfo> baseline_reuse;
+        std::vector<ReuseInfo> control_reuse;
         const std::vector<ninfer::serve::LoggedCompletion> scr_edited =
-            select_edited(load(scr_log, "SCR"), true);
+            select_edited(load(scr_log, "SCR"), "scr", true, prompts, scr_reuse);
         const std::vector<ninfer::serve::LoggedCompletion> baseline_edited =
-            select_edited(load(baseline_log, "baseline"), false);
+            select_edited(load(baseline_log, "baseline"), "baseline", false, prompts,
+                          baseline_reuse);
         const std::vector<ninfer::serve::LoggedCompletion> control_edited =
-            select_edited(load(control_log, "control"), false);
+            select_edited(load(control_log, "control"), "control", false, prompts, control_reuse);
 
         const ninfer::targets::qwen3_6::detail::ScrQualityThresholds thresholds;
         // Throws when a prompt relocated nothing: a suite that never engaged Suffix Cache Reuse
@@ -631,9 +983,11 @@ int main(int argc, char** argv) {
         // which is precisely what pair_scr_quality_samples refuses.
         const auto control =
             ninfer::serve::evaluate_scr_quality_control(baseline_edited, control_edited, thresholds);
+        // Hoisted out of the block below: the first-flip detail printer walks the same samples to
+        // show the token each side chose where the streams parted, which the report does not carry.
+        const auto measurement_samples =
+            ninfer::serve::pair_scr_quality_samples(scr_edited, baseline_edited);
         {
-            const auto measurement_samples =
-                ninfer::serve::pair_scr_quality_samples(scr_edited, baseline_edited);
             const auto control_samples =
                 ninfer::serve::pair_scr_quality_samples_for_control(baseline_edited, control_edited);
             for (std::size_t i = 0; i < scored.prompts.size() && i < control_samples.size(); ++i) {
@@ -654,11 +1008,20 @@ int main(int argc, char** argv) {
                      "to its right\n  describe a prefix both runs chose identically and are "
                      "comparable; the agreement column is\n  index-aligned and is not.\n";
 
+        print_divergence_detail(prompts, measurement_samples, scored);
+        print_output_comparison(prompts, baseline_exchange, scr_exchange, control_exchange);
+        print_reuse_explainer(scr_reuse);
+
         // The envelope carries the control beside the measurement, because a report that states a
         // verdict without the floor it was measured against is not a report. The inner objects are
-        // the target's own format, so the thresholds still exist in exactly one place.
+        // the target's own format, so the thresholds still exist in exactly one place; the reuse
+        // telemetry and the outputs are the harness's own, because neither belongs to the target.
         std::ostringstream report;
-        report << "{\"attributable\":" << (attributable ? "true" : "false") << ",\"control\":"
+        report << "{\"attributable\":" << (attributable ? "true" : "false")
+               << ",\"reuse\":" << reuse_section(scr_reuse, baseline_reuse, control_reuse)
+               << ",\"outputs\":" << outputs_section(prompts, baseline_exchange, scr_exchange,
+                                                       control_exchange)
+               << ",\"control\":"
                << ninfer::targets::qwen3_6::detail::format_scr_quality_json(control, thresholds)
                << ",\"measurement\":"
                << ninfer::targets::qwen3_6::detail::format_scr_quality_json(scored, thresholds)
