@@ -46,6 +46,29 @@ double to_double(__nv_bfloat16 v) { return static_cast<double>(__bfloat162float(
 
 __nv_bfloat16 to_bf16(double v) { return __float2bfloat16(static_cast<float>(v)); }
 
+// The value the staging below writes past a column's own length. A column shorter than valid_rows is
+// a request to reduce a padded plane, not a licence to read past the fixture: the padding is part of
+// what the Op reads, so the oracle has to reduce it too.
+constexpr double kStagingPadding = -30.0;
+
+// The exact BF16 plane the Op reduces for column `t`: the column's own values followed by the
+// staging padding, truncated to valid_rows. Building this by indexing `columns[t][v]` for
+// v < valid_rows reads past the fixture when the column is shorter than valid_rows, which is
+// precisely the near-tie case below, so the length has to be honoured here rather than assumed.
+std::vector<double> staged_column(const std::vector<std::vector<double>>& columns, std::size_t t,
+                                  std::int32_t valid_rows) {
+    const std::vector<double>& source = columns[t];
+    std::vector<double> column;
+    column.reserve(static_cast<std::size_t>(valid_rows));
+    for (std::int32_t v = 0; v < valid_rows; ++v) {
+        const double value = v < static_cast<std::int32_t>(source.size())
+                                 ? source[static_cast<std::size_t>(v)]
+                                 : kStagingPadding;
+        column.push_back(to_double(to_bf16(value)));
+    }
+    return column;
+}
+
 // FP64 log-softmax of one column, evaluated from the exact values the Op will read.
 double oracle_logprob(const std::vector<double>& column, std::int32_t chosen) {
     double peak = -std::numeric_limits<double>::infinity();
@@ -102,7 +125,7 @@ struct Columns {
                         static_cast<std::size_t>(v)] =
                     v < static_cast<std::int32_t>(column.size())
                         ? to_bf16(column[static_cast<std::size_t>(v)])
-                        : to_bf16(-30.0);
+                        : to_bf16(kStagingPadding);
             }
         }
         CUDA_CHECK(cudaMalloc(&device_logits, elems * sizeof(__nv_bfloat16)));
@@ -177,11 +200,7 @@ void check(const std::vector<std::vector<double>>& columns,
         // the answer by up to half a BF16 ulp of the chosen logit, which for a logit near 5 is ~0.01
         // nats against a result of magnitude ~9. Measuring the rounding would bury the reduction's own
         // error, which is what this file exists to bound.
-        std::vector<double> column;
-        column.reserve(static_cast<std::size_t>(valid_rows));
-        for (std::int32_t v = 0; v < valid_rows; ++v) {
-            column.push_back(to_double(to_bf16(columns[t][static_cast<std::size_t>(v)])));
-        }
+        const std::vector<double> column = staged_column(columns, t, valid_rows);
         const double expected = oracle_logprob(column, picks[t]);
         const double error    =
             std::fabs(state.host_out[t] - expected) / std::max(1.0, std::fabs(expected));
@@ -199,11 +218,7 @@ void check(const std::vector<std::vector<double>>& columns,
     double margin_worst = 0.0;
     std::int32_t margin_worst_t = -1;
     for (std::size_t t = 0; t < state.host_margin.size(); ++t) {
-        std::vector<double> column;
-        column.reserve(static_cast<std::size_t>(valid_rows));
-        for (std::int32_t v = 0; v < valid_rows; ++v) {
-            column.push_back(to_double(to_bf16(columns[t][static_cast<std::size_t>(v)])));
-        }
+        const std::vector<double> column = staged_column(columns, t, valid_rows);
         const double expected = oracle_margin(column, valid_rows);
         const double got      = state.host_margin[t];
         if (expected > 1.0e30) {

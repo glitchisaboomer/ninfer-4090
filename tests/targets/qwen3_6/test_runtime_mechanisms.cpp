@@ -183,23 +183,38 @@ void test_round_logprob_binding() {
                ordinary.sampled_logprobs.ne[0] == capacity &&
                ordinary.sampled_logprobs.ne[1] == 1,
            "ordinary egress binds one FP32 logprob per decode row");
+    expect(ordinary.sampled_margins.dtype == ninfer::DType::FP32 &&
+               ordinary.sampled_margins.ne[0] == capacity &&
+               ordinary.sampled_margins.ne[1] == 1,
+           "ordinary egress binds one FP32 margin per decode row");
 
-    const auto* egress = static_cast<const unsigned char*>(ordinary.egress.data);
+    const auto* egress   = static_cast<const unsigned char*>(ordinary.egress.data);
     const auto* logprobs = static_cast<const unsigned char*>(ordinary.sampled_logprobs.data);
+    const auto* margins  = static_cast<const unsigned char*>(ordinary.sampled_margins.data);
     expect(egress != nullptr && logprobs >= egress &&
                logprobs < egress + layout.ordinary->egress.bytes,
            "ordinary logprobs live inside the decode egress region");
+    expect(egress != nullptr && margins >= egress &&
+               margins < egress + layout.ordinary->egress.bytes,
+           "ordinary margins live inside the decode egress region");
     expect(ordinary.sampled_tokens.data != ordinary.sampled_logprobs.data,
            "ordinary logprobs do not alias the sampled tokens");
+    expect(ordinary.sampled_margins.data != ordinary.sampled_tokens.data &&
+               ordinary.sampled_margins.data != ordinary.sampled_logprobs.data,
+           "ordinary margins do not alias the sampled tokens or logprobs");
 
-    // The logprob array covers the full domain, not only the live batch, so its region cannot be
-    // sized from a batch-dependent prefix.
+    // Both float arrays cover the full domain, not only the live batch, so their regions cannot be
+    // sized from a batch-dependent prefix. They follow the sampled tokens in declaration order and the
+    // struct ends after the margins; the offsets are the contract the layout binds against, so a
+    // reordered, resized, or dropped member has to fail here.
     expect(static_cast<std::size_t>(logprobs - egress) ==
                offsetof(q36::OrdinaryDecodeEgress, sampled_logprobs) &&
+               static_cast<std::size_t>(margins - egress) ==
+                   offsetof(q36::OrdinaryDecodeEgress, sampled_margins) &&
                sizeof(q36::OrdinaryDecodeEgress) ==
-                   offsetof(q36::OrdinaryDecodeEgress, sampled_logprobs) +
+                   offsetof(q36::OrdinaryDecodeEgress, sampled_margins) +
                        sizeof(std::array<float, ninfer::kMaximumConcurrency>),
-           "ordinary egress POD carries the logprobs at their declared offset");
+           "ordinary egress POD carries the logprobs and margins at their declared offsets");
 
     ::operator delete(memory, std::align_val_t{256});
 }
