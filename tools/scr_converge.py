@@ -56,18 +56,18 @@ import json
 import sys
 from pathlib import Path
 
-FIELD_GENERATED_TOKEN_IDS = "result.generated.token_ids"
-FIELD_GENERATED_LOGPROBS  = "result.generated.logprobs"
-FIELD_GENERATED_MARGINS   = "result.generated.margins"
-FIELD_PROMPT_TOKENS       = "result.prompt_tokens"
-FIELD_COMPLETION_TOKENS   = "result.completion_tokens"
-FIELD_PREFILL_TOKENS      = "result.computed_prefill_tokens"
-FIELD_RELOCATED           = "result.prefix_relocated_tokens"
-FIELD_REUSE_PATH          = "result.prefix_reuse_path"
-FIELD_CACHE_HIT           = "result.prefix_cache_hit_tokens"
-FIELD_FINISH              = "result.finish_reason"
-FIELD_REQUEST_ID          = "request.request_id"
-FIELD_SEED                = "request.sampling.seed"
+FIELD_GENERATED_TOKEN_IDS = ["result", "generated", "token_ids"]
+FIELD_GENERATED_LOGPROBS  = ["result", "generated", "logprobs"]
+FIELD_GENERATED_MARGINS   = ["result", "generated", "margins"]
+FIELD_PROMPT_TOKENS       = ["result", "prompt_tokens"]
+FIELD_COMPLETION_TOKENS   = ["result", "completion_tokens"]
+FIELD_PREFILL_TOKENS      = ["result", "computed_prefill_tokens"]
+FIELD_RELOCATED           = ["result", "prefix_relocated_tokens"]
+FIELD_REUSE_PATH          = ["result", "prefix_reuse_path"]
+FIELD_CACHE_HIT           = ["result", "prefix_cache_hit_tokens"]
+FIELD_FINISH              = ["result", "finish_reason"]
+FIELD_REQUEST_ID          = ["request", "request_id"]
+FIELD_SEED                = ["request", "sampling", "seed"]
 
 
 def load_request_done_records(paths):
@@ -87,7 +87,7 @@ def load_request_done_records(paths):
 
 
 def pick(obj, keys, default=None):
-    """Walk nested dotted key into obj, returning default on any miss."""
+    """Walk nested key path into obj, returning default on any miss."""
     cur = obj
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
@@ -200,8 +200,8 @@ def main():
     for (path, rid), grp in keyrows.items():
         tids = [g[1] for g in grp]
         ident = len({tuple(t) for t in tids}) == 1
-        print("  %-16s req=%s  records=%d  identical_within=%s  len=%d"
-              % (path, s(rid), len(grp), ident, len(tids[0])), flush=True)
+        print("  %-16s req=%s  records=%d  identical_within=%s  lens=%s"
+              % (path, s(rid), len(grp), ident, [len(t) for t in tids]), flush=True)
         if not ident:
             _show_divergence(grp, "%s/%s" % (path, rid))
 
@@ -252,7 +252,7 @@ def main():
     # Token-count convergence (cheap signal that the runs even produced the
     # same number of tokens).
     counts = [len(t) for _, t, *_ in rows]
-    if len({counts}) == 1:
+    if len(set(counts)) == 1:
         print("\n[converged] all runs produced the same number of tokens (%d)" % counts[0])
     else:
         print("\n[diverged] token counts differ: %s" % counts)
