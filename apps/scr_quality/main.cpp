@@ -568,14 +568,23 @@ std::vector<PhaseExchange> run_phase(const Options& options, const std::vector<S
 // Reuse telemetry for one prompt pair, kept beside the scores: a report that says how far the runs
 // drifted without saying how much was reused cannot be read as the K curve the roadmap asks for,
 // and `reused=0` with `relocated>0` is a shape that has to be explained rather than guessed at.
+//
+// The priming request carries its own telemetry because it is not always a cold prefill: the SCR
+// phase relocates the priming request too whenever a resident tail matches, so its reply is expected
+// to differ from a cold baseline's and the two cases have to be told apart by their paths.
 struct ReuseInfo {
     std::string name;
     std::int32_t primed_prompt_tokens     = 0;
     std::int32_t prompt_tokens            = 0;
-    std::int32_t edit_offset              = 0;
-    std::uint32_t prefix_cache_hit_tokens = 0;
-    std::uint32_t prefix_relocated_tokens = 0;
+    // The edited request's token count minus the priming request's -- a *length* delta, not the
+    // position of the edit. The built-in suite balances its edit, so this is 0 on every prompt while
+    // the edit itself sits in the middle; calling it `edit_offset` invited exactly that misreading.
+    std::int32_t length_delta               = 0;
+    std::uint32_t prefix_cache_hit_tokens   = 0;
+    std::uint32_t prefix_relocated_tokens   = 0;
     std::string prefix_reuse_path;
+    std::uint32_t primed_relocated_tokens    = 0;
+    std::string primed_reuse_path;
 };
 
 // The edited record of each prompt pair, in suite order, with the telemetry that says whether the
@@ -601,8 +610,8 @@ std::vector<ninfer::serve::LoggedCompletion> select_edited(
         // exactly this mistake, and the only symptom was that five of six prompts reported
         // full_reset with no relocation to explain it.
         constexpr std::int32_t kPageTokens = 64; // kPagedKVPageSize
-        const std::int32_t offset = edited.prompt_tokens - primed.prompt_tokens;
-        const bool aligned        = offset % kPageTokens == 0;
+        const std::int32_t length_delta   = edited.prompt_tokens - primed.prompt_tokens;
+        const bool aligned                = length_delta % kPageTokens == 0;
         const std::size_t prompt_index = index / 2;
         const std::string name = prompt_index < prompts.size()
                                      ? prompts[prompt_index].name
@@ -610,14 +619,17 @@ std::vector<ninfer::serve::LoggedCompletion> select_edited(
         std::cerr << "[" << label << "] " << name
                   << ": prompt_tokens=" << edited.prompt_tokens
                   << " primed=" << primed.prompt_tokens
-                  << " edit_offset=" << offset << (aligned ? "" : " NOT_PAGE_ALIGNED")
+                  << " length_delta=" << length_delta << (aligned ? "" : " NOT_PAGE_ALIGNED")
                   << " reused=" << edited.prefix_cache_hit_tokens
                   << " relocated=" << edited.prefix_relocated_tokens
-                  << " path=" << edited.prefix_reuse_path << "\n";
+                  << " path=" << edited.prefix_reuse_path
+                  << " primed_relocated=" << primed.prefix_relocated_tokens
+                  << " primed_path=" << primed.prefix_reuse_path << "\n";
         if (!aligned && scr) { misaligned.push_back(prompt_index); }
-        reuse.push_back(ReuseInfo{name, primed.prompt_tokens, edited.prompt_tokens, offset,
+        reuse.push_back(ReuseInfo{name, primed.prompt_tokens, edited.prompt_tokens, length_delta,
                                   edited.prefix_cache_hit_tokens, edited.prefix_relocated_tokens,
-                                  edited.prefix_reuse_path});
+                                  edited.prefix_reuse_path, primed.prefix_relocated_tokens,
+                                  primed.prefix_reuse_path});
         selected.push_back(edited);
     }
     if (!misaligned.empty()) {
@@ -719,17 +731,62 @@ std::string excerpt(const std::string& text, std::size_t limit = 200) {
     return "'" + flat + "'";
 }
 
+// A reply's comparable text. While the model is thinking, `content` is empty and the whole reply
+// lives in `reasoning`, so a comparison over `content` alone compares two empty strings on every
+// prompt that hits the output limit -- which is how the 2026-10-08 sweep reported
+// first_diff_char -1 beside lines that said the text differed. The fields are compared individually
+// in `reply_matches`; this join exists for the character diff, so a reply that finished its thinking
+// into `content` is not read as a wording change.
+std::string reply_text(const ChatReply& reply) {
+    if (reply.content.empty()) { return reply.reasoning; }
+    if (reply.reasoning.empty()) { return reply.content; }
+    return reply.content + "\n" + reply.reasoning;
+}
+
+bool reply_matches(const ChatReply& left, const ChatReply& right) {
+    return left.content == right.content && left.reasoning == right.reasoning;
+}
+
+// The window around the first difference rather than the head of the text. Two replies that share a
+// preamble and part at character 800 read as identical when both are printed from the start, which
+// is how a real difference hides next to a line announcing that the text differs. Flattening is one
+// character for one, so the index stays valid.
+std::string window_around(const std::string& text, std::size_t at, std::size_t before = 70,
+                          std::size_t after = 150) {
+    std::string flat = text;
+    for (char& character : flat) {
+        if (character == '\n' || character == '\r' || character == '\t') { character = ' '; }
+    }
+    if (at >= flat.size()) { return excerpt(flat, before + after); }
+    const std::size_t begin = at > before ? at - before : 0;
+    const std::size_t end   = std::min(flat.size(), at + after);
+    const std::string window = (begin == 0 ? std::string() : std::string("...")) +
+                               flat.substr(begin, end - begin) +
+                               (end == flat.size() ? std::string() : std::string("..."));
+    return "'" + window + "'";
+}
+
 // The flip itself, with the numbers that decide what it means. Margin is best-minus-second-best in
 // nats: a flip behind a margin of a thousandth is a coin tipped by any perturbation at all, a flip
 // against a wide margin is a decision the reuse path actually moved. Position 0 comes along too,
 // because d(first) in the report is measured there and is only readable against the margin beside
 // it. Values come straight from the request log; a server whose log predates the margin field
 // prints n/a rather than borrowing a margin from a neighbouring position.
-void print_divergence_detail(const std::vector<SuitePrompt>& prompts,
+//
+// The same detail is printed for the control as for the measurement. A control flip is the most
+// important number in the run -- it is the difference between "the reuse path moved this decision"
+// and "this prompt sits on a tie" -- and in the 2026-10-08 sweep every control flip happened behind
+// an exactly zero margin, which was visible only in the raw request log. `left_label` names the
+// sample's `baseline_*` column and `right_label` its `scr_*` column, because for the control pair
+// those columns hold the control phase and the baseline phase respectively, not scr and baseline.
+void print_divergence_detail(const char* title, const char* left_label, const char* right_label,
+                             const std::vector<SuitePrompt>& prompts,
                              const std::vector<ScrQualitySample>& samples,
                              const ScrQualityReport& scored) {
-    std::cerr << "\nFIRST-FLIP DETAIL  (measurement: --scr vs --no-scr)\n"
-                 "\n  margin = best-minus-second-best logit gap, in nats.\n";
+    std::cerr << "\n" << title
+              << "\n\n  margin = best-minus-second-best logit gap, in nats: a flip at a margin of "
+                 "zero is\n  a coin tipped by any perturbation at all, including the one between "
+                 "two runs of the\n  same configuration.\n";
     for (std::size_t i = 0; i < scored.prompts.size() && i < samples.size(); ++i) {
         const ScrQualityPromptResult& result = scored.prompts[i];
         const ScrQualitySample& sample        = samples[i];
@@ -743,16 +800,18 @@ void print_divergence_detail(const std::vector<SuitePrompt>& prompts,
             std::cerr << ": no comparable tokens\n";
             continue;
         }
-        std::cerr << "\n    pos0    logprob --no-scr " << metric(sample.baseline_logprobs[0])
-                  << "  --scr " << metric(sample.scr_logprobs[0])
-                  << "   margin --no-scr " << margin_at(sample.baseline_margins, 0)
-                  << "  --scr " << margin_at(sample.scr_margins, 0);
+        std::cerr << "\n    pos0    logprob " << left_label << " "
+                  << metric(sample.baseline_logprobs[0]) << "  " << right_label << " "
+                  << metric(sample.scr_logprobs[0]) << "   margin " << left_label << " "
+                  << margin_at(sample.baseline_margins, 0) << "  " << right_label << " "
+                  << margin_at(sample.scr_margins, 0);
         const std::size_t flip = result.first_divergence_index;
         if (flip < overlap) {
-            std::cerr << "\n    flip@" << flip << "  --no-scr token " << sample.baseline_tokens[flip]
-                      << " logprob " << metric(sample.baseline_logprobs[flip]) << " margin "
-                      << margin_at(sample.baseline_margins, flip) << "   |  --scr token "
-                      << sample.scr_tokens[flip] << " logprob "
+            std::cerr << "\n    flip@" << flip << "  " << left_label << " token "
+                      << sample.baseline_tokens[flip] << " logprob "
+                      << metric(sample.baseline_logprobs[flip]) << " margin "
+                      << margin_at(sample.baseline_margins, flip) << "   |  " << right_label
+                      << " token " << sample.scr_tokens[flip] << " logprob "
                       << metric(sample.scr_logprobs[flip]) << " margin "
                       << margin_at(sample.scr_margins, flip);
         } else {
@@ -766,61 +825,106 @@ void print_divergence_detail(const std::vector<SuitePrompt>& prompts,
 // reports what that was worth -- whether both runs still answered the question the same way, and
 // the first character at which the text reads differently.
 //
-// The primed replies are checked too: they seed the resident KV, so a primed reply that differs
-// between phases means the two sides did not start from the same state and the pair is not a clean
-// A/B. The control is checked against the baseline for the same reason in reverse: two identical
-// configurations that produce different prose would make the floor a text question as well as a
-// logprob one.
+// The text compared is the reply's `content` *and* its `reasoning`, field by field, and the window
+// shown starts at the character that differs. Comparing `content` alone compared two empty strings
+// on every prompt of the 2026-10-08 sweep -- a reply that stops at the output limit carries its
+// whole text in `reasoning` -- and printing both excerpts from the head made two replies that part
+// mid-sentence look the same.
+//
+// The priming replies are checked on the comparison that can carry a verdict. The SCR phase serves
+// its priming request through relocation whenever a resident tail matches (K >= 3 in that sweep), so
+// its priming reply is *expected* to differ from a cold baseline's; calling that "the resident KV was
+// seeded differently" blamed the feature for working. What must not differ is the control against
+// the baseline: same flags, same cold path, so a difference there means the priming request itself
+// is not reproducible and every pair built on it inherits the difference.
 void print_output_comparison(const std::vector<SuitePrompt>& prompts,
                              const std::vector<PhaseExchange>& baseline,
                              const std::vector<PhaseExchange>& scr,
-                             const std::vector<PhaseExchange>& control) {
-    std::cerr << "\nGENERATED OUTPUT  (--no-scr vs --scr, edited request)\n";
-    std::size_t identical      = 0;
-    std::size_t primed_same    = 0;
-    std::size_t control_same   = 0;
-    const std::size_t measured =
-        std::min({prompts.size(), baseline.size(), scr.size()});
+                             const std::vector<PhaseExchange>& control,
+                             const std::vector<ReuseInfo>& scr_reuse) {
+    std::cerr << "\nGENERATED OUTPUT  (--no-scr vs --scr, edited request)\n"
+                 "\n  Excerpts start at the first differing character, so a pair whose excerpts look "
+                 "similar\n  but whose difference is late has parted outside its opening."
+                 "\n";
+    std::size_t identical           = 0;
+    std::size_t primed_same         = 0;
+    std::size_t primed_by_reuse     = 0;
+    std::size_t primed_control_same = 0;
+    std::size_t control_same        = 0;
+    const std::size_t measured = std::min({prompts.size(), baseline.size(), scr.size()});
     for (std::size_t i = 0; i < measured; ++i) {
         const ChatReply& base = baseline[i].edited;
         const ChatReply& test = scr[i].edited;
-        const bool same = base.content == test.content && base.reasoning == test.reasoning;
-        const bool primed_match = baseline[i].primed.content == scr[i].primed.content &&
-                                  baseline[i].primed.reasoning == scr[i].primed.reasoning;
-        const bool control_match = i < control.size() &&
-                                   control[i].edited.content == base.content &&
-                                   control[i].edited.reasoning == base.reasoning;
+        const bool same           = reply_matches(base, test);
+        const bool primed_match   = reply_matches(baseline[i].primed, scr[i].primed);
+        const bool primed_control_match =
+            i < control.size() && reply_matches(control[i].primed, baseline[i].primed);
+        const bool control_match = i < control.size() && reply_matches(control[i].edited, base);
+        const std::uint32_t primed_relocated =
+            i < scr_reuse.size() ? scr_reuse[i].primed_relocated_tokens : 0U;
+        const std::string primed_path =
+            i < scr_reuse.size() ? scr_reuse[i].primed_reuse_path : std::string();
         identical += same ? 1U : 0U;
         primed_same += primed_match ? 1U : 0U;
+        primed_control_same += primed_control_match ? 1U : 0U;
         control_same += control_match ? 1U : 0U;
+        if (!primed_match && primed_relocated != 0) { ++primed_by_reuse; }
 
-        const std::size_t diff = first_diff(base.content, test.content);
+        // Which field carries the difference. `reasoning` is preferred while the reply is still
+        // thinking, because `content` is empty there and a window into nothing says nothing; both are
+        // compared and the field is named wherever a difference is reported.
+        const bool content_differs   = base.content != test.content;
+        const bool reasoning_differs = base.reasoning != test.reasoning;
+        const bool show_reasoning    = reasoning_differs || base.content.empty();
+        const std::string& base_text = show_reasoning ? base.reasoning : base.content;
+        const std::string& test_text = show_reasoning ? test.reasoning : test.content;
+        const char* field            = show_reasoning ? "reasoning" : "content";
+        const std::size_t diff       = first_diff(base_text, test_text);
+
         std::cerr << "\n  " << prompts[i].name << ": "
-                  << (same ? "content identical" : "CONTENT DIFFERS");
-        if (diff != std::string::npos) {
-            std::cerr << " (first differing character " << diff << ")";
+                  << (same ? "reply identical" : "REPLY DIFFERS");
+        if (content_differs || reasoning_differs) {
+            std::cerr << " (" << field << " differs at character " << diff << " of "
+                      << std::max(base_text.size(), test_text.size()) << ")";
         }
         std::cerr << ", finish --no-scr="
                   << (base.finish_reason.empty() ? "?" : base.finish_reason)
                   << " --scr=" << (test.finish_reason.empty() ? "?" : test.finish_reason);
-        if (!primed_match) {
-            std::cerr << "\n    PRIMED replies differ between phases: the resident KV was seeded "
-                         "differently,\n    so this pair is not a clean A/B";
+        if (!primed_control_match) {
+            std::cerr << "\n    PRIMING NOT REPRODUCIBLE: the control answered its own priming "
+                         "request differently\n    from the baseline (both --no-scr "
+                         "--no-prefix-reuse, both cold), so this pair is not\n    a clean A/B and "
+                         "the priming request is where to look first";
+        } else if (!primed_match && primed_relocated != 0) {
+            std::cerr << "\n    priming reply differs by design: the SCR phase relocated "
+                      << primed_relocated << " token(s) of its priming request (path="
+                      << primed_path << "), which the cold baseline cannot";
+        } else if (!primed_match) {
+            std::cerr << "\n    PRIMED replies differ with both phases on a cold prefill: the "
+                         "resident KV was\n    not built the same way";
         }
         if (!control_match) {
-            std::cerr << "\n    CONTROL prose differs from baseline: two identical "
+            std::cerr << "\n    CONTROL reply differs from baseline: two identical "
                          "configurations produced\n    different text here";
         }
-        std::cerr << "\n    --no-scr: " << excerpt(base.content)
-                  << "\n    --scr    : " << excerpt(test.content);
-        if (!base.reasoning.empty() || !test.reasoning.empty()) {
-            std::cerr << "\n    reasoning --no-scr: " << excerpt(base.reasoning)
-                      << "\n    reasoning --scr    : " << excerpt(test.reasoning);
+        if (diff != std::string::npos) {
+            std::cerr << "\n    --no-scr " << field << ": " << window_around(base_text, diff)
+                      << "\n    --scr    " << field << ": " << window_around(test_text, diff);
+        } else {
+            std::cerr << "\n    --no-scr " << field << ": " << excerpt(base_text)
+                      << "\n    --scr    " << field << ": " << excerpt(test_text);
         }
+        std::cerr << "\n";
     }
-    std::cerr << "\n  edited content identical on " << identical << "/" << measured
-              << " prompt(s); primed replies identical on " << primed_same << "/" << measured
-              << "; control matched baseline on " << control_same << "/" << measured << "\n";
+    std::cerr << "\n  edited replies identical on " << identical << "/" << measured
+              << " prompt(s) (content+reasoning); primed replies identical on " << primed_same
+              << "/" << measured << "; " << primed_by_reuse << " of the "
+              << (measured - primed_same)
+              << " that differ did so because the SCR phase relocated the priming request\n"
+              << "  (that is the feature working, not a confound); primed control vs baseline "
+                 "identical on "
+              << primed_control_same << "/" << measured << "; edited control matched baseline on "
+              << control_same << "/" << measured << "\n";
 }
 
 // `reused=` in the per-prompt lines is prefix_cache_hit_tokens, which the runtime sets from
@@ -858,10 +962,15 @@ std::string reuse_section(const std::vector<ReuseInfo>& scr, const std::vector<R
             array.push_back(Json{{"name", entry.name},
                                  {"primed_prompt_tokens", entry.primed_prompt_tokens},
                                  {"prompt_tokens", entry.prompt_tokens},
-                                 {"edit_offset", entry.edit_offset},
+                                 // The edited request's token count minus the priming request's. Not
+                                 // the position of the edit: the built-in suite balances its edit,
+                                 // so this is 0 on every prompt while the edit sits in the middle.
+                                 {"length_delta", entry.length_delta},
                                  {"prefix_cache_hit_tokens", entry.prefix_cache_hit_tokens},
                                  {"prefix_relocated_tokens", entry.prefix_relocated_tokens},
-                                 {"prefix_reuse_path", entry.prefix_reuse_path}});
+                                 {"prefix_reuse_path", entry.prefix_reuse_path},
+                                 {"primed_relocated_tokens", entry.primed_relocated_tokens},
+                                 {"primed_reuse_path", entry.primed_reuse_path}});
         }
         return array;
     };
@@ -873,11 +982,18 @@ std::string reuse_section(const std::vector<ReuseInfo>& scr, const std::vector<R
 
 // The two paths' actual prose, in the report rather than only on stderr: the artifact gets read
 // again later, and "both runs still said the same answer" is not derivable from token ids by
-// whoever reads it then. `first_diff_char` is -1 when the contents are identical.
+// whoever reads it then.
+//
+// `first_diff_char` is the index of the first differing character *within* `first_diff_field`, which
+// names the field it was measured in (`content`, `reasoning`, or `none` when both fields match). It
+// used to be measured in `content` alone, which is empty whenever the reply stops while still
+// thinking, so it read -1 on every prompt of the 2026-10-08 sweep beside `identical: false`. The two
+// `*_differs` flags say which fields moved, so a reader does not have to infer it from the window.
 std::string outputs_section(const std::vector<SuitePrompt>& prompts,
                             const std::vector<PhaseExchange>& baseline,
                             const std::vector<PhaseExchange>& scr,
-                            const std::vector<PhaseExchange>& control) {
+                            const std::vector<PhaseExchange>& control,
+                            const std::vector<ReuseInfo>& scr_reuse) {
     const auto reply = [](const ChatReply& value) {
         return Json{{"content", value.content},
                     {"reasoning", value.reasoning},
@@ -887,21 +1003,31 @@ std::string outputs_section(const std::vector<SuitePrompt>& prompts,
     for (std::size_t i = 0; i < prompts.size() && i < baseline.size() && i < scr.size(); ++i) {
         const ChatReply& base = baseline[i].edited;
         const ChatReply& test = scr[i].edited;
-        const std::size_t diff = first_diff(base.content, test.content);
+        const bool content_differs   = base.content != test.content;
+        const bool reasoning_differs = base.reasoning != test.reasoning;
+        const bool show_reasoning    = reasoning_differs || base.content.empty();
+        const std::string& base_text = show_reasoning ? base.reasoning : base.content;
+        const std::string& test_text = show_reasoning ? test.reasoning : test.content;
+        const std::size_t diff       = first_diff(base_text, test_text);
         const std::int64_t diff_char =
             diff == std::string::npos ? -1 : static_cast<std::int64_t>(diff);
         Json entry{{"name", prompts[i].name},
-                   {"identical", base.content == test.content && base.reasoning == test.reasoning},
+                   {"identical", reply_matches(base, test)},
+                   {"content_differs", content_differs},
+                   {"reasoning_differs", reasoning_differs},
+                   {"first_diff_field",
+                    (content_differs || reasoning_differs) ? (show_reasoning ? "reasoning" : "content")
+                                                           : "none"},
                    {"first_diff_char", diff_char},
-                   {"primed_identical", baseline[i].primed.content == scr[i].primed.content &&
-                                             baseline[i].primed.reasoning ==
-                                                 scr[i].primed.reasoning},
+                   {"primed_identical", reply_matches(baseline[i].primed, scr[i].primed)},
+                   {"primed_relocated_tokens",
+                    i < scr_reuse.size() ? scr_reuse[i].primed_relocated_tokens : 0U},
                    {"baseline", reply(base)},
                    {"scr", reply(test)}};
         if (i < control.size()) {
-            entry["control_identical"] =
-                control[i].edited.content == base.content &&
-                control[i].edited.reasoning == base.reasoning;
+            entry["primed_identical_control"] =
+                reply_matches(control[i].primed, baseline[i].primed);
+            entry["control_identical"] = reply_matches(control[i].edited, base);
             entry["control"] = reply(control[i].edited);
         }
         array.push_back(std::move(entry));
@@ -987,13 +1113,16 @@ int main(int argc, char** argv) {
         // show the token each side chose where the streams parted, which the report does not carry.
         const auto measurement_samples =
             ninfer::serve::pair_scr_quality_samples(scr_edited, baseline_edited);
-        {
-            const auto control_samples =
-                ninfer::serve::pair_scr_quality_samples_for_control(baseline_edited, control_edited);
-            for (std::size_t i = 0; i < scored.prompts.size() && i < control_samples.size(); ++i) {
-                scored.prompts[i] = ninfer::targets::qwen3_6::detail::evaluate_scr_prompt_against_control(
-                    measurement_samples[i], control_samples[i], thresholds);
-            }
+        // Kept past the floor loop below: the first-flip detail is worth exactly as much on the
+        // control as on the measurement, and a control flip behind a 0.0-nat margin is the difference
+        // between "the reuse path moved this decision" and "this prompt sits on a tie". In the
+        // 2026-10-08 sweep every control flip was the latter, and it was visible only in the raw
+        // request log because only the measurement reached the detail printer.
+        const auto control_samples =
+            ninfer::serve::pair_scr_quality_samples_for_control(baseline_edited, control_edited);
+        for (std::size_t i = 0; i < scored.prompts.size() && i < control_samples.size(); ++i) {
+            scored.prompts[i] = ninfer::targets::qwen3_6::detail::evaluate_scr_prompt_against_control(
+                measurement_samples[i], control_samples[i], thresholds);
         }
         const std::vector<std::uint32_t> unattributable =
             ninfer::targets::qwen3_6::detail::scr_quality_control_divergent_prompts(control);
@@ -1008,8 +1137,15 @@ int main(int argc, char** argv) {
                      "to its right\n  describe a prefix both runs chose identically and are "
                      "comparable; the agreement column is\n  index-aligned and is not.\n";
 
-        print_divergence_detail(prompts, measurement_samples, scored);
-        print_output_comparison(prompts, baseline_exchange, scr_exchange, control_exchange);
+        print_divergence_detail("FIRST-FLIP DETAIL  (measurement: --scr vs --no-scr)", "--no-scr",
+                                "--scr", prompts, measurement_samples, scored);
+        // The columns are named, not implied: these samples hold the baseline phase in the `scr_*`
+        // column and the control phase in the `baseline_*` column, because that is the order the
+        // control was paired in. A label borrowed from the measurement would print the two runs
+        // under each other's names.
+        print_divergence_detail("FIRST-FLIP DETAIL  (control: baseline run 2 vs baseline run 1)",
+                                "control", "baseline", prompts, control_samples, control);
+        print_output_comparison(prompts, baseline_exchange, scr_exchange, control_exchange, scr_reuse);
         print_reuse_explainer(scr_reuse);
 
         // The envelope carries the control beside the measurement, because a report that states a
@@ -1020,7 +1156,7 @@ int main(int argc, char** argv) {
         report << "{\"attributable\":" << (attributable ? "true" : "false")
                << ",\"reuse\":" << reuse_section(scr_reuse, baseline_reuse, control_reuse)
                << ",\"outputs\":" << outputs_section(prompts, baseline_exchange, scr_exchange,
-                                                       control_exchange)
+                                                       control_exchange, scr_reuse)
                << ",\"control\":"
                << ninfer::targets::qwen3_6::detail::format_scr_quality_json(control, thresholds)
                << ",\"measurement\":"
