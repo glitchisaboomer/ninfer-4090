@@ -309,6 +309,40 @@ for.
 justifies the feature is a long reused prefix with an edit invalidating a long suffix. A suite that
 does not exercise that measures SCR where it does nothing useful, and reports a meaningless speedup.
 
+### The harness as it exists now (2026-10-08)
+
+```powershell
+build-ninja\apps\ninfer-scr-quality.exe --model .\models\qwen3_8_27b.ninfer `
+  --work-dir scr-quality-run2 --keep-logs --scr-diag --flag-control --max-tokens 512
+```
+
+Four phases, each a fresh server on its own port, one prompt pair at a time:
+
+| phase | flags | what its comparison is |
+| --- | --- | --- |
+| `scr` | `--scr --scr-mode tail` | the measurement |
+| `baseline` | `--no-scr --no-prefix-reuse` | the reference |
+| `control` | same as baseline | the **run-to-run floor**: what two identical runs disagree by |
+| `flag` (opt-in) | same as `scr` plus `--scr-max-spans 0` | the **configuration floor**: what the SCR flags alone cost, with relocation switched off |
+
+The two floors exist because the phases being compared differ in more than relocation. `control`
+shares the baseline's flags and cannot see the configuration; `flag` carries the SCR flags and
+relocates nothing, and the harness **asserts that it relocated no token on any request** (`0` is
+accepted by `--scr-max-spans` for exactly this). The row that isolates relocation is `scr` against
+`flag` — identical flags on both sides — which the `ATTRIBUTION` table prints per prompt beside both
+floors. Read the measurement against the larger of the two, never against zero.
+
+Everything the phases print — the harness's own sections, the runtime's `[scr-diag]` lines (written
+inside the spawned server), and the server's banner, whose `graphs=` budget is how a phase-dependent
+CUDA-graph capture set becomes visible — is teed to `<work-dir>/console.log` **and** the terminal.
+The tee works at the descriptor level, not on a stream buffer, because the children inherit fd 1 and
+2: a streambuf tee would silently drop every line a child writes. `--log -` turns it off.
+
+With `thinking` on, a 64-token budget cuts every reply off mid-thought (`finish_reason=length`,
+`content` empty), so `--max-tokens 512` is what makes "did both paths answer the same" answerable at
+all. The `outputs` section diffs `content` and `reasoning` separately and prints the window at the
+first differing character.
+
 ---
 
 ## 4. The bug that was found, and what it teaches

@@ -101,7 +101,9 @@ std::string serve_usage_text(const char* argv0) {
            "                              edit, reuse resident KV for the surviving suffix instead\n"
            "                              of re-prefilling it (experimental; off by default)\n"
            "  --scr-max-spans <N>         Maximum surviving spans relocated per edit (default: " +
-               std::to_string(kDefaultSuffixReuseMaxSpans) + ")\n"
+               std::to_string(kDefaultSuffixReuseMaxSpans) +
+               "; 0 keeps --scr set and\n"
+               "                              relocates nothing, for a configuration control)\n"
            "  --scr-mode <tail|segmented> Relocation shape to plan for: 'tail' uses one contiguous\n"
            "                              surviving run, 'segmented' the general case (default: tail)\n"
            "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
@@ -265,9 +267,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_suffix_cache_reuse = false;
         } else if (arg == "--scr-max-spans" || arg == "--suffix-reuse-max-spans") {
             const int val = parse_nonnegative_int(require_value(arg.c_str()), arg.c_str());
-            if (val <= 0) {
-                throw std::invalid_argument(std::string(arg) + " must be positive");
-            }
+            // 0 is accepted on purpose: it leaves `--scr` set and switches relocation off, which is
+            // what a configuration control needs -- an SCR run whose flags match a real one except
+            // that no span is ever relocated. Negatives are still rejected by the parser above, and
+            // the planner already treats 0 as "do not plan anything".
             options.suffix_reuse_max_spans = static_cast<std::uint32_t>(val);
         } else if (arg == "--scr-mode" || arg == "--suffix-reuse-mode") {
             const std::string mode(require_value(arg.c_str()));

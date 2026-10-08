@@ -33,6 +33,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -51,9 +52,12 @@
 #include "httplib.h"
 
 #if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
 #    include <process.h>
 #    include <windows.h>
 #else
+#    include <poll.h>
 #    include <signal.h>
 #    include <spawn.h>
 #    include <sys/wait.h>
@@ -108,6 +112,13 @@ struct Options {
     // which is the only channel that shows the applied plan, the page remap, and any refusal the
     // planner made. Without it the harness can only report what it asked for, never what happened.
     bool scr_diag = false;
+    // A fourth phase: the SCR flags with relocation switched off (`--scr --scr-max-spans 0`). Its
+    // difference from the baseline is the cost of the configuration alone, which the run-to-run
+    // control cannot see -- two baseline runs share their flags, and the flags are exactly what
+    // differs between the two phases being compared.
+    bool flag_control = false;
+    // Where the console tee writes. Empty means <work-dir>/console.log; "-" disables the tee.
+    std::string console_log;
 };
 
 struct SuitePrompt {
@@ -134,7 +145,13 @@ struct SuitePrompt {
               << "  --api-key <key>               bearer token, when the server requires one\n"
               << "  --json <file|->               report file; "-" writes it to stdout instead\n"
               << "                                (default: <work-dir>/scr-quality.json)\n"
+              << "  --log <file|->                tee stdout and stderr -- this process and every\n"
+                 "                                server it spawns -- to a file as well as the terminal\n"
+                 "                                (default: <work-dir>/console.log)\n"
               << "  --keep-logs                   leave the request logs in place on success\n"
+              << "  --flag-control                add a phase that runs the SCR flags with relocation\n"
+                 "                                disabled, scored against the baseline as the\n"
+                 "                                configuration floor\n"
               << "  --scr-diag                    set NINFER_SCR_DIAG=1 for the spawned servers, so each\n"
                  "                                prints its applied relocation plan, page remap, and any\n"
                  "                                planner refusal to this console\n";
@@ -206,6 +223,10 @@ Options parse_options(int argc, char** argv) {
             options.prompts_per_k = positive_int(value_of(index), "--prompts-per-k");
         } else if (arg == "--keep-logs") {
             options.keep_logs = true;
+        } else if (arg == "--log") {
+            options.console_log = value_of(index);
+        } else if (arg == "--flag-control") {
+            options.flag_control = true;
         } else if (arg == "--scr-diag") {
             options.scr_diag = true;
         } else if (arg == "--k-blocks") {
@@ -431,6 +452,195 @@ private:
     bool running_ = false;
 };
 
+// A tee for this process's console: everything written to stdout or stderr -- the harness's own
+// diagnostics *and* the output of every ninfer-serve it spawns -- is shown on the terminal and
+// written to one file.
+//
+// The redirection is at the descriptor level, not a stream-buffer swap. A stream-buffer tee would
+// capture only what this process writes through C++ streams, and the lines worth keeping are not
+// those: the runtime's own relocation diagnostics (`[scr-diag]`, written inside the child) and the
+// server's startup banner -- including the CUDA-graph budget, `graphs=`, which is how a
+// phase-dependent capture set becomes visible -- belong to the spawned servers. Pointing fd 1 and 2
+// at a pipe captures a child's output whether or not the child knows the tee exists, because it
+// inherits those descriptors.
+//
+// The reader polls rather than blocking on a read, so `stop()` cannot hang behind a descriptor some
+// child leaked: after the descriptors are restored the reader takes one last drain and exits.
+class ConsoleTee {
+public:
+    ConsoleTee()                               = default;
+    ConsoleTee(const ConsoleTee&)              = delete;
+    ConsoleTee& operator=(const ConsoleTee&)   = delete;
+    ~ConsoleTee() { stop(); }
+
+    // An empty path or "-" leaves the console alone. On failure the console is left as it was and
+    // `error` says why: a harness that cannot log is still a harness that can measure.
+    bool start(const std::string& path, std::string& error);
+    // Restores the descriptors, drains, and joins the reader. Idempotent, and safe from a destructor.
+    void stop() noexcept;
+
+private:
+    // True when there is something to read. Non-blocking on purpose: see the class comment.
+    [[nodiscard]] bool readable() const;
+    // One read-and-forward step. False when the pipe has nothing to give right now.
+    bool drain_once();
+
+    std::ofstream file_;
+    int saved_stdout_ = -1;
+    int saved_stderr_ = -1;
+    int read_fd_      = -1;
+    bool active_      = false;
+    std::thread reader_;
+    std::atomic<bool> stopping_{false};
+};
+
+bool ConsoleTee::start(const std::string& path, std::string& error) {
+    if (path.empty() || path == "-") { return true; }
+    file_.open(path, std::ios::binary | std::ios::trunc);
+    if (!file_) {
+        error = "cannot write the console log " + path;
+        return false;
+    }
+    // Anything already written must reach the terminal before the descriptors move under it.
+    std::cerr.flush();
+    std::cout.flush();
+
+    int pipe_fds[2] = {-1, -1};
+#if defined(_WIN32)
+    // Text mode on purpose: the CRT then translates a lone LF to CRLF for both the children and this
+    // process, so the file gets the line endings a Windows editor expects and the terminal shows the
+    // forwarded bytes as they were written.
+    if (::_pipe(pipe_fds, 64 * 1024, _O_TEXT) != 0) {
+        error = "cannot create the console pipe";
+        file_.close();
+        return false;
+    }
+    saved_stdout_ = ::_dup(1);
+    saved_stderr_ = ::_dup(2);
+#else
+    if (::pipe(pipe_fds) != 0) {
+        error = "cannot create the console pipe";
+        file_.close();
+        return false;
+    }
+    saved_stdout_ = ::dup(1);
+    saved_stderr_ = ::dup(2);
+#endif
+    if (saved_stdout_ < 0 || saved_stderr_ < 0) {
+#if defined(_WIN32)
+        ::_close(pipe_fds[0]);
+        ::_close(pipe_fds[1]);
+        if (saved_stdout_ >= 0) { ::_close(saved_stdout_); }
+        if (saved_stderr_ >= 0) { ::_close(saved_stderr_); }
+#else
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        if (saved_stdout_ >= 0) { ::close(saved_stdout_); }
+        if (saved_stderr_ >= 0) { ::close(saved_stderr_); }
+#endif
+        saved_stdout_ = -1;
+        saved_stderr_ = -1;
+        error         = "cannot duplicate the console descriptors";
+        file_.close();
+        return false;
+    }
+    // Both streams point at the pipe, so a spawned server is captured on either one, and so is this
+    // process's own std::cout/std::cerr. The extra write descriptor is closed here: fd 1 and 2 hold
+    // the only references this process needs, and keeping a third would stop the reader from seeing
+    // EOF when they are restored.
+#if defined(_WIN32)
+    ::_dup2(pipe_fds[1], 1);
+    ::_dup2(pipe_fds[1], 2);
+    ::_close(pipe_fds[1]);
+#else
+    ::dup2(pipe_fds[1], 1);
+    ::dup2(pipe_fds[1], 2);
+    ::close(pipe_fds[1]);
+#endif
+    read_fd_ = pipe_fds[0];
+    active_  = true;
+    reader_  = std::thread([this] {
+        while (true) {
+            if (drain_once()) { continue; }
+            if (stopping_.load()) {
+                // One last drain: bytes can land between the availability check and the flag.
+                while (drain_once()) {}
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        }
+    });
+    return true;
+}
+
+bool ConsoleTee::readable() const {
+    if (read_fd_ < 0) { return false; }
+#if defined(_WIN32)
+    const HANDLE handle = reinterpret_cast<HANDLE>(::_get_osfhandle(read_fd_));
+    if (handle == INVALID_HANDLE_VALUE) { return false; }
+    DWORD waiting = 0;
+    if (::PeekNamedPipe(handle, nullptr, 0, nullptr, &waiting, nullptr) == 0) { return false; }
+    return waiting != 0;
+#else
+    struct pollfd probe{read_fd_, POLLIN, 0};
+    return ::poll(&probe, 1, 0) > 0;
+#endif
+}
+
+bool ConsoleTee::drain_once() {
+    if (!readable()) { return false; }
+    char buffer[16384];
+#if defined(_WIN32)
+    const int bytes = ::_read(read_fd_, buffer, static_cast<unsigned>(sizeof buffer));
+#else
+    const ssize_t bytes = ::read(read_fd_, buffer, sizeof buffer);
+#endif
+    if (bytes <= 0) { return false; }
+    file_.write(buffer, bytes);
+    file_.flush();
+    // The terminal gets the bytes through the descriptor this process started with. Everything is
+    // forwarded to stdout rather than to stderr, because a run that is being piped is piping stdout;
+    // a reader who wants the streams separated has the file and the per-phase request logs.
+#if defined(_WIN32)
+    (void)::_write(saved_stdout_, buffer, static_cast<unsigned>(bytes));
+#else
+    (void)::write(saved_stdout_, buffer, static_cast<std::size_t>(bytes));
+#endif
+    return true;
+}
+
+void ConsoleTee::stop() noexcept {
+    if (!active_) { return; }
+    active_ = false;
+    std::cerr.flush();
+    std::cout.flush();
+    // Restoring the descriptors drops this process's references to the pipe's write end. The reader
+    // still writes to the saved descriptors, so they are closed only after it has been joined.
+#if defined(_WIN32)
+    if (saved_stdout_ >= 0) { ::_dup2(saved_stdout_, 1); }
+    if (saved_stderr_ >= 0) { ::_dup2(saved_stderr_, 2); }
+#else
+    if (saved_stdout_ >= 0) { ::dup2(saved_stdout_, 1); }
+    if (saved_stderr_ >= 0) { ::dup2(saved_stderr_, 2); }
+#endif
+    stopping_.store(true);
+    if (reader_.joinable()) { reader_.join(); }
+#if defined(_WIN32)
+    if (saved_stdout_ >= 0) { ::_close(saved_stdout_); }
+    if (saved_stderr_ >= 0) { ::_close(saved_stderr_); }
+    if (read_fd_ >= 0) { ::_close(read_fd_); }
+#else
+    if (saved_stdout_ >= 0) { ::close(saved_stdout_); }
+    if (saved_stderr_ >= 0) { ::close(saved_stderr_); }
+    if (read_fd_ >= 0) { ::close(read_fd_); }
+#endif
+    saved_stdout_ = -1;
+    saved_stderr_ = -1;
+    read_fd_      = -1;
+    file_.flush();
+    file_.close();
+}
+
 void wait_for_health(const Options& options, int port, ServerProcess& server) {
     httplib::Client client("127.0.0.1", port);
     client.set_connection_timeout(2, 0);
@@ -531,7 +741,8 @@ std::string read_file(const std::string& path) {
 // control run the same flags, and printing both as "baseline" made them read as one phase.
 std::vector<PhaseExchange> run_phase(const Options& options, const std::vector<SuitePrompt>& prompts,
                                      bool scr, int port, const std::string& log_path,
-                                     const char* label) {
+                                     const char* label,
+                                     const std::vector<std::string>& phase_args = {}) {
     std::remove(log_path.c_str());
     const std::vector<std::string> extra = [&] {
         std::vector<std::string> args = split_whitespace(options.server_args);
@@ -539,6 +750,9 @@ std::vector<PhaseExchange> run_phase(const Options& options, const std::vector<S
             const std::vector<std::string> baseline = split_whitespace(options.baseline_server_args);
             args.insert(args.end(), baseline.begin(), baseline.end());
         }
+        // Last, so a phase can override the earlier flags: the flag control appends
+        // `--scr-max-spans 0` to an otherwise ordinary SCR command line.
+        args.insert(args.end(), phase_args.begin(), phase_args.end());
         return args;
     }();
     const std::vector<std::string> args = ninfer::serve::build_scr_quality_server_arguments(
@@ -927,6 +1141,60 @@ void print_output_comparison(const std::vector<SuitePrompt>& prompts,
               << control_same << "/" << measured << "\n";
 }
 
+// The measurement against every floor the run has, per prompt. Two floors, because the two phases
+// being compared differ in more than relocation: the run-to-run control shares the baseline's flags
+// and cannot see the configuration, while the flag phase carries the SCR flags with relocation
+// disabled and cannot see the reuse. A divergence that sits inside or behind either one is not
+// evidence about relocation, and this is the table that says so without re-reading three others.
+//
+// The last row is the one the comparison was after all along: the SCR run against the
+// relocation-disabled run, which have identical flags, so whatever it shows is relocation's.
+void print_attribution_table(const std::vector<SuitePrompt>& prompts,
+                             const std::vector<ScrQualitySample>& measurement,
+                             const std::vector<ScrQualitySample>& noise,
+                             const std::vector<ScrQualitySample>& config_floor,
+                             const std::vector<ScrQualitySample>& relocation_only,
+                             const ninfer::targets::qwen3_6::detail::ScrQualityThresholds& thresholds) {
+    std::cerr << "\nATTRIBUTION  (the measurement against both floors it has to clear)\n"
+                 "\n  Every row is measured against the same baseline run, so `parted@` is comparable\n"
+                 "  across rows: a smaller one means the two streams parted sooner.\n";
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        std::cerr << "\n  " << prompts[i].name << "\n";
+        // Evaluated by the target's own scorer, so the arithmetic here is not a second implementation
+        // of `d(first)`/`d(mean)` that can drift from the report's.
+        const auto line = [&](const std::vector<ScrQualitySample>& samples) -> std::string {
+            if (i >= samples.size()) { return "n/a"; }
+            const auto result = ninfer::targets::qwen3_6::detail::evaluate_scr_prompt(samples[i], thresholds);
+            std::ostringstream out;
+            out.precision(6);
+            out << "d(first) " << std::fixed << result.first_token_divergence << "  parted@ "
+                << result.first_divergence_index << "  d(mean) " << result.mean_logprob_divergence;
+            return out.str();
+        };
+        std::cerr << "    measurement      scr vs --no-scr                       " << line(measurement)
+                  << "\n";
+        std::cerr << "    noise floor      --no-scr vs --no-scr (2nd run)        " << line(noise)
+                  << "\n";
+        std::cerr << "    config floor     --scr --scr-max-spans 0 vs --no-scr  " << line(config_floor)
+                  << "\n";
+        std::cerr << "    relocation only  scr vs --scr --scr-max-spans 0        " << line(relocation_only)
+                  << "\n";
+        if (i < relocation_only.size() && i < config_floor.size()) {
+            const auto relocated =
+                ninfer::targets::qwen3_6::detail::evaluate_scr_prompt(relocation_only[i], thresholds);
+            const auto flagged =
+                ninfer::targets::qwen3_6::detail::evaluate_scr_prompt(config_floor[i], thresholds);
+            const bool ahead = relocated.first_divergence_index < flagged.first_divergence_index;
+            std::cerr << "    verdict          "
+                      << (ahead
+                              ? "relocation parts the streams sooner than the configuration alone"
+                              : "the configuration alone parts them no later -- the flags are the "
+                                "candidate, not the reuse")
+                      << "\n";
+        }
+    }
+}
+
 // `reused=` in the per-prompt lines is prefix_cache_hit_tokens, which the runtime sets from
 // `reuse_base`: the length of the prefix that matches the resident sequence *in full*. An
 // in-the-middle edit defeats that match however long the shared head is, so the line reads 0 while
@@ -955,7 +1223,8 @@ void print_reuse_explainer(const std::vector<ReuseInfo>& scr_reuse) {
 // thresholds are read against it: divergence that grows with the relocated span is a different
 // finding from divergence that does not, and the K axis of the roadmap's Figure 13 lives here.
 std::string reuse_section(const std::vector<ReuseInfo>& scr, const std::vector<ReuseInfo>& baseline,
-                          const std::vector<ReuseInfo>& control) {
+                          const std::vector<ReuseInfo>& control,
+                          const std::vector<ReuseInfo>& flag) {
     const auto entries = [](const std::vector<ReuseInfo>& phase) {
         Json array = Json::array();
         for (const ReuseInfo& entry : phase) {
@@ -974,9 +1243,13 @@ std::string reuse_section(const std::vector<ReuseInfo>& scr, const std::vector<R
         }
         return array;
     };
+    // The flag phase relocates nothing by construction, so its entries are the assertion that the
+    // configuration control really was one -- kept in the report, because that is what a reader
+    // checking the run later has to go on.
     return Json{{"scr", entries(scr)},
                 {"baseline", entries(baseline)},
-                {"control", entries(control)}}
+                {"control", entries(control)},
+                {"flag", entries(flag)}}
         .dump();
 }
 
@@ -1041,9 +1314,25 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         std::filesystem::create_directories(options.work_dir);
+        // Installed before the first server exists, so the children inherit the pipe and every phase's
+        // console output -- the harness's diagnostics, the runtime's `[scr-diag]` lines, and the
+        // server's own banner with its CUDA-graph budget -- is both shown and kept.
+        ConsoleTee tee;
+        {
+            const std::string console_path = options.console_log.empty()
+                                                 ? options.work_dir + "/console.log"
+                                                 : options.console_log;
+            std::string tee_error;
+            if (!tee.start(console_path, tee_error)) {
+                std::cerr << "warning: " << tee_error << "; continuing without a console log\n";
+            } else if (options.console_log != "-") {
+                std::cerr << "console log: " << console_path << " (also on the terminal)\n";
+            }
+        }
         const std::string scr_log      = options.work_dir + "/scr.jsonl";
         const std::string baseline_log = options.work_dir + "/baseline.jsonl";
         const std::string control_log  = options.work_dir + "/control.jsonl";
+        const std::string flag_log     = options.work_dir + "/flag.jsonl";
         const std::vector<SuitePrompt> prompts = build_suite(options);
         const std::string report_path = (options.json_out.empty() || options.json_out == "-")
                                             ? options.work_dir + "/scr-quality.json"
@@ -1077,6 +1366,16 @@ int main(int argc, char** argv) {
        // that grows with the reused region looks like.
         const std::vector<PhaseExchange> control_exchange =
             run_phase(options, prompts, false, options.port + 2, control_log, "control");
+        // The flag control, when asked for: the same SCR command line with relocation switched off.
+        // The run-to-run control cannot see the difference between "relocation perturbed this" and
+        // "the SCR configuration perturbed this", because the two phases it compares have different
+        // flags; this phase has the SCR flags and no relocation, so the gap between it and the real
+        // SCR run is relocation's alone.
+        std::vector<PhaseExchange> flag_exchange;
+        if (options.flag_control) {
+            flag_exchange = run_phase(options, prompts, true, options.port + 3, flag_log, "flag",
+                                      {"--scr-max-spans", "0"});
+        }
 
         const auto load = [&](const std::string& path, const char* phase) {
             const std::vector<ninfer::serve::LoggedCompletion> completions =
@@ -1097,6 +1396,25 @@ int main(int argc, char** argv) {
                           baseline_reuse);
         const std::vector<ninfer::serve::LoggedCompletion> control_edited =
             select_edited(load(control_log, "control"), "control", false, prompts, control_reuse);
+        std::vector<ReuseInfo> flag_reuse;
+        std::vector<ninfer::serve::LoggedCompletion> flag_edited;
+        if (options.flag_control) {
+            flag_edited = select_edited(load(flag_log, "flag"), "flag", false, prompts, flag_reuse);
+            // The phase is only a configuration control if relocation really did not run. Checked
+            // rather than assumed: `--scr-max-spans 0` is what is supposed to disable it, and a
+            // silent regression there would turn this phase into a second baseline run that reads
+            // like a clean floor.
+            for (const ReuseInfo& entry : flag_reuse) {
+                if (entry.prefix_relocated_tokens != 0 || entry.primed_relocated_tokens != 0) {
+                    throw std::runtime_error(
+                        "the flag control relocated " +
+                        std::to_string(entry.prefix_relocated_tokens) + " token(s) on " + entry.name +
+                        " (primed " + std::to_string(entry.primed_relocated_tokens) +
+                        "); --scr-max-spans 0 did not disable relocation, so this phase is not a "
+                        "configuration control");
+                }
+            }
+        }
 
         const ninfer::targets::qwen3_6::detail::ScrQualityThresholds thresholds;
         // Throws when a prompt relocated nothing: a suite that never engaged Suffix Cache Reuse
@@ -1129,9 +1447,28 @@ int main(int argc, char** argv) {
         const bool attributable =
             ninfer::targets::qwen3_6::detail::scr_quality_control_is_clean(control);
 
+        // The flag phase scored against the baseline, and the two pairings the attribution table
+        // needs. `pair_*_for_control` puts its first argument in `scr_*` and its second in
+        // `baseline_*`, so each call below names the order it wants on purpose.
+        ninfer::targets::qwen3_6::detail::ScrQualityReport flag_report;
+        std::vector<ScrQualitySample> config_floor_samples;
+        std::vector<ScrQualitySample> relocation_only_samples;
+        if (options.flag_control) {
+            flag_report = ninfer::serve::evaluate_scr_quality_control(baseline_edited, flag_edited,
+                                                                      thresholds);
+            config_floor_samples =
+                ninfer::serve::pair_scr_quality_samples_for_control(baseline_edited, flag_edited);
+            relocation_only_samples =
+                ninfer::serve::pair_scr_quality_samples_for_control(scr_edited, flag_edited);
+        }
+
         print_curve("MEASUREMENT  scr vs baseline", prompts, scr_edited, scored, true);
         print_curve("CONTROL  baseline vs baseline (the noise floor)", prompts, baseline_edited,
                     control, false);
+        if (options.flag_control) {
+            print_curve("FLAG CONTROL  --scr --scr-max-spans 0 vs baseline (relocation off, flags on)",
+                        prompts, flag_edited, flag_report, false);
+        }
 
         std::cerr << "\n  parted@ is the first greedy token the two runs disagreed on, so the columns "
                      "to its right\n  describe a prefix both runs chose identically and are "
@@ -1145,8 +1482,21 @@ int main(int argc, char** argv) {
         // under each other's names.
         print_divergence_detail("FIRST-FLIP DETAIL  (control: baseline run 2 vs baseline run 1)",
                                 "control", "baseline", prompts, control_samples, control);
+        if (options.flag_control) {
+            print_divergence_detail(
+                "FIRST-FLIP DETAIL  (flag control: --scr --scr-max-spans 0 vs --no-scr)", "flag",
+                "--no-scr", prompts, config_floor_samples, flag_report);
+            print_attribution_table(prompts, measurement_samples, control_samples, config_floor_samples,
+                                    relocation_only_samples, thresholds);
+        }
         print_output_comparison(prompts, baseline_exchange, scr_exchange, control_exchange, scr_reuse);
         print_reuse_explainer(scr_reuse);
+        if (options.flag_control) {
+            std::cerr << "\n  The flag control relocated no token on any request (asserted, not assumed): "
+                         "it ran the SCR\n  command line with `--scr-max-spans 0`, so its divergence from "
+                         "the baseline is what the\n  flags alone cost. Read the measurement against "
+                         "both floors above, never against zero.\n";
+        }
 
         // The envelope carries the control beside the measurement, because a report that states a
         // verdict without the floor it was measured against is not a report. The inner objects are
@@ -1154,14 +1504,20 @@ int main(int argc, char** argv) {
         // telemetry and the outputs are the harness's own, because neither belongs to the target.
         std::ostringstream report;
         report << "{\"attributable\":" << (attributable ? "true" : "false")
-               << ",\"reuse\":" << reuse_section(scr_reuse, baseline_reuse, control_reuse)
+               << ",\"reuse\":" << reuse_section(scr_reuse, baseline_reuse, control_reuse, flag_reuse)
                << ",\"outputs\":" << outputs_section(prompts, baseline_exchange, scr_exchange,
                                                        control_exchange, scr_reuse)
                << ",\"control\":"
                << ninfer::targets::qwen3_6::detail::format_scr_quality_json(control, thresholds)
                << ",\"measurement\":"
-               << ninfer::targets::qwen3_6::detail::format_scr_quality_json(scored, thresholds)
-               << "}\n";
+               << ninfer::targets::qwen3_6::detail::format_scr_quality_json(scored, thresholds);
+        // Only when the phase ran: an empty "flag" section would read as a flag control that came
+        // back clean rather than as one that was never taken.
+        if (options.flag_control) {
+            report << ",\"flag\":"
+                   << ninfer::targets::qwen3_6::detail::format_scr_quality_json(flag_report, thresholds);
+        }
+        report << "}\n";
 
         if (options.json_out == "-") {
             std::cout << report.str();
@@ -1179,6 +1535,7 @@ int main(int argc, char** argv) {
             std::remove(scr_log.c_str());
             std::remove(baseline_log.c_str());
             std::remove(control_log.c_str());
+            if (options.flag_control) { std::remove(flag_log.c_str()); }
         }
         if (!attributable) {
             std::cerr << "\nUNATTRIBUTABLE: the control chose a different token than itself on "

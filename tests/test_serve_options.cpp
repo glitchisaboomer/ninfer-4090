@@ -311,6 +311,21 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    // 0 spans is a configuration control, not a mistake: --scr stays set so the run carries the same
+    // flags as a relocating one, and the planner relocates nothing. Rejecting it would leave the
+    // scr-quality harness unable to separate "the SCR flags changed this run" from "relocation
+    // changed this run", which is the difference between an attributable measurement and a confound.
+    const ServeOptions no_relocation =
+        parse({"ninfer-serve", "model.ninfer", "--scr", "--scr-mode", "tail", "--scr-max-spans", "0"});
+    failures += check(no_relocation.enable_suffix_cache_reuse,
+                      "--scr did not enable suffix cache reuse");
+    failures += check(no_relocation.suffix_reuse_max_spans == 0,
+                      "--scr-max-spans 0 was rejected or not stored as relocation-disabled");
+    failures += check(no_relocation.scr_plan_segmented == false,
+                      "--scr-mode tail did not select tail relocation");
+    failures += check(defaults.suffix_reuse_max_spans == kDefaultSuffixReuseMaxSpans,
+                      "--scr-max-spans default mismatch");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
