@@ -49,13 +49,6 @@ function(ninfer_add_op_test name)
   endif()
 endfunction()
 
-# The rope-delta plane's shape, sizing and per-page rule. Registered as a host test precisely because
-# docs/SCR_QUANTIZED_KV_RELOCATION.md records that `paged_kv_cache.h` includes <cuda_runtime_api.h>,
-# so the arithmetic had to be pulled into a CUDA-free header before it could be tested anywhere
-# without a toolchain.
-ninfer_add_host_test(ninfer_paged_kv_delta_layout_test
-  SOURCES test_paged_kv_delta_layout.cpp)
-
 # A test whose sources carry no CUDA dependency and link no library, the way
 # `targets/qwen3_6/impl/runtime/scr_quality.h` is built and tested. Such a test runs on a machine
 # with no nvcc and no GPU, which makes it the opposite of a convenience: it is the test that still
@@ -79,6 +72,13 @@ function(ninfer_add_host_test name)
   endif()
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
+
+# The rope-delta plane's shape, sizing and per-page rule. Registered as a host test precisely because
+# docs/SCR_QUANTIZED_KV_RELOCATION.md records that `paged_kv_cache.h` includes <cuda_runtime_api.h>,
+# so the arithmetic had to be pulled into a CUDA-free header before it could be tested anywhere
+# without a toolchain.
+ninfer_add_host_test(ninfer_paged_kv_delta_layout_test
+  SOURCES test_paged_kv_delta_layout.cpp)
 
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
