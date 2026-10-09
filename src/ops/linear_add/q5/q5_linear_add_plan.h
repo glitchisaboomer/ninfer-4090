@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/linear_add/q5/q5_linear_add_catalog.h"
+
 #include "core/arena.h"
 
 #include <cuda_runtime.h>
@@ -9,29 +11,9 @@
 
 namespace ninfer::ops::detail {
 
-enum class Q5LinearAddScheduleId {
-    GemvResidual,
-    Split2ExactResidual,
-    MmaResidualR64C16,
-    MmaResidualR64C24,
-    MmaResidualR64C32,
-    MmaResidualR64C64,
-    MmaResidualR64C128,
-};
-
-struct Q5LinearAddProblem {
-    std::int32_t rows;
-    std::int32_t k;
-    std::int32_t padded_k;
-    std::int32_t cols;
-};
-
-struct Q5LinearAddPlan {
-    Q5LinearAddScheduleId schedule;
-    std::size_t workspace_bytes;
-};
-
-const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept;
+// Routing policy lives in `q5_linear_add_catalog.h`, which is CUDA-free on purpose so it can be
+// tested without a toolchain. What remains here is the CUDA-typed execution surface. The schedule
+// names, the schedule ids and the routing table all come from the catalog.
 
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept;
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem);

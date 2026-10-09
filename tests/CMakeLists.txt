@@ -49,6 +49,30 @@ function(ninfer_add_op_test name)
   endif()
 endfunction()
 
+# A test whose sources carry no CUDA dependency and link no library, the way
+# `targets/qwen3_6/impl/runtime/scr_quality.h` is built and tested. Such a test runs on a machine
+# with no nvcc and no GPU, which makes it the opposite of a convenience: it is the test that still
+# runs where the toolchain does not, so a policy regression is caught there rather than discovered on
+# the one box that can build the rest of the suite.
+#
+# The strict floating-point options are not optional here. A test that reasons about rounding has to
+# be compiled with the same rounding the op under test uses, and a contracted multiply-add silently
+# changes the answer.
+function(ninfer_add_host_test name)
+  cmake_parse_arguments(arg "" "" "SOURCES" ${ARGN})
+  add_executable(${name} ${arg_SOURCES})
+  target_include_directories(${name} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${name} PRIVATE
+      -fno-fast-math
+      -ffp-contract=off)
+  endif()
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
@@ -318,6 +342,12 @@ ninfer_add_fused_linear_test(
   ninfer_linear_add_q5_a16_test
   ops/linear_add/test_q5_a16.cpp
   ops/linear_add/linear_add_test_common.cpp)
+# The Q5 LinearAdd schedule catalog: which schedule a shape resolves to, and the one band among them
+# that writes an output element from two CTAs into the same bf16 element in an unfixed order. The
+# catalog is CUDA-free policy, so this pins it on a machine with no toolchain and no GPU. Widening the
+# order-dependent band requires editing this file's expectations first.
+ninfer_add_host_test(ninfer_linear_add_q5_residual_band_test
+  SOURCES ops/linear_add/test_q5_residual_band.cpp)
 ninfer_add_fused_linear_test(
   ninfer_linear_add_bf16_a16_test
   ops/linear_add/test_bf16_a16.cpp

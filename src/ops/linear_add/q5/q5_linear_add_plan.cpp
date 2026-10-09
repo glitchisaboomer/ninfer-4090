@@ -2,119 +2,26 @@
 
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
-#include <array>
-#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
-namespace {
 
-constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
-
-struct ColsSet {
-    std::int32_t first;
-    std::int32_t last;
-
-    constexpr bool contains(std::int32_t cols) const noexcept {
-        return cols >= first && cols <= last;
-    }
-};
-
-struct SupportSpec {
-    std::int32_t rows;
-    std::int32_t k;
-    std::int32_t padded_k;
-};
-
-struct RouteSpec {
-    ColsSet cols;
-    Q5LinearAddScheduleId schedule;
-};
-
-constexpr std::array<SupportSpec, 2> kSupports{{
-    {5120, 6144, 6144},
-    {5120, 17408, 17408},
-}};
-
-constexpr std::array<RouteSpec, 6> kK6144Routes{{
-    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{14, 16}, Q5LinearAddScheduleId::MmaResidualR64C16},
-    {{17, 64}, Q5LinearAddScheduleId::MmaResidualR64C32},
-    {{65, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
-    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
-}};
-
-constexpr std::array<RouteSpec, 5> kK17408Routes{{
-    {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
-    {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{17, 64}, Q5LinearAddScheduleId::MmaResidualR64C32},
-    {{65, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
-    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
-}};
-
-template <std::size_t N>
-constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
-    std::int64_t expected = 1;
-    for (const RouteSpec& route : routes) {
-        if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
-        expected = static_cast<std::int64_t>(route.cols.last) + 1;
-    }
-    return routes.back().cols.last == kAnyCols &&
-           expected == static_cast<std::int64_t>(kAnyCols) + 1;
-}
-
-static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
-              "Q5 LinearAdd routes must be exact, contiguous, and closed");
-
-bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
-    for (const SupportSpec& support : kSupports) {
-        if (problem.rows == support.rows && problem.k == support.k &&
-            problem.padded_k == support.padded_k) {
-            return true;
-        }
-    }
-    return false;
-}
-
-} // namespace
-
-const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Q5LinearAddScheduleId::GemvResidual:
-        return "linear_add.q5.gemv.residual";
-    case Q5LinearAddScheduleId::Split2ExactResidual:
-        return "linear_add.q5.simt.split2.exact.residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C16:
-        return "linear_add.q5.mma.r64.c16.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C24:
-        return "linear_add.q5.mma.r64.c24.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C32:
-        return "linear_add.q5.mma.r64.c32.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C64:
-        return "linear_add.q5.mma.r64.c64.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C128:
-        return "linear_add.q5.mma.r64.c128.cta_collective_residual";
-    }
-    return "linear_add.q5.unknown";
-}
+// The route tables, the support inventory, the schedule names and the closedness check live in
+// `q5_linear_add_catalog.h`; they are compile-time policy and are unit-tested from there without a
+// CUDA toolchain. This translation unit only turns a resolved catalog entry into a launcher call.
 
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return q5_linear_add_admits_shape(problem);
 }
 
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
-    if (!q5_linear_add_admits(problem)) {
+    if (!q5_linear_add_admits_shape(problem)) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
     }
-
-    const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
-        for (const RouteSpec& route : routes) {
-            if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
-        }
+    if (q5_linear_add_find_route(problem) == nullptr) {
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
-    };
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
+    }
+    return q5_linear_add_resolve_catalog(problem);
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
