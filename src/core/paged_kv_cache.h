@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/layout.h"
+#include "core/paged_kv_delta_layout.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime_api.h>
@@ -11,8 +12,6 @@
 #include <vector>
 
 namespace ninfer {
-
-inline constexpr std::int32_t kPagedKVPageSize = 64;
 
 /**
  * Non-owning, single-sequence view consumed by growing-cache Ops.
