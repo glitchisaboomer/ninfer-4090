@@ -124,6 +124,11 @@ target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
 ninfer_add_test(ninfer_qwen3_6_prompt_edit_test
   SOURCES targets/qwen3_6/test_prompt_edit.cpp
   LIBRARIES ninfer_engine)
+# The fold the prefill residual trace compares layers with, and the cross-instance registry that lets
+# one Engine's prefill be compared against another's. Host-only: the fingerprint is pure code and is
+# checked against declared FP64 values, not against itself.
+ninfer_add_test(ninfer_qwen3_6_prefill_trace_hash_test
+  SOURCES targets/qwen3_6/test_prefill_trace_hash.cpp)
 ninfer_add_test(ninfer_qwen3_6_scr_quality_test
   SOURCES targets/qwen3_6/test_scr_quality.cpp
   LIBRARIES ninfer_engine)
@@ -140,6 +145,12 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# Guards prefill reproducibility. Position 0's logprob comes from the forward pass alone, so a
+# disagreement between two cold prefills of one fixed prompt is prefill disagreeing with itself.
+ninfer_add_test(ninfer_qwen3_6_27b_prefill_determinism_test
+  SOURCES targets/qwen3_6_27b/test_engine_prefill_determinism.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_prefill_determinism_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR

@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <utility>
 
@@ -54,7 +56,30 @@ constexpr auto kLaunchers5120x6144 =
 constexpr auto kLaunchers5120x17408 =
     make_launchers<Geom5120x17408>(std::make_index_sequence<16>{});
 
-template <class Geometry, int TileTokens, int ActiveTokens>
+// The residual path splits K across two CTAs that both add into the same bf16 output element through
+// `Q5SmallTMmaResidualAtomicEpilogue`. Nothing in the programming model fixes which of the two lands
+// first, and bf16 addition is not associative, so two prefills that are otherwise identical can leave
+// residuals differing in their low bits. Every other schedule of this op owns its output element, so
+// this is the one nondeterministic write on the small-T path.
+//
+// `NINFER_Q5_RESIDUAL_SPLITS=1` runs the identical schedule with one writer per element: deterministic,
+// and it rounds once instead of twice. It costs half the CTAs along K, which is what the split was for,
+// so it is an override rather than the default until that cost has been measured. See
+// docs/ISSUE_prefill-nondeterminism.md for the evidence that this is the divergent write.
+bool q5_residual_single_split() {
+    static const bool single = [] {
+        const char* value = std::getenv("NINFER_Q5_RESIDUAL_SPLITS");
+        const bool one = value != nullptr && value[0] == '1' && value[1] == '\0';
+        if (one) {
+            std::cerr << "[q5] linear_add residual: 1 K-split (NINFER_Q5_RESIDUAL_SPLITS=1), one writer"
+                         " per element\n";
+        }
+        return one;
+    }();
+    return single;
+}
+
+template <class Geometry, int TileTokens, int ActiveTokens, int KSplits>
 void launch_residual_exact(const Tensor& x, const Weight& weight, Tensor& out,
                            cudaStream_t stream) {
     using Schedule = Q5SmallTSchedule;
@@ -62,12 +87,11 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Tensor& out,
         (Geometry::kOutputRows + Schedule::kRowsPerCta - 1) / Schedule::kRowsPerCta;
     const auto in_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
     const auto out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
-    constexpr int kSplits = 2;
-    const dim3 grid(static_cast<unsigned>(kBlocks), static_cast<unsigned>(kSplits), 1u);
+    const dim3 grid(static_cast<unsigned>(kBlocks), static_cast<unsigned>(KSplits), 1u);
     const Q5SmallTMmaResidualAtomicEpilogue epilogue{};
 
     q5_small_t_mma_kernel<Geometry, TileTokens, ActiveTokens, Q5SmallTMmaResidualAtomicEpilogue,
-                          Q5SmallTMmaIdentityRows, kSplits>
+                          Q5SmallTMmaIdentityRows, KSplits>
         <<<grid, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -77,12 +101,21 @@ void launch_residual_exact(const Tensor& x, const Weight& weight, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Geometry, int TileTokens, int ActiveTokens>
+void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (q5_residual_single_split()) {
+        launch_residual_exact<Geometry, TileTokens, ActiveTokens, 1>(x, weight, out, stream);
+        return;
+    }
+    launch_residual_exact<Geometry, TileTokens, ActiveTokens, 2>(x, weight, out, stream);
+}
+
 template <class Geometry, std::size_t... Offsets>
 constexpr auto make_residual_launchers(std::index_sequence<Offsets...>) {
     return std::array<Q5Launch, sizeof...(Offsets)>{
-        &launch_residual_exact<Geometry,
-                               ((1 + static_cast<int>(Offsets)) <= 8 ? 8 : 16),
-                               1 + static_cast<int>(Offsets)>...};
+        &launch_residual<Geometry,
+                         ((1 + static_cast<int>(Offsets)) <= 8 ? 8 : 16),
+                         1 + static_cast<int>(Offsets)>...};
 }
 
 constexpr auto kResidualLaunchers5120x6144 =

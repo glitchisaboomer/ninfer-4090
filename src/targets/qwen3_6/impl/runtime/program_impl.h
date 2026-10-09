@@ -517,6 +517,18 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
+            // The control leg of the diagnostic. `ordered_reset` zeroes the GDN slot here too, so
+            // without this line the trace only ever shows the relocated path's stages and there is
+            // nothing to read a "stale recurrent state" against -- the run that is supposed to be
+            // the reference cannot be observed.
+            if (scr_diagnostics_enabled()) {
+                log_scr_gdn_state("full_reset", true, std::nullopt, LinearAttentionStateFingerprint{},
+                                  decoder->linear_attention.fingerprint_slot(
+                                      LinearStateSlots::current_state_slot(sequence.lane,
+                                                                           max_concurrency),
+                                      device.stream),
+                                  device.stream);
+            }
         } else if (is_disk_restore) {
             sequence.kv.reset();
             ordered_reset(sequence);
@@ -783,6 +795,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 scr_remap = remap;
                 sequence.kv->text.reassign_pages(remap, device.stream);
                 suffix_prefill_ranges.clear();
+                // Diagnostic only: fingerprint the GDN slot across the invalidation below so the
+                // trace says whether the zero ran, not merely that the code path was reached.
+                LinearAttentionStateFingerprint gdn_before;
+                if (scr_diagnostics_enabled()) {
+                    gdn_before = decoder->linear_attention.fingerprint_slot(
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                        device.stream);
+                }
                 if (!request_plan.relocated_head.empty()) {
                     suffix_prefill_ranges.push_back(request_plan.relocated_head);
                     // The linear-attention layers keep one fixed-size recurrent state for the whole
@@ -806,6 +826,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     decoder->linear_attention.zero_slot(
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                         device.stream);
+                }
+                if (scr_diagnostics_enabled()) {
+                    log_scr_gdn_state("invalidate", !request_plan.relocated_head.empty(),
+                                      request_plan.relocated_head.empty(), gdn_before,
+                                      decoder->linear_attention.fingerprint_slot(
+                                          LinearStateSlots::current_state_slot(sequence.lane,
+                                                                               max_concurrency),
+                                          device.stream),
+                                      device.stream);
                 }
                 suffix_prefill_ranges.push_back(request_plan.relocated_tail);
             } else {
@@ -1689,6 +1718,88 @@ void ProgramImplCore::log_scr_prefill_chunk(std::uint32_t base, std::uint32_t cu
     std::cerr.flush();
 }
 
+// Compact per-layer magnitude summary. Printing all 64 layers per stage would swamp the trace the
+// run is read through, so the line carries the total (which catches "the zero never ran"), the
+// worst layer (which catches one layer diverging while the total stays plausible), and a few
+// evenly spaced samples so two runs can be lined up by eye without a diff tool.
+void ProgramImplCore::log_scr_gdn_state(const char* stage, bool zero_taken,
+                                        std::optional<bool> head_empty,
+                                        const LinearAttentionStateFingerprint& before,
+                                        const LinearAttentionStateFingerprint& after,
+                                        cudaStream_t stream) const {
+    if (!scr_diagnostics_enabled()) { return; }
+    (void)stream;
+
+    const auto total = [](const std::vector<float>& values) {
+        double sum = 0.0;
+        for (const float value : values) { sum += static_cast<double>(value); }
+        return sum;
+    };
+    const auto peak_layer = [](const std::vector<float>& values) {
+        std::size_t index = 0;
+        for (std::size_t i = 1; i < values.size(); ++i) {
+            if (values[i] > values[index]) { index = i; }
+        }
+        return index;
+    };
+
+    std::ostringstream out;
+    out << "[scr-diag] gdn stage=" << stage << " zero_taken=" << (zero_taken ? "yes" : "no")
+        << " head_range=";
+    if (!head_empty.has_value()) {
+        out << "n/a";
+    } else {
+        out << (*head_empty ? "empty" : "nonempty");
+    }
+
+    // Read the layer count from `after`, which every stage fills. The two stages that have nothing
+    // to compare against pass an empty `before`, and reading the count from there would report
+    // layers=0 on exactly the baseline legs a relocated run gets compared against.
+    out << " layers=" << after.conv_abs_sum.size();
+    if (zero_taken) {
+        // The whole question this line answers is whether the slot the relocation branch left
+        // behind is zero or stale, so report the magnitude rather than a boolean: "nonzero" alone
+        // would also be the answer after prefill has legitimately refilled it, and those two are
+        // the difference between a bug and the feature working.
+        out << " conv_abs_before=" << total(before.conv_abs_sum)
+            << " conv_abs_after=" << total(after.conv_abs_sum)
+            << " rec_abs_before=" << total(before.recurrent_abs_sum)
+            << " rec_abs_after=" << total(after.recurrent_abs_sum);
+    } else {
+        out << " conv_abs=" << total(after.conv_abs_sum)
+            << " rec_abs=" << total(after.recurrent_abs_sum);
+    }
+    out << " non_finite(conv/rec)=" << after.conv_non_finite << "/" << after.recurrent_non_finite;
+
+    if (!after.conv_abs_sum.empty()) {
+        const std::size_t peak = peak_layer(after.conv_abs_sum);
+        out << " peak_conv_layer=" << peak << " peak_conv_abs=" << after.conv_abs_sum[peak];
+    }
+    if (!after.recurrent_abs_sum.empty()) {
+        const std::size_t peak = peak_layer(after.recurrent_abs_sum);
+        out << " peak_rec_layer=" << peak << " peak_rec_abs=" << after.recurrent_abs_sum[peak];
+    }
+
+    // A few evenly spaced layers, so a reader can line up two runs without a diff tool.
+    const auto sample = [&](const std::vector<float>& values) {
+        out << " [";
+        for (int i = 0; i < 4; ++i) {
+            const std::size_t index =
+                values.empty() ? 0
+                               : static_cast<std::size_t>(i) * (values.size() - 1) / 3;
+            out << (i ? "," : "") << (values.empty() ? 0.0F : values[index]);
+        }
+        out << "]";
+    };
+    out << " conv_samples";
+    sample(after.conv_abs_sum);
+    out << " rec_samples";
+    sample(after.recurrent_abs_sum);
+
+    std::cerr << out.str() << '\n';
+    std::cerr.flush();
+}
+
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
     if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend) {
@@ -2344,6 +2455,27 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 // than mis-rotated, and this is the only observation that can tell those apart.
                 log_scr_relocation_integrity(text_kv_view(sequence), staged.relocated_page_probes,
                                              device.stream);
+            }
+            if (scr_diagnostics_enabled()) {
+                // The GDN state every phase ends its prefill with.
+                //
+                // This is deliberately not gated on relocation. The question the run is trying to
+                // answer is whether a relocated request starts from a recurrent state that describes
+                // its own prompt, and "describes its own prompt" has to be checked against a run that
+                // provably built its state from a cold start. Fingerprinting only the relocated leg
+                // produces a number with nothing to compare it to -- which is exactly how the GDN
+                // invalidation went unobserved: each reading looked locally plausible.
+                //
+                // It is also the only per-phase observation of the state the first sampled token is
+                // computed from, so a baseline-vs-baseline difference here localises run-to-run
+                // drift to the recurrent state instead of leaving it somewhere in 64 layers.
+                log_scr_gdn_state("post_prefill", staged.reuse == ReusePath::SuffixRelocation,
+                                  std::nullopt, LinearAttentionStateFingerprint{},
+                                  decoder->linear_attention.fingerprint_slot(
+                                      LinearStateSlots::current_state_slot(sequence.lane,
+                                                                           max_concurrency),
+                                      device.stream),
+                                  device.stream);
             }
         } else {
             mark_workspace_usage(workspace_plan.ordinary_round);

@@ -2,6 +2,8 @@
 
 #include "core/device.h"
 
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -321,6 +323,77 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
             CUDA_CHECK(cudaMemsetAsync(recurrent_slot(layer, slot).data, 0, rec_bytes, stream));
         }
     }
+}
+
+// Read one state tensor and reduce it to sum|x| plus a non-finite count.
+//
+// BF16 is the top 16 bits of an FP32, so a BF16 word is widened by a shift rather than a decode,
+// which keeps this aligned with the BF16 KV planes the relocation diagnostic already fingerprints.
+// `stream` is drained before the reduction, so the observation cannot precede the writes it is
+// meant to describe; the reduction itself runs on the host copy.
+template <class Word>
+double sum_abs_state(const Tensor& tensor, cudaStream_t stream, std::int64_t* non_finite) {
+    const std::size_t bytes = tensor.bytes();
+    std::vector<Word> host(bytes / sizeof(Word));
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Accumulated in double, not float: a 64-layer total over millions of elements can outgrow
+    // float's 24-bit mantissa, and the whole purpose of this sum is to answer "is this zero",
+    // which is exactly the question a lossy accumulator gives the wrong answer to.
+    double total = 0.0;
+    for (const Word word : host) {
+        const float value = [&] {
+            if constexpr (sizeof(Word) == sizeof(float)) { return static_cast<float>(word); }
+            else {
+                const std::uint32_t bits = static_cast<std::uint32_t>(word) << 16;
+                float wide               = 0.0F;
+                std::memcpy(&wide, &bits, sizeof(wide));
+                return wide;
+            }
+        }();
+        if (!std::isfinite(value)) {
+            ++*non_finite;
+            continue;
+        }
+        total += std::fabs(static_cast<double>(value));
+    }
+    return total;
+}
+
+// Populate `result` from `pool` for one slot. Templated on the conv dtype, which is the only part
+// whose element type is not fixed: the recurrent half is FP32 by construction.
+template <class ConvWord>
+void fingerprint_slot_impl(const LinearAttentionStatePool& pool, std::int32_t slot,
+                           cudaStream_t stream, LinearAttentionStateFingerprint& result) {
+    const std::uint32_t layers = pool.layer_count();
+    result.conv_abs_sum.assign(layers, 0.0F);
+    result.recurrent_abs_sum.assign(layers, 0.0F);
+    result.conv_non_finite      = 0;
+    result.recurrent_non_finite  = 0;
+
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        result.conv_abs_sum[layer] =
+            static_cast<float>(sum_abs_state<ConvWord>(pool.conv_slot(layer, slot), stream,
+                                                        &result.conv_non_finite));
+        result.recurrent_abs_sum[layer] =
+            static_cast<float>(sum_abs_state<float>(pool.recurrent_slot(layer, slot), stream,
+                                                    &result.recurrent_non_finite));
+    }
+}
+
+LinearAttentionStateFingerprint LinearAttentionStatePool::fingerprint_slot(std::int32_t slot,
+                                                                          cudaStream_t stream) const {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool fingerprint_slot");
+    if (layer_count() == 0) { return {}; }
+
+    LinearAttentionStateFingerprint result;
+    if (spec.conv_dtype == DType::BF16) {
+        fingerprint_slot_impl<std::uint16_t>(*this, slot, stream, result);
+    } else {
+        fingerprint_slot_impl<float>(*this, slot, stream, result);
+    }
+    return result;
 }
 
 } // namespace ninfer

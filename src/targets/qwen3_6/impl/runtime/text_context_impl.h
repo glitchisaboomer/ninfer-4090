@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "targets/qwen3_6/impl/runtime/prefill_layer_trace.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -1308,6 +1309,14 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     const TextPrefill text_prefill{full_ids, begin};
+    // The residual trace is selected at run time, unlike the DFlash sink, which is a production
+    // path the caller chooses: no public API should exist for a diagnostic. The branch costs one
+    // predictable test per chunk and leaves the NullTap instantiation byte-identical.
+    if (prefill_layer_trace_enabled()) {
+        PrefillLayerTrace tap;
+        return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, tap,
+                            finalize_at_end);
+    }
     NullTap tap;
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, tap,
                         finalize_at_end);

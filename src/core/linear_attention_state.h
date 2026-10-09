@@ -42,6 +42,22 @@ struct LinearAttentionStateAllLayersView {
     LinearAttentionStatePoolSpec spec;
 };
 
+// Per-layer magnitude summary of one Linear Attention state slot.
+//
+// A GDN slot cannot be relocated (it is one recurrent summary of the whole sequence, not a
+// per-token cache), so a relocated request has to invalidate it. Whether that invalidation
+// actually happened is invisible from outside the pool: nothing in the state itself records
+// which prompt it was summarised over. This is the observation that makes the invalidation
+// checkable, and it is deliberately coarse -- sum|x| per layer over the conv and recurrent
+// halves separately, so "the zero did not run" and "the zero ran and prefill refilled it" are
+// distinguishable from "the state is a plausible steady-state summary".
+struct LinearAttentionStateFingerprint {
+    std::vector<float> conv_abs_sum;      // one entry per layer
+    std::vector<float> recurrent_abs_sum; // one entry per layer
+    std::int64_t conv_non_finite         = 0;
+    std::int64_t recurrent_non_finite     = 0;
+};
+
 [[nodiscard]] LinearAttentionStatePoolLayout
 plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionStatePoolSpec& spec);
 
@@ -70,6 +86,13 @@ struct LinearAttentionStatePool {
 
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
+
+    // sum|x| and non-finite counts per layer, for one slot. Diagnostics only: it reads every
+    // byte of the slot over the PCIe bus and synchronises, so it is never on a request path.
+    // `stream` must be the stream the writers were launched on -- a blocking read on the legacy
+    // default stream does not drain a non-blocking one, and would report the pre-write state.
+    [[nodiscard]] LinearAttentionStateFingerprint fingerprint_slot(
+        std::int32_t slot, cudaStream_t stream) const;
 };
 
 } // namespace ninfer

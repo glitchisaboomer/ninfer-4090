@@ -543,6 +543,32 @@ private:
                                std::uint32_t range_end, std::uint32_t resumed,
                                const qwen3_6::PagedKVCacheView& view, cudaStream_t stream) const;
 
+    // The GDN half of the relocation diagnostic.
+    //
+    // A Linear Attention slot is one recurrent summary of a whole sequence rather than a per-token
+    // cache, so it cannot be relocated: there is nothing to move and no RoPE to undo. A relocated
+    // request therefore has to invalidate it, and program_impl.h does that by zeroing the slot and
+    // replaying the head range. That reasoning is sound but was never observed, and it has one
+    // unverified branch: when the plan's head range is empty the zero is skipped on the argument
+    // that the resident prompt is then a strict prefix of the new one. Nothing checked that
+    // argument, and a wrong answer here does not fail loudly -- 48 of 64 layers simply start from a
+    // summary of a prompt the request never contained, which shows up only as drift in the first
+    // generated token's logprob.
+    //
+    // This reports, per stage, whether the zero was taken and how much magnitude each layer's conv
+    // and recurrent halves actually carry, so the three states that look alike from the outside
+    // separate: zero skipped (magnitude left over from the previous prompt), zero taken and still
+    // zero (head range empty or not yet replayed), and zero taken and refilled by prefill (magnitude
+    // back). A non-zero non-finite count means the replay itself produced garbage, which is a
+    // different fault entirely.
+    //
+    // Reading the whole slot costs a full PCIe round trip per stage, which is why this stays behind
+    // the same NINFER_SCR_DIAG switch as the KV probe rather than running unconditionally.
+    void log_scr_gdn_state(const char* stage, bool zero_taken, std::optional<bool> head_empty,
+                           const LinearAttentionStateFingerprint& before,
+                           const LinearAttentionStateFingerprint& after,
+                           cudaStream_t stream) const;
+
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
 
