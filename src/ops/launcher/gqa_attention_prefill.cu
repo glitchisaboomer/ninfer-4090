@@ -155,7 +155,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data),
-        nullptr // TODO(step-4b): Wire runtime delta plane here
+        static_cast<const std::int32_t*>(cache.rope_deltas.data),
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
