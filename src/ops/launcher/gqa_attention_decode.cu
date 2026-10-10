@@ -219,6 +219,8 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .k_scale_pages = cache.k_scale_pages,
         .v_scale_pages = cache.v_scale_pages,
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
+        .rope_deltas   = cache.rope_deltas,
+        .rope_inv_freq = cache.rope_inv_freq,
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
         .dtype         = cache.dtype,
@@ -229,8 +231,6 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .packed_k      = cache.packed_k,
         .e8_lattice    = cache.e8_lattice,
         .e8_root       = cache.e8_root,
-        .rope_deltas   = cache.rope_deltas,
-        .rope_inv_freq = cache.rope_inv_freq,
     };
 }
 
