@@ -344,13 +344,25 @@ configurable context reaches that threshold. The defect was real but latent; the
 architectural (the Op no longer depends on mutable module-global state) rather than a correctness
 rescue.
 
-## SCR is currently limited to BF16 KV, and that caps it below useful context
+## SCR is no longer limited to BF16 KV
 
-`gqa_kv_rerotate` requires an uncompressed BF16 Text KV plane. `validate_text_k_cache` rejects every
-quantized layout (`int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), and **the request planner has
-no matching guard**, so a quantized `--kv-dtype` plans a relocation that then throws at runtime
-instead of degrading to `AppendAtFrontier`. A planner-side guard is the cheapest fix and is not
-done yet.
+*(Superseded: this section used to say that `gqa_kv_rerotate` required an uncompressed BF16 Text KV
+plane and that `validate_text_k_cache` rejected every quantized layout, with no matching planner
+guard. All three of those statements are now false of the code — see
+`docs/SCR_QUANTIZED_KV_RELOCATION.md`.)*
+
+Relocation no longer rewrites the stored K. It publishes a **per-page RoPE delta** on a separate
+delta plane, and the attention kernels counter-rotate Q for the page being read, so the codes in the
+cache are never touched and the layout stops mattering. `validate_text_k_cache` and
+`ops::gqa_kv_rerotate` are both gone; `request_plan_impl.h`'s `delta_path_supports_dtype` admits
+BF16 and I8, which covers every quantized layout below, and the planner consults it.
+
+What that leaves open is verification, not availability:
+
+- `tools/scr_e2e_check.py` must be run once per `--kv-dtype` (`bf16`, `int8`, `rk8v4`, `rk4v4`,
+  `rk4v4-e8`) and must report `reuse=suffix_relocation` for each;
+- `rk2v4-e8` is deliberately refused by that check: its K read path is a different codec
+  (`e8_root_decode_8d_int8`) whose oracle is not written, so nothing can attribute a pass there yet.
 
 For `qwen3_8_27b` the arithmetic is: 2 (K and V) x 16 full-attention layers x 4 KV heads x 256
 head_dim, against 16.96 GiB of `groupwise-int` weights on a 23.99 GiB card.

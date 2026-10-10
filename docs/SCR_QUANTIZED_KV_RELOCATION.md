@@ -28,10 +28,12 @@ falsified an earlier draft of this document.
 
 ## 0. Why this exists
 
-`SCR_RELOCATION_PATHS.md` currently limits SCR to an uncompressed BF16 Text K plane, because the one
-relocation primitive it has, `ops::gqa_kv_rerotate`, requires one: `validate_text_k_cache`
-(`src/ops/wrapper/gqa_kv_rerotate.cpp:33`) rejects every quantized layout, and the request planner has
-no matching guard, so `--kv-dtype rk4v4-e8 --scr` *throws* instead of degrading.
+*Motivation, as of the start of this work. `SCR_RELOCATION_PATHS.md` then limited SCR to an
+uncompressed BF16 Text K plane, because the one relocation primitive it had, `ops::gqa_kv_rerotate`,
+required one: `validate_text_k_cache` (`src/ops/wrapper/gqa_kv_rerotate.cpp:33`) rejected every
+quantized layout, and the request planner had no matching guard, so `--kv-dtype rk4v4-e8 --scr`
+threw instead of degrading. All of that is now gone from the code — see Step 3's **Landed** note and
+Step 5's audit status — and this section is kept as the record of why the change was made.*
 
 The consequence, from that document's own table, is that SCR is available only where it matters least:
 
@@ -300,6 +302,11 @@ plumbing for it).
 3. Remove the BF16-only gate: `validate_text_k_cache` and add the planner-side guard the handoff notes
    is missing (`request_plan_impl.h:254` does not check the KV dtype), so a quantized `--kv-dtype`
    plans a relocation it can honour instead of one that throws.
+   **Landed.** `validate_text_k_cache` and `ops::gqa_kv_rerotate` are gone, the runtime writes the
+   delta plane per span (`program_impl.h`, `rope_delta_for_span`) with no dtype condition, and
+   `request_plan_impl.h`'s `delta_path_supports_dtype` admits `BF16` and `I8` — which is every
+   quantized layout. `tools/scr_e2e_check.py` carried the stale BF16-only claim and now accepts
+   `bf16 / int8 / rk8v4 / rk4v4 / rk4v4-e8` and refuses `rk2v4-e8`; the per-dtype runs are owed.
 
 **Verify:** the existing `tests/ops/test_scr_relocation_integration.cpp` routes writes through
 `gqa_kv_append` and reads through the real attention kernels; run it once per KV dtype, not just BF16.
@@ -353,6 +360,20 @@ type error to catch it:
 - any diagnostic that fingerprints the K plane — reusing the existing `[scr-diag]` page fingerprints is
   the right instinct, but they must be taken *after* the operations that consume the pages, which is
   the lesson `SCR_PHASE_5_5_HANDOFF.md` §4 records.
+
+**Audit status.** Every reader above was checked against the code rather than assumed:
+
+| reader | state |
+|---|---|
+| decode attention, i8 and bf16 | honours the delta, and the delta anchor equals the reference anchor to 1e-5 |
+| prefill attention, i8 and bf16 | honours it. The A1 oracle proves it rather than inspecting it: there the relocated page carries `delta = -384` while the *query* page carries none, so the check can only pass if the delta is read per key page |
+| MTP / DFlash attention | unreachable — the planner requires `SpeculativeBackend::None` (`request_plan_impl.h`) |
+| `prepare_ragged_prefix`, `kv_cache_append_prefix` | DFlash-only call sites (`dflash_impl.h`), so unreachable with a relocated page for the same reason |
+| `[scr-diag]` fingerprints | present; the ordering rule above still needs confirming against the emit sites |
+
+So the wiring this step asks for is done by the earlier steps; what is left is hardening — converting
+the speculative-backend gate from a planner condition into a checked guarantee at publish time — and
+the ordering confirmation for the fingerprints.
 
 ---
 

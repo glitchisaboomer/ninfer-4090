@@ -39,9 +39,13 @@ not widen the serve surface as part of this work.
 
 Two smaller gaps are also known and deferred, in case they come up:
 
-- The planner's SCR gate (`request_plan_impl.h:254`) does **not** check the KV dtype, so
-  `--kv-dtype rk4v4-e8 --scr` plans a relocation that `validate_text_k_cache` then rejects by
-  throwing. Needs a planner-side BF16 gate before that combination can be used.
+- ~~The planner's SCR gate does not check the KV dtype, so a quantized `--kv-dtype` plans a
+  relocation that `validate_text_k_cache` then rejects.~~ **Resolved.** The gate now exists
+  (`request_plan_impl.h`'s `delta_path_supports_dtype`, which admits BF16 and I8) and
+  `validate_text_k_cache` is gone: relocation publishes a per-page RoPE delta instead of
+  re-rotating the stored K, so quantized layouts are available. What is owed is the per-dtype run of
+  `tools/scr_e2e_check.py` (it accepts `bf16`, `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8` and refuses
+  `rk2v4-e8`). See `docs/SCR_QUANTIZED_KV_RELOCATION.md`.
 - There is no cap on the relocated **token** count. `--scr-max-spans` (default 6) caps the *number of
   spans*, and tail mode produces exactly one span, so it never binds. The paper's `K` in Figure 13 is
   a token count. The roadmap says hardcode `K = 6`, configurable but unexposed until correctness

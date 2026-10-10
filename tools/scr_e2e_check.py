@@ -8,14 +8,19 @@ and compares.
 
 The prompts are built so that request B shares a long prefix AND a long suffix with request A,
 differing only in the middle. A prefills everything; B hits the prefix cache, hits an edit,
-and finds the tail still resident after the edit point, so SCR relocates and re-rotates it
-instead of re-prefilling.
+and finds the tail still resident after the edit point, so SCR relocates it by publishing a
+per-page RoPE delta instead of re-prefilling it.
 
 The comparison is worthless unless SCR actually engaged, so this script fails loudly when the
 server does not report reuse=suffix_relocation rather than reporting a vacuous pass.
 
+Run it once per supported --kv-dtype (`bf16`, `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`). The relocation
+is a delta on the page, not a rewrite of the codes, so every layout whose attention kernels honour
+that delta has to be checked; BF16 alone no longer exercises the path.
+
 Usage (from the repo root):
-    python tools/scr_e2e_check.py --model "qwen3_8_27b.ninfer"
+    python tools/scr_e2e_check.py --model "qwen3_8_27b.ninfer" \
+        --base-args "... --kv-dtype rk4v4-e8 ..."
 
 Standard library only: no pip install.
 """
@@ -487,15 +492,29 @@ def main():
     print("SCR end-to-end check")
     print()
 
-    # gqa_kv_rerotate validates the Text KV plane and rejects every quantized layout, and the
-    # planner has no matching guard, so a quantized --kv-dtype plans a relocation that then throws.
-    if not any(a.lower() == "--kv-dtype" and args.base_args_list[i + 1].lower() == "bf16"
-               for i, a in enumerate(args.base_args_list) if i + 1 < len(args.base_args_list)):
-        print("WARNING: --kv-dtype bf16 was not found in --base-args.")
-        print("         The relocation Op requires an uncompressed BF16 Text KV plane and rejects")
-        print("         int8 / rk8v4 / rk4v4 / rk4v4-e8 / rk2v4-e8. The planner has no guard for")
-        print("         this, so it will plan a relocation and the request will then fail.")
-        print()
+    # The relocation writes a per-page RoPE delta rather than re-rotating the stored K, so the
+    # planner admits every KV dtype whose attention kernels honour that delta:
+    # request_plan_impl.h's delta_path_supports_dtype returns BF16 or I8, and every quantized layout
+    # below is I8. rk2v4-e8 is the one the engine cannot stand behind yet -- its K read path is a
+    # different codec (e8_root_decode_8d_int8) whose oracle is not written -- so this script refuses
+    # it instead of reporting a pass nobody can attribute. (The planner's own comment claims it too,
+    # because the delta mechanism is codec-agnostic; the refusal here is about verification, not
+    # about whether the rotation would be applied.)
+    supported_kv_dtypes = ("bf16", "int8", "rk8v4", "rk4v4", "rk4v4-e8")
+    kv_dtype = next((args.base_args_list[i + 1].lower() for i, a in enumerate(args.base_args_list)
+                     if a.lower() == "--kv-dtype" and i + 1 < len(args.base_args_list)), None)
+    if kv_dtype is None:
+        print("error: --base-args must contain --kv-dtype <dtype>; supported: "
+              + ", ".join(supported_kv_dtypes), file=sys.stderr)
+        return 2
+    if kv_dtype not in supported_kv_dtypes:
+        print(f"error: --kv-dtype {kv_dtype} is not checked by this script; supported: "
+              + ", ".join(supported_kv_dtypes), file=sys.stderr)
+        return 2
+    # Recorded in the output so a per-dtype sweep is distinguishable after the fact; the dtype itself
+    # arrives through --base-args, so what is printed here is what the server was actually given.
+    print(f"KV dtype under test: --kv-dtype {kv_dtype}")
+    print()
     print("Pass 1: --scr --scr-mode tail")
     scr_result, scr_records = run_config(args, ["--scr", "--scr-mode", "tail"], "scr")
     if scr_result is None:
@@ -534,8 +553,7 @@ def main():
             for line in diagnostic:
                 print(f"  {line.strip()}")
         for needle, hint in (
-            ("must be BF16", "SCR requires --kv-dtype bf16; quantized KV planes are rejected"),
-            ("not supported", "the KV plane layout is one the relocation Op refuses"),
+            ("not supported", "the KV plane layout is one the relocation path refuses"),
             ("exceeds KV cache capacity", "lower --max-context for this run"),
             ("exceeds the page entitlement", "lower --max-context for this run"),
         ):
