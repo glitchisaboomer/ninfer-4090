@@ -300,7 +300,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
                     partial_acc, partial_m, partial_l, stream,                                 \
-                    nullptr, RerotateFreq{}); // TODO(step-4b): Wire runtime delta plane here   \
+                    nullptr, RerotateFreq{}); /* TODO(step-4b): wire runtime delta plane */        \
             }                                                                                      \
         };                                                                                         \
         const bool masked = invocation.valid_columns != nullptr;                                   \
