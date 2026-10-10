@@ -130,6 +130,22 @@ __device__ __forceinline__ int gqa_small_t_tc_swz32(int row, int col) {
     return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
 }
 
+// Counter-rotate one FP32 rotary pair by R(-delta), using the frequency entry
+// at index `pair`. The convention matches gqa_rope_counter_rotate_q_bf16:
+// sincosf gives sin/cos of +delta*freq, and the R(-theta) form below applies
+// the negative angle. The caller is responsible for applying this only to
+// pairs inside the rotary region [0, 32).
+__device__ __forceinline__ void gqa_rope_counter_rotate_pair_f32(
+    float& x, float& y, int pair, std::int32_t delta, const RerotateFreq& freq) {
+    if (delta == 0) { return; }
+    float s, c;
+    sincosf(static_cast<float>(delta) * freq.v[pair], &s, &c);
+    const float xr = x * c + y * s;
+    const float yr = y * c - x * s;
+    x = xr;
+    y = yr;
+}
+
 // Counter-rotate a Q A-fragment (m16n8k16 bf16 layout) by R(-delta).
 // Pairs (e, e+32) for e in [0,32). Only k-chunks 0..3 (columns 0-63) are touched.
 __device__ __forceinline__ void gqa_rope_counter_rotate_q_bf16(

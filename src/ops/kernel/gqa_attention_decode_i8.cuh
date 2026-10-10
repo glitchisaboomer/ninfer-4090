@@ -66,7 +66,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
+        const std::int32_t* __restrict__ rope_page_deltas, RerotateFreq freq) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -138,6 +139,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    const std::int32_t* delta_row = rope_page_deltas == nullptr
+                                        ? nullptr
+                                        : rope_page_deltas + static_cast<std::int64_t>(table_row) *
+                                                                 table_stride;
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads *
                        TokenTile * split_count;
@@ -408,27 +413,41 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
     for (int i = tid; i < Br * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
 
-    for (int unit = warp; unit < RowCount * Groups; unit += Wc) {
-        const int row = unit / Groups;
-        const int grp = unit - row * Groups;
-        const int d0  = grp * kGqaKvQuantGroup + lane;
-        const int d1  = d0 + 32;
-        int q_head    = 0;
-        int token     = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-        float x0        = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d0, token)]);
-        float x1        = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d1, token)]);
-        if constexpr (RotateK) {
-            gqa_kv_hadamard64(x0, x1, FullMask);
+    auto stage_and_quantize_q = [&](std::int32_t delta) {
+        for (int unit = warp; unit < RowCount * Groups; unit += Wc) {
+            const int row = unit / Groups;
+            const int grp = unit - row * Groups;
+            const int d0  = grp * kGqaKvQuantGroup + lane;
+            const int d1  = d0 + 32;
+            int q_head    = 0;
+            int token     = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            float x0        = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d0, token)]);
+            float x1        = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d1, token)]);
+            // Rotate before Hadamard: since H is applied to both sides,
+            // (H·R·Q)·(H·K) = (R·Q)·K. Applying R after H would not commute.
+            // Only group 0 covers dims [0, 64), the rotary region.
+            if (delta != 0 && grp == 0) {
+                gqa_rope_counter_rotate_pair_f32(x0, x1, lane, delta, freq);
+            }
+            if constexpr (RotateK) {
+                gqa_kv_hadamard64(x0, x1, FullMask);
+            }
+            float amax      = fmaxf(fabsf(x0), fabsf(x1));
+            amax            = warp_max(amax, FullMask);
+            const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
+            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
+            gqa_small_t_i8_store_swz(q_i8, row, d0, DB16, gqa_kv_quant_code(x0, inv));
+            gqa_small_t_i8_store_swz(q_i8, row, d1, DB16, gqa_kv_quant_code(x1, inv));
+            if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
         }
-        float amax      = fmaxf(fabsf(x0), fabsf(x1));
-        amax            = warp_max(amax, FullMask);
-        const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
-        const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-        gqa_small_t_i8_store_swz(q_i8, row, d0, DB16, gqa_kv_quant_code(x0, inv));
-        gqa_small_t_i8_store_swz(q_i8, row, d1, DB16, gqa_kv_quant_code(x1, inv));
-        if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
+    };
+
+    std::int32_t current_delta = 0;
+    if (delta_row != nullptr) {
+        current_delta = delta_row[first_tile >> kPagedKVPageShift];
     }
+    stage_and_quantize_q(current_delta);
 
     ninfer::ops::cp_wait<0>();
     __syncthreads();
@@ -451,7 +470,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     // helper call under -rdc; a shared-memory broadcast is one conflict-free LDS.
     float q_scale_r0[Groups];
     float q_scale_r1[Groups];
-    if (warp < RowTiles) {
+    auto refresh_q_scale_regs = [&]() {
+        if (warp >= RowTiles) { return; }
         // warp < RowTiles and gid <= 7, so producer_row0 + 8 <= Br - 1.
         const int producer_row0 = warp * 16 + gid;
 #pragma unroll
@@ -459,7 +479,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             q_scale_r0[g] = q_scale_tmp[producer_row0 * Groups + g];
             q_scale_r1[g] = q_scale_tmp[(producer_row0 + 8) * Groups + g];
         }
-    }
+    };
+    refresh_q_scale_regs();
 
     float acc[PVNtPerWarp][4];
 #pragma unroll
@@ -473,6 +494,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        if (delta_row != nullptr && kb != 0) {
+            const std::int32_t new_delta = delta_row[k0 >> kPagedKVPageShift];
+            if (new_delta != current_delta) {
+                stage_and_quantize_q(new_delta);
+                __syncthreads();  // publish all warps' q_i8 / q_scale writes
+                refresh_q_scale_regs();
+                current_delta = new_delta;
+            }
+        }
 
         // One warp per row tile produces P and alpha while the remaining warps
         // stream/dequant V.

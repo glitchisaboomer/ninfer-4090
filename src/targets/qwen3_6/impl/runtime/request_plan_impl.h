@@ -15,10 +15,15 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
 // The delta-plane relocation path requires the attention kernel to counter-rotate Q per page.
-// Only the BF16 attention kernels implement that rotation today; the INT8 family does not.
-// Widen this set only when a matching kernel helper exists.
+// Widen this set only when that dtype's attention kernel implements the per-page rotation:
+// BF16 rotates the register A-fragment, the i8 kernels rotate the FP32 rotary pair at the
+// Q-quantization site and re-quantize on each key-page boundary.
 constexpr bool delta_path_supports_dtype(DType dtype) {
-    return dtype == DType::BF16;
+    // BF16 attention kernels counter-rotate Q at the fragment level; the i8
+    // kernels counter-rotate the FP32 rotary pair before quantization. Both
+    // paths are implemented. Every i8 variant (int8, rk8v4, rk4v4, rk4v4-e8,
+    // rk2v4-e8) dispatches to the same kernels and inherits the support.
+    return dtype == DType::BF16 || dtype == DType::I8;
 }
 
 void validate_sampling(const ResolvedSamplingParameters& sampling) {

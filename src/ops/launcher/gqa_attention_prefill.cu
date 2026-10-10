@@ -45,7 +45,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const __half*>(cache_k_scale.data),
                 static_cast<const __half*>(cache_v_scale.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+                static_cast<__nv_bfloat16*>(out.data), tokens, freq);
         };
         if (cache.e8_root) {
             launch_i8.template operator()<true, true, true, false, true>();
