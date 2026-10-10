@@ -1,4 +1,5 @@
 // ninfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
+#include <cstdio>
 #include "ninfer/ops/gqa_attention.h"
 
 #include "core/layout.h"
@@ -487,6 +488,9 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
+    std::printf("  [route] q_heads=%d tokens=%d envelope=%u..%u -> %d\n",
+                (int)q.ne[1], (int)q.ne[2], envelope.min_visible_keys,
+                envelope.max_visible_keys, (int)route); std::fflush(stdout);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;

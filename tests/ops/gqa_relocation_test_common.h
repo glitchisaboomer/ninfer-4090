@@ -322,6 +322,35 @@ inline AttentionRun run_cached_attention(const Cache& cache, const std::vector<_
     return AttentionRun{download_doubles(dout, q.size())};
 }
 
+// Same as run_cached_attention, but takes an explicit view so callers can attach
+// rope_deltas and rope_inv_freq. Routes through the public gqa_attention_cached,
+// which forwards the view's delta plane and freq table to the kernel.
+inline AttentionRun run_cached_attention_view(const Cache& cache,
+                                              const std::vector<__nv_bfloat16>& q,
+                                              std::int32_t first_position, std::int32_t tokens,
+                                              std::uint32_t visible,
+                                              const PagedKVLayerView& view) {
+    DeviceBuffer dq   = upload(q);
+    DeviceBuffer dout = DeviceBuffer(q.size() * sizeof(__nv_bfloat16));
+    dout.fill(0);
+    DeviceBuffer dp = upload_positions(sequential_positions(first_position, tokens));
+
+    const ops::GqaExecutionEnvelope envelope{visible, visible};
+    const std::size_t workspace_bytes =
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, DType::BF16, envelope, 1, tokens,
+                                                   tokens);
+    DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tp(dp.p, DType::I32, {tokens});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    ops::gqa_attention_cached(tq, tp, kAttentionScale, view, envelope, workspace, tout, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    CUDA_CHECK(cudaGetLastError());
+    return AttentionRun{download_doubles(dout, q.size())};
+}
+
 // A1: the append-and-attend route the prefill uses. This is the same shape as the
 // integration test's original helper: append a chunk through the production write path,
 // then run public gqa_attention over the batch view.

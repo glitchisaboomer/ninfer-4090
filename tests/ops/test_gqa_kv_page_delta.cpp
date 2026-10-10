@@ -38,54 +38,6 @@ constexpr std::int32_t kDecodeBase   = kDestPage * kPageSize + kRelocatedRun - k
 constexpr std::uint32_t kDecodeVisible =
     static_cast<std::uint32_t>(kDecodeBase + kDecodeTokens);
 
-// Helper: run the decode A3 path through the detail:: launcher with the supplied view.
-AttentionRun run_decode_attention_detail(const Cache& cache, const std::vector<__nv_bfloat16>& q,
-                                         std::int32_t first_position, std::int32_t tokens,
-                                         std::uint32_t visible, const PagedKVLayerView& view) {
-    DeviceBuffer dq   = upload(q);
-    DeviceBuffer dout = DeviceBuffer(q.size() * sizeof(__nv_bfloat16));
-    dout.fill(0);
-    DeviceBuffer dp = upload_positions(sequential_positions(first_position, tokens));
-
-    const ops::GqaExecutionEnvelope envelope{visible, visible};
-    const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kQHeads, DType::BF16, envelope, 1, tokens, tokens);
-    DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
-    DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
-
-    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
-    Tensor tp(dp.p, DType::I32, {tokens});
-    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
-
-    // The launcher writes split-k partials into three separate device buffers. They must
-    // NOT alias `dout`. Shapes match the values the production caller of
-    // gqa_attention_cached_small_t_launch uses for a single split:
-    //   partial_acc: [kHeadDim, kQHeads, tokens]  BF16
-    //   partial_m:   [kQHeads, tokens]            FP32
-    //   partial_l:   [kQHeads, tokens]            FP32
-    // If the launcher's own signature/comment says otherwise, use those values.
-    const std::size_t acc_elems = static_cast<std::size_t>(kHeadDim) *
-                                  static_cast<std::size_t>(kQHeads) *
-                                  static_cast<std::size_t>(tokens);
-    const std::size_t ml_elems = static_cast<std::size_t>(kQHeads) *
-                                 static_cast<std::size_t>(tokens);
-    DeviceBuffer partial_acc_buf(acc_elems * sizeof(__nv_bfloat16));
-    DeviceBuffer partial_m_buf(ml_elems * sizeof(float));
-    DeviceBuffer partial_l_buf(ml_elems * sizeof(float));
-    partial_acc_buf.fill(0);
-    partial_m_buf.fill(0);
-    partial_l_buf.fill(0);
-    Tensor partial_acc(partial_acc_buf.p, DType::BF16, {kHeadDim, kQHeads, tokens});
-    Tensor partial_m(partial_m_buf.p, DType::FP32, {kQHeads, tokens});
-    Tensor partial_l(partial_l_buf.p, DType::FP32, {kQHeads, tokens});
-
-    detail::gqa_attention_cached_small_t_launch(tq, tp, kAttentionScale, view, envelope,
-                                                 partial_acc, partial_m, partial_l, tout, nullptr);
-    CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    CUDA_CHECK(cudaGetLastError());
-    return AttentionRun{download_doubles(dout, q.size())};
-}
-
 // Helper: run the prefill A1 path through the detail:: launcher with the supplied batch view. This is
 // the append-and-attend route, so the cache is mutated by the call; the test builds a fresh cache for
 // each run.
@@ -150,8 +102,8 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
 
 
     // 4. Run attention WITH deltas via detail:: launcher (should match reference)
-    auto got_relocated = run_decode_attention_detail(cache, scenario.q, kDecodeBase, kDecodeTokens,
-                                                    visible, view);
+    auto got_relocated = run_cached_attention_view(cache, scenario.q, kDecodeBase, kDecodeTokens,
+                                                   visible, view);
 
 
     // 5. Build reference: direct prefill at destination (K carries dst RoPE)
@@ -181,8 +133,8 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
     std::vector<std::int32_t> zero_deltas(kLogicalPages, 0);
     DeviceBuffer zero_buf = upload_i32(zero_deltas);
     view.rope_deltas = Tensor(zero_buf.p, DType::I32, {kLogicalPages});
-    auto got_stale = run_decode_attention_detail(cache, scenario.q, kDecodeBase, kDecodeTokens, visible,
-                                                 view);
+    auto got_stale = run_cached_attention_view(cache, scenario.q, kDecodeBase, kDecodeTokens, visible,
+                                               view);
 
     // 8. Assert the control FAILS loudly
     if (!expect_control_separates(
