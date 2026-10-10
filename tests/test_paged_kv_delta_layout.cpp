@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
+#include <vector>
 #include <limits>
 
 namespace {
@@ -29,6 +30,8 @@ using ninfer::kPagedKVPageSize;
 using ninfer::kRopeDeltaNone;
 using ninfer::RopeDeltaLayout;
 using ninfer::relocated_span_is_page_aligned;
+using ninfer::RopeDeltaRowSpan;
+using ninfer::rope_delta_row_span;
 using ninfer::resolve_rope_delta_layout;
 using ninfer::rope_delta_for_span;
 using ninfer::rope_delta_layout_is_supported;
@@ -214,6 +217,88 @@ void test_implied_context_round_trip() {
           "the round trip closes at the top of the int32 range");
 }
 
+// `PagedKVPool::clear_rope_delta_row` zeroes one table row with a single contiguous memset, which is
+// only safe if the plane's rows are byte-disjoint and together cover it exactly. That property is
+// what a reviewer got wrong once -- they assumed the usual row-major convention, with dim 0
+// outermost, under which a dim-1 slice is strided and the memset would zero part of a neighbouring
+// row. This asserts the actual property rather than restating the convention, so the next reader has
+// a test to run instead of a claim to trust.
+//
+// Disjointness alone is not enough: rows that were disjoint but left gaps would mean some entry is
+// never cleared, which is the same bug arriving from the other side. Covering is asserted too.
+void test_row_span_tiles_the_plane() {
+    std::printf("row spans are disjoint and jointly tile the delta plane\n");
+    const struct {
+        std::int32_t pages;
+        std::int32_t rows;
+    } shapes[] = {
+        {1, 1},  {10, 2},   {64, 1},   {64, 8},   {128, 4},
+        {1024, 4}, {255, 3}, {4096, 8}, {8192, 8}, {65, 8},
+    };
+    for (const auto& shape : shapes) {
+        const std::size_t total_bytes =
+            static_cast<std::size_t>(shape.pages) * shape.rows * sizeof(std::int32_t);
+        std::vector<bool> covered(total_bytes / sizeof(std::int32_t), false);
+        for (std::int32_t row = 0; row < shape.rows; ++row) {
+            const RopeDeltaRowSpan span =
+                rope_delta_row_span(shape.rows, shape.pages, row);
+            if (span.bytes != static_cast<std::size_t>(shape.pages) * sizeof(std::int32_t)) {
+                std::printf("  FAIL: pages=%d rows=%d row=%d has %zu bytes\n", shape.pages,
+                            shape.rows, row, span.bytes);
+                ++g_failures;
+                continue;
+            }
+            if (span.offset % sizeof(std::int32_t) != 0) {
+                std::printf("  FAIL: pages=%d rows=%d row=%d starts at %zu, not element-aligned\n",
+                            shape.pages, shape.rows, row, span.offset);
+                ++g_failures;
+            }
+            const std::size_t first = span.offset / sizeof(std::int32_t);
+            const std::size_t last  = first + shape.pages;
+            if (last > covered.size()) {
+                std::printf("  FAIL: pages=%d rows=%d row=%d overruns the plane\n", shape.pages,
+                            shape.rows, row);
+                ++g_failures;
+                continue;
+            }
+            for (std::size_t i = first; i < last; ++i) {
+                if (covered[i]) {
+                    std::printf("  FAIL: pages=%d rows=%d row=%d overlaps element %zu\n", shape.pages,
+                                shape.rows, row, i);
+                    ++g_failures;
+                    break;
+                }
+                covered[i] = true;
+            }
+        }
+        for (std::size_t i = 0; i < covered.size(); ++i) {
+            if (!covered[i]) {
+                std::printf("  FAIL: pages=%d rows=%d leaves element %zu uncovered\n", shape.pages,
+                            shape.rows, i);
+                ++g_failures;
+                break;
+            }
+        }
+    }
+
+    // Out-of-range rows resolve to an empty span, which the caller turns into a throw. An empty span
+    // is not a valid byte length to memset, so "bytes == 0" has to be distinguishable from a real
+    // one -- and it is, because the plane always has at least one page per row.
+    check(rope_delta_row_span(4, 128, 4).bytes == 0, "one past the last row is empty");
+    check(rope_delta_row_span(4, 128, -1).bytes == 0, "a negative row is empty");
+    check(rope_delta_row_span(0, 128, 0).bytes == 0, "no rows is empty");
+    check(rope_delta_row_span(4, 0, 0).bytes == 0, "no pages is empty");
+    // The exact figures, so a change to the stride or the element size is a test failure rather
+    // than something to reason about.
+    check(rope_delta_row_span(2, 10, 0).offset == 0 && rope_delta_row_span(2, 10, 0).bytes == 40,
+          "row 0 of a {10,2} plane starts at 0 and is 40 bytes");
+    check(rope_delta_row_span(2, 10, 1).offset == 40 && rope_delta_row_span(2, 10, 1).bytes == 40,
+          "row 1 of a {10,2} plane starts at byte 40");
+    check(rope_delta_row_span(8, 1024, 5).offset == 5 * 4096,
+          "row 5 of a {1024,8} plane starts at byte 20480");
+    static_assert(rope_delta_row_span(2, 10, 1).offset == 40);
+}
+
 } // namespace
 
 int main() {
@@ -233,6 +318,7 @@ int main() {
     test_span_alignment();
     test_per_page_delta();
     test_implied_context_round_trip();
+    test_row_span_tiles_the_plane();
 
     if (g_failures != 0) {
         std::printf("FAILED: %d check(s)\n", g_failures);

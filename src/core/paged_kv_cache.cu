@@ -228,24 +228,20 @@ const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_;
 const Tensor& PagedKVPool::rope_deltas() const noexcept { return rope_deltas_; }
 
 void PagedKVPool::clear_rope_delta_row(std::int32_t row, cudaStream_t stream) {
-    if (row < 0 || row >= table_row_count()) {
-        throw std::out_of_range("Paged KV rope-delta row out of range");
-    }
     // `kRopeDeltaNone` is zero, so clearing the row *is* the reset. This runs on the caller's stream
     // beside `publish_mapping`, not on the default stream, because a default-stream write does not
     // order against the non-blocking stream that will read it.
     //
-    // Contiguity is the load-bearing fact and it is worth stating, because it reads as unsafe: the
-    // plane is `{logical_pages, table_rows}` and dim 1 is the row, so a slice along dim 1 looks
-    // strided. It is not, because dim 0 is this codebase's innermost dimension -- `nb[0]` is the
-    // element stride and `nb[1]` is `ne[0] * nb[0]`. The production reader proves it:
-    // `publish_range` indexes a block-table row as `row.data + first_page` and memcpys
-    // `page_count * 4` contiguous bytes, which is only correct under that convention. So slicing dim
-    // 1 yields `ne[0]` contiguous elements at `base + row * nb[1]`, and one memset covers exactly
-    // that row. Under the opposite convention both this and `publish_range` would be wrong.
-    const Tensor slice = rope_deltas_.slice(1, row, 1);
-    CUDA_CHECK(cudaMemsetAsync(slice.data, 0,
-                               static_cast<std::size_t>(slice.ne[0]) * sizeof(std::int32_t), stream));
+    // The offset comes from the tested `rope_delta_row_span` rather than from a `Tensor::slice`, so
+    // the arithmetic that decides *which bytes get zeroed* is host-verifiable. It reads as though it
+    // should need a strided write -- the plane is `{logical_pages, table_rows}` and the row is dim 1
+    // -- but dim 0 is innermost here, so a row is contiguous. The row-span test proves the rows are
+    // disjoint and jointly tile the plane, which is what makes one memset over one row safe.
+    const RopeDeltaRowSpan span =
+        rope_delta_row_span(table_row_count(), rope_deltas_.ne[0], row);
+    if (span.bytes == 0) { throw std::out_of_range("Paged KV rope-delta row out of range"); }
+    auto* row_base = static_cast<unsigned char*>(rope_deltas_.data) + span.offset;
+    CUDA_CHECK(cudaMemsetAsync(row_base, 0, span.bytes, stream));
 }
 
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
@@ -703,18 +699,25 @@ void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping, cu
 void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot bind an empty Paged KV allocation"); }
     if (bound_row_ >= 0) { throw std::logic_error("Paged KV allocation is already bound"); }
-    // Clear the row's deltas *before* claiming it. `clear_rope_delta_row` range-checks and throws
-    // before issuing anything, so this order means a failure leaves no row marked in use; claiming
-    // first and clearing second would leak the row on any throw in between.
+    // Claim the row *before* clearing its deltas, and give it back if the clear fails.
     //
-    // This is the one place the plane's invariant can be established: `acquire_row` is the only path
-    // that claims a row, and a row is handed to a new sequence every time the previous one releases
-    // it. So a row carries either `kRopeDeltaNone` or a delta relocation wrote for the sequence
-    // currently bound to it. Without it, a page relocated for one sequence keeps its shift after the
-    // row is reused, and the next sequence's attention counter-rotates a page that was never moved --
-    // silently, because a stale shift is a plausible number.
-    pool_->clear_rope_delta_row(row, stream);
+    // The order matters and the obvious one is wrong. Clearing first means that when `acquire_row`
+    // rejects the row because another allocation still owns it, that other allocation's deltas have
+    // already been zeroed: it is still bound, still believes its relocated pages carry shifts, and
+    // attention now reads `kRopeDeltaNone` for pages that were actually moved. That is the same
+    // silent-corruption class as a stale shift -- a plausible zero instead of a plausible number --
+    // and it is not recoverable, because nothing downstream can tell.
+    //
+    // Acquiring first converts that into the failure the previous revision was trying to avoid, a row
+    // left marked in use, and the catch below then undoes it. A row stuck in use is loud: the next
+    // bind to that row throws. Choose the failure that reports itself.
     pool_->acquire_row(row);
+    try {
+        pool_->clear_rope_delta_row(row, stream);
+    } catch (...) {
+        pool_->release_row(row);
+        throw;
+    }
     bound_row_ = row;
     publish_mapping(stream);
 }
