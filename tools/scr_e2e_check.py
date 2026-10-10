@@ -261,7 +261,12 @@ def solve_alignment(port, max_tokens, timeout, think):
 
     prefix_units = 0
     for units in range(0, 60):
-        length = count_tokens(port, request_prompt("b", units), max_tokens, timeout, think)
+        # What has to be block-aligned is len(PREFIX) itself: that is where the surviving run
+        # begins in prompt B, and the block grid is anchored at position 0 in both prompts.
+        # Measuring the whole prompt B aligns prompt B, which is a different number, and it only
+        # agrees when TAIL happens to be a whole number of blocks -- which is exactly the `--fact-in
+        # prefix` case that failed to align at all.
+        length = count_tokens(port, prefix_text(units), max_tokens, timeout, think)
         if length % BLOCK_TOKENS == 0:
             prefix_units = units
             print(f"    PREFIX padded with {units} unit(s) -> {length} tokens, block aligned")
@@ -272,7 +277,9 @@ def solve_alignment(port, max_tokens, timeout, think):
 
     middle_units = 0
     for units in range(0, 80):
-        length = count_tokens(port, request_prompt("a", prefix_units, units), max_tokens, timeout, think)
+        # Same rule on the other side: len(PREFIX)+len(MIDDLE) is where the run begins in prompt A.
+        length = count_tokens(port, prefix_text(prefix_units) + middle_text(units),
+                              max_tokens, timeout, think)
         if length % BLOCK_TOKENS == 0:
             middle_units = units
             print(f"    MIDDLE padded with {units} unit(s) -> {length} tokens, block aligned")
@@ -283,16 +290,22 @@ def solve_alignment(port, max_tokens, timeout, think):
 
     tokens_b = count_tokens(port, request_prompt("b", prefix_units), max_tokens, timeout, think)
     tokens_a = count_tokens(port, request_prompt("a", prefix_units, middle_units), max_tokens, timeout, think)
-    # Split prompt A at the start of the middle: before it is the shared prefix, after it is the
-    # relocated run plus the deleted middle. So the run is (tokens_a - tokens_b) short of that.
-    head_only = request_prompt("a", prefix_units, middle_units).split("SECTION ONE")[0]
-    prefix_only = count_tokens(port, head_only, max_tokens, timeout, think)
+    # The run is everything in prompt B after the shared prefix. Measuring the prefix directly is
+    # the only sound way to get this: the sentinel this used to split on ("SECTION ONE") does not
+    # occur in these prompts at all, so the split returned the whole string and the estimate was
+    # wrong by the size of the prompt (it reported 647 of 856 tokens relocated where the applied
+    # plan relocated 128). That error also drove the "harsher regime than the paper" warning below,
+    # which then argued against a run that was actually inside the paper's regime.
+    prefix_only = count_tokens(port, prefix_text(prefix_units), max_tokens, timeout, think)
     tail_tokens = tokens_b - prefix_only
     share = 100 * tail_tokens // max(tokens_b, 1)
     print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
           f"MIDDLE = {tokens_a - tokens_b} tokens ({(tokens_a - tokens_b) // BLOCK_TOKENS} blocks)")
-    print(f"    relocated run is about {tail_tokens} tokens ({tail_tokens // BLOCK_TOKENS} blocks), "
-          f"roughly {share}% of the prompt")
+    # Approximate by construction: the tokenisation of the assembled prompt can differ from the
+    # per-segment counts by a constant, and the applied plan drops the last partial page. Read
+    # `span{... tok=...}` from the --scr-diag output for the number that was actually relocated.
+    print(f"    relocated run is about {tail_tokens} tokens (~{tail_tokens // BLOCK_TOKENS} blocks), "
+          f"roughly {share}% of the prompt (estimate; the applied plan is authoritative)")
     print(f"    (the paper reuses ~8% of prompt tokens beyond prefix-cache hits; a share far above "
           f"that is a much harsher regime than it measured)")
     return prefix_units, middle_units
