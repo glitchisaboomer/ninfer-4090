@@ -94,12 +94,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     return layout;
 }
 
-PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
+PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
+                               std::array<float, 32> rope_inv_freq)
     : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
       quant_group_(layout.quant_group), packed_v_(layout.packed_v), rotate_k_(layout.rotate_k),
       rotate_v_(layout.rotate_v), packed_k_(layout.packed_k), e8_lattice_(layout.e8_lattice),
-      e8_root_(layout.e8_root) {}
+      e8_root_(layout.e8_root), rope_inv_freq_(rope_inv_freq) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -141,6 +142,8 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .packed_k      = packed_k_,
         .e8_lattice    = e8_lattice_,
         .e8_root       = e8_root_,
+        .rope_deltas   = pool_.rope_delta_row_for_block_table(block_table),
+        .rope_inv_freq = rope_inv_freq_,
     };
 }
 
@@ -155,6 +158,8 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .k_scale_pages = quantized ? pool_.plane(base + 2) : Tensor(),
         .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
         .block_tables  = pool_.block_tables(),
+        .rope_deltas   = pool_.rope_deltas(),
+        .rope_inv_freq = rope_inv_freq_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,
@@ -172,9 +177,11 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }
 
-DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
-    : text_kv(backing, layout.text_kv), linear_attention(backing, layout.linear_attention) {
-    if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
+DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
+                               std::array<float, 32> rope_inv_freq)
+    : text_kv(backing, layout.text_kv, rope_inv_freq),
+      linear_attention(backing, layout.linear_attention) {
+    if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv, rope_inv_freq); }
 }
 
 PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }

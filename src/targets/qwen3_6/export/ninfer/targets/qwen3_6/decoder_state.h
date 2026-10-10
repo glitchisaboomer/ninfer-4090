@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <optional>
 
 namespace ninfer::targets::qwen3_6 {
@@ -72,7 +73,8 @@ private:
 
 class PagedKVCache {
 public:
-    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
+                 std::array<float, 32> rope_inv_freq = {});
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -80,6 +82,10 @@ public:
     PagedKVCache& operator=(PagedKVCache&&)      = delete;
 
     [[nodiscard]] std::uint32_t max_context() const noexcept { return max_context_; }
+
+    [[nodiscard]] const std::array<float, 32>& rope_inv_freq() const noexcept {
+        return rope_inv_freq_;
+    }
 
     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
 
@@ -108,6 +114,7 @@ private:
     bool packed_k_             = false;
     bool e8_lattice_           = false;
     bool e8_root_              = false;
+    std::array<float, 32> rope_inv_freq_{};
 };
 
 struct DecoderStateLayout {
@@ -126,7 +133,8 @@ struct DecoderState {
     std::optional<PagedKVCache> mtp_kv;
     LinearAttentionStatePool linear_attention;
 
-    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
+    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
+                 std::array<float, 32> rope_inv_freq = {});
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;

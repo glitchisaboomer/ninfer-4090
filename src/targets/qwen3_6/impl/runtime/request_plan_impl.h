@@ -14,6 +14,13 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
+// The delta-plane relocation path requires the attention kernel to counter-rotate Q per page.
+// Only the BF16 attention kernels implement that rotation today; the INT8 family does not.
+// Widen this set only when a matching kernel helper exists.
+constexpr bool delta_path_supports_dtype(DType dtype) {
+    return dtype == DType::BF16;
+}
+
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
         !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
@@ -259,6 +266,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         base.suffix_reuse_max_spans != 0 && speculative_backend == SpeculativeBackend::None &&
         base.vision_control == nullptr && sequence.retained && sequence.kv &&
         prompt.identity.reusable &&
+        delta_path_supports_dtype(kv_dtype) &&
         (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier)) {
         const qwen3_6::detail::PromptEditDiff diff = qwen3_6::detail::diff_prompt_edit(
             sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);

@@ -5,7 +5,6 @@
 #include "targets/qwen3_6/impl/runtime/prompt_lookup.h"
 #include "targets/qwen3_6/impl/runtime/yarn.h"
 #include "ninfer/ops/gdn_replay.h"
-#include "ninfer/ops/gqa_kv_rerotate.h"
 #include "core/paged_kv_delta_layout.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rope.h"
@@ -246,7 +245,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    // The RoPE table has to be installed before the decoder is constructed: every KV
+    // cache keeps a copy of it so each layer view hands the attention kernels the same
+    // table the forward RoPE used, including the YaRN-scaled table a large capacity
+    // selects. `compute_yarn_config` is a pure host computation over `capacity`, so
+    // hoisting it ahead of the state construction changes nothing else.
+    const auto yarn = compute_yarn_config(capacity);
+    text_rope_inv_freq = yarn.inv_freq;
+    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder,
+                                                         text_rope_inv_freq);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
     }
@@ -328,8 +335,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
-    const auto yarn = compute_yarn_config(capacity);
-    text_rope_inv_freq = yarn.inv_freq;
     ops::set_text_rope_frequencies(yarn.inv_freq.data());
     device.synchronize();
     prepare_graphs();
@@ -946,18 +951,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     }
                 }
             }
-            for (const RelocatedSpan& span : request_plan.relocated_spans) {
-                const auto delta = static_cast<std::int32_t>(
-                    static_cast<std::int64_t>(span.dest_begin) -
-                    static_cast<std::int64_t>(span.source_begin));
-                for (int full_layer = 0; full_layer < TextConfig::full_attention_layers();
-                     ++full_layer) {
-                    ops::gqa_kv_rerotate_run(static_cast<std::int32_t>(span.dest_begin),
-                                             static_cast<std::int32_t>(span.tokens), delta,
-                                             text_rope_inv_freq, relocation_kv.layer_view(full_layer),
-                                             device.stream);
-                }
-            }
+            // Relocation is expressed entirely on the delta plane: the block-table
+            // row was re-pointed and the per-page deltas published by
+            // `sequence.kv->text.reassign_pages(remap, deltas, device.stream)`
+            // above. The attention kernels counter-rotate Q per page from the
+            // delta plane, so the physical K bytes are left exactly as the
+            // original prefill wrote them; there is no in-place K rewrite here.
             if (scr_diagnostics_enabled()) {
                 // Fingerprint the relocated destination pages as the prefill will find them, so the
                 // post-prefill check can prove they survived it. Resolved through the published block

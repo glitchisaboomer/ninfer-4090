@@ -204,8 +204,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         // No runtime cross-check against pos[]. The doc asks for one, but pos[] holds
         // absolute positions while delta is a relative shift, and there is no cheap
         // invariant linking the two at this location. The sign convention is verified
-        // statically against the rerotate oracle in
-        // tests/targets/qwen3_6/test_gqa_kv_rerotate.cpp, which is the authority.
+        // by the delta-plane oracle test (tests/ops/test_gqa_kv_page_delta.cpp) and
+        // the integration test's negative control (tests/ops/test_scr_relocation_
+        // integration.cpp), which are the authorities.
         if (current_delta != 0) {
             gqa_rope_counter_rotate_q_bf16(af_q, lid, current_delta, freq);
         }

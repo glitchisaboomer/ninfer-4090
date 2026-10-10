@@ -271,6 +271,28 @@ Tensor PagedKVPool::rope_delta_row(std::int32_t row) const {
         {static_cast<std::int32_t>(logical_page_capacity())});
 }
 
+// Tensor::slice advances the view's `data` pointer by `start * nb[dim]` and Tensor
+// carries no separate offset field, so a block-table row slice's `data` already points
+// at its first element inside `block_tables_`. The row index therefore comes from the
+// raw pointer difference alone, with no offset compensation.
+Tensor PagedKVPool::rope_delta_row_for_block_table(Tensor block_table) const {
+    if (block_table.data == nullptr) { return Tensor{}; }
+    const auto* base = static_cast<const unsigned char*>(block_tables_.data);
+    const auto* ptr  = static_cast<const unsigned char*>(block_table.data);
+    const auto  span = static_cast<std::size_t>(block_tables_.numel()) * sizeof(std::int32_t);
+    if (ptr < base || ptr >= base + span) {
+        throw std::out_of_range("block-table slice does not belong to this pool");
+    }
+    const auto offset_bytes = static_cast<std::size_t>(ptr - base);
+    const auto stride_bytes =
+        static_cast<std::size_t>(logical_page_capacity()) * sizeof(std::int32_t);
+    if (stride_bytes == 0 || offset_bytes % stride_bytes != 0) {
+        throw std::invalid_argument("block-table slice is not row-aligned");
+    }
+    const std::int32_t row = static_cast<std::int32_t>(offset_bytes / stride_bytes);
+    return rope_delta_row(row);
+}
+
 std::uint32_t PagedKVPool::entitled_pages() const noexcept { return entitled_pages_; }
 
 std::uint32_t PagedKVPool::mapped_pages() const noexcept { return mapped_pages_; }

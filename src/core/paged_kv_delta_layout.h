@@ -139,8 +139,8 @@ resolve_rope_delta_layout(std::int32_t max_context, std::int32_t table_rows) noe
 // inside or entirely outside; the partial case is therefore a boundary error and returns none rather
 // than a shift that would move half a page's keys.
 //
-// The sign is the one `gqa_kv_rerotate` documents: the caller supplies
-// `new_position - old_position`, so a span moved left is negative.
+// The sign is the one the attention kernels' Q counter-rotation documents: the
+// caller supplies `new_position - old_position`, so a span moved left is negative.
 [[nodiscard]] constexpr std::int32_t rope_delta_for_span(std::uint32_t source_begin,
                                                         std::uint32_t source_tokens,
                                                         std::uint32_t dest_begin,

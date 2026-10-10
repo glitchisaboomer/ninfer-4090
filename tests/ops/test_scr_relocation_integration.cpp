@@ -1,40 +1,49 @@
-// Integration test for Suffix Cache Reuse relocation: a re-rotated page must be indistinguishable
-// from a page a direct prefill at the destination would have written, judged by the real attention
-// Op reading the real cache.
+// Integration test for Suffix Cache Reuse relocation: a delta-plane-relocated
+// page must be indistinguishable from a page a direct prefill at the
+// destination would have written, judged by the real attention Ops reading
+// the real cache.
 //
-// The component test (tests/targets/qwen3_6/test_gqa_kv_rerotate.cpp) seeds the K plane by hand using
-// paged_kv_element_offset, the same addressing the Op under test uses. That makes it a test of the
-// rotation arithmetic *given* an addressing convention; it cannot detect the Op and the cache writer
-// disagreeing about that convention. This file closes that gap: every byte of cache content is
-// written by ops::gqa_kv_append, and every read goes through ops::gqa_attention_cached or
-// ops::gqa_attention -- kernels that were not written with the Op in mind.
+// The oracle test (tests/ops/test_gqa_kv_page_delta.cpp) drives the detail::
+// launchers directly with a hand-built delta plane, which makes it a test of
+// the counter-rotation arithmetic given an addressing convention; it cannot
+// detect the public entry points and the cache writer disagreeing about that
+// convention. This file closes that gap: every byte of cache content is
+// written by ops::gqa_kv_append, and every read goes through
+// ops::gqa_attention_cached or ops::gqa_attention -- kernels that were not
+// written with the delta plane in mind.
 //
 // Method:
 //   1. One random raw K row per token, per KV head.
 //   2. K_source    = bf16(rope(raw, src + t))  appended at positions [src, src+T)
 //      K_reference = bf16(rope(raw, dst + t))  appended at positions [dst, dst+T)
 //      V           = identical in both, so K is the only thing that differs.
-//   3. A correct re-rotation by delta = dst - src makes the two caches equivalent, so the assertion is
-//      that attention over the relocated cache is indistinguishable from attention over the directly
-//      prefilled one. A re-rotation applied twice, or to the wrong pages, changes the K rows and shows
-//      up in that comparison.
-//   4. The directly prefilled cache is additionally held to the FP64 attention oracle at the published
-//      conformance criterion, which anchors the harness itself: a failure there means the reader, the
-//      oracle, or this test's cache construction disagree, independently of any relocation.
-//   5. The block table is a non-identity permutation and the destination logical page is re-pointed at
-//      the source's physical page before the append, which is exactly what reassign_pages produces.
-//      The Op therefore has to resolve the page through the table rather than reuse a page number.
-//   6. A negative control runs the same comparison with the re-rotation skipped and requires the error
-//      to clear the pass limit by a wide factor, so a blind harness reports itself instead of passing.
+//   3. A relocation re-points the destination logical page at the source's
+//      physical page -- already done to the block table by build_scenario,
+//      exactly what reassign_pages publishes -- and writes delta = dst - src
+//      for that page on the delta plane. The K bytes stay exactly as the
+//      source prefill wrote them; the attention kernels counter-rotate Q per
+//      page from the delta plane, so the assertion is that attention over the
+//      relocated cache is indistinguishable from attention over the directly
+//      prefilled one. A delta plane that names the wrong pages, or zeroes the
+//      destination page, changes the scores and shows up in that comparison.
+//   4. The directly prefilled cache is additionally held to the FP64 attention
+//      oracle at the published conformance criterion, which anchors the harness
+//      itself: a failure there means the reader, the oracle, or this test's
+//      cache construction disagree, independently of any relocation.
+//   5. A negative control runs the same comparison with an all-zero delta
+//      plane -- a relocation that published no deltas -- and requires the error
+//      to clear the pass limit by a wide factor, so a blind harness reports
+//      itself instead of passing.
 //
-// If this file passes, the relocation Op is consistent with the production write path and the
-// production read path, and any remaining SCR failure lies in how the runtime sequences the two.
+// If this file passes, the relocation delta plane is consistent with the
+// production write path and the production read path, and any remaining SCR
+// failure lies in how the runtime sequences the two.
 //
-// Shared scenario, oracle, and threshold definitions live in gqa_relocation_test_common.h so this test
-// and the delta-plane oracle test cannot drift.
+// Shared scenario, oracle, and threshold definitions live in
+// gqa_relocation_test_common.h so this test and the delta-plane oracle test
+// cannot drift.
 
 #include "ops/gqa_relocation_test_common.h"
-#include "ninfer/ops/gqa_kv_rerotate.h"
 
 using namespace ninfer;
 
@@ -47,8 +56,12 @@ void fail(const std::string& what) {
     ++failures;
 }
 
-// 1. The Op's addressing must agree with the production write path. The component test cannot see
-//    this, because it seeds and reads through the Op's own helper.
+// 1. The production write path must store rows the way the FP64 RoPE oracle
+//    describes them. The delta-plane reader and the writer have to agree on
+//    the cache's addressing convention; the oracle test seeds and reads
+//    through its own helpers, so it cannot see a disagreement between
+//    ops::gqa_kv_append and the attention kernels. This check anchors the
+//    writer directly against the oracle.
 void check_layout_agreement(const Scenario& scenario) {
     const FreqTable freq = default_inv_freq();
     Cache cache           = make_reference_cache(scenario);
@@ -88,15 +101,15 @@ void check_layout_agreement(const Scenario& scenario) {
     // rounding chain fp64 -> fp32 -> bf16. That chain reaches exactly 1.0 operand-BF16 ulp in the
     // worst case, where the rotation lands its result on twice the operand magnitude, so a limit at
     // 1.0 would fail on correct data. A layout disagreement is not a perturbation at all: it permutes
-    // the rotary pairs, which costs 505 ulp on the same data. 4.0 keeps the separation the component
+    // the rotary pairs, which costs 505 ulp on the same data. 4.0 keeps the separation the oracle
     // test uses while clearing the rounding chain.
     constexpr double kLayoutUlpLimit = 4.0;
     if (worst > kLayoutUlpLimit) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
                       "write-path layout: gqa_kv_append stores a row %.2f BF16 ulp from the FP64 RoPE "
-                      "oracle (head %d, position %d), over the %.1f limit, so gqa_kv_rerotate's "
-                      "addressing convention is not the cache's",
+                      "oracle (head %d, position %d), over the %.1f limit, so the cache writer's "
+                      "addressing convention is not the one the delta-plane reader uses",
                       worst, worst_head, worst_position, kLayoutUlpLimit);
         fail(buf);
     } else {
@@ -105,61 +118,92 @@ void check_layout_agreement(const Scenario& scenario) {
     }
 }
 
-// 2. The Op must rotate exactly the destination physical page, and nothing else.
-void check_targeting(const Scenario& scenario, std::int32_t delta) {
-    const FreqTable freq = default_inv_freq();
-    Cache cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+// The delta plane a one-page relocation publishes: every logical page is
+// ordinary except the destination page, which carries the full dst - src
+// shift. This is the plane `PagedKVAllocation::reassign_pages` writes for a
+// relocation that moves one page-aligned run.
+struct DeltaPlane {
+    DeviceBuffer buffer;
+};
 
-    const std::vector<std::uint16_t> k_before = cache.k_plane();
-    const std::vector<std::uint16_t> v_before = cache.v_plane();
-
-    ops::gqa_kv_rerotate_run(scenario.dst, kRelocatedRun, delta,
-                             std::span<const float, kRotaryPairs>(freq), cache.view(), nullptr);
-    CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    CUDA_CHECK(cudaGetLastError());
-
-    const std::vector<std::uint16_t> k_after = cache.k_plane();
-    const std::vector<std::uint16_t> v_after = cache.v_plane();
-
-    const int before_failures                 = failures;
-    const std::int32_t expected_physical      = scenario.table[static_cast<std::size_t>(kDestPage)];
-    const std::size_t span                    = cache.elements_per_page();
-    int changed_pages                         = 0;
-    for (std::int32_t page = 0; page < cache.physical_pages; ++page) {
-        const std::size_t base = span * static_cast<std::size_t>(page);
-        bool changed           = false;
-        for (std::size_t i = base; i < base + span; ++i) {
-            if (k_before[i] != k_after[i]) {
-                changed = true;
-                break;
-            }
-        }
-        if (!changed) { continue; }
-        ++changed_pages;
-        if (page != expected_physical) {
-            fail("targeting: physical page " + std::to_string(page) +
-                 " was rotated, but the destination logical page resolves to " +
-                 std::to_string(expected_physical));
-        }
-    }
-    if (changed_pages != 1) {
-        fail("targeting: " + std::to_string(changed_pages) +
-             " physical pages changed, expected exactly the destination page " +
-             std::to_string(expected_physical));
-    }
-    if (v_before != v_after) {
-        fail("targeting: the Op modified the V plane; re-rotation must leave V byte-identical");
-    }
-    if (failures == before_failures) {
-        std::printf("  targeting: ok (only physical page %d rotated, V untouched)\n",
-                    expected_physical);
-    }
+[[nodiscard]] DeltaPlane make_delta_plane(std::int32_t delta) {
+    std::vector<std::int32_t> host(kLogicalPages, 0);
+    host[static_cast<std::size_t>(kDestPage)] = delta;
+    DeltaPlane plane;
+    plane.buffer = upload_i32(host);
+    return plane;
 }
 
-// 3. The relocated cache must be operationally indistinguishable from a directly prefilled one when
-//    read by A3. This is the assertion the component test cannot make: it reads the plane the way the
-//    Op writes it and never asks whether the attention kernel agrees.
+// A single-sequence layer view with the delta plane and freq table attached,
+// the shape `PagedKVCache::layer_view` hands the decode path.
+[[nodiscard]] PagedKVLayerView delta_view(const Cache& cache, const DeltaPlane& plane,
+                                               const FreqTable& freq) {
+    PagedKVLayerView view = cache.view();
+    view.rope_deltas   = Tensor(plane.buffer.p, DType::I32, {kLogicalPages});
+    view.rope_inv_freq = freq;
+    return view;
+}
+
+// The batched equivalent, the shape `PagedKVCache::batch_layer_view` hands
+// the prefill path: one table row, so the plane is [logical_pages, 1].
+[[nodiscard]] PagedKVBatchLayerView delta_batch_view(const Cache& cache,
+                                                          const DeltaPlane& plane,
+                                                          const FreqTable& freq) {
+    PagedKVBatchLayerView batch = cache.batch_view();
+    batch.rope_deltas   = Tensor(plane.buffer.p, DType::I32, {kLogicalPages, 1});
+    batch.rope_inv_freq = freq;
+    return batch;
+}
+
+// A1 (append-and-attend) through the public gqa_attention entry point, with
+// an explicit batch view so the delta plane and freq table can be attached.
+// Mirrors run_append_attention in the shared header.
+AttentionRun run_append_attention_view(Cache& cache,
+                                          const std::vector<__nv_bfloat16>& q,
+                                          const std::vector<__nv_bfloat16>& k,
+                                          const std::vector<__nv_bfloat16>& v,
+                                          std::int32_t first_position, std::int32_t tokens,
+                                          std::uint32_t visible,
+                                          const PagedKVBatchLayerView& batch_view) {
+    append_chunk(cache, k, v, first_position, tokens);
+
+    DeviceBuffer dq     = upload(q);
+    DeviceBuffer dk     = upload(k);
+    DeviceBuffer dv     = upload(v);
+    DeviceBuffer dtable = DeviceBuffer(sizeof(std::int32_t));
+    const std::int32_t table_row = 0;
+    dtable.copy_from_host(&table_row, sizeof(table_row));
+    DeviceBuffer dout = DeviceBuffer(q.size() * sizeof(__nv_bfloat16));
+    dout.fill(0);
+    DeviceBuffer dp = upload_positions(sequential_positions(first_position, tokens));
+
+    const ops::GqaExecutionEnvelope envelope{visible, visible};
+    const std::size_t workspace_bytes =
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, DType::BF16, envelope, 1,
+                                                           tokens, tokens);
+    DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKvHeads, tokens});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKvHeads, tokens});
+    Tensor tp(dp.p, DType::I32, {tokens});
+    Tensor ttable(dtable.p, DType::I32, {1});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable, kAttentionScale, batch_view,
+                       envelope, workspace, tout, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    CUDA_CHECK(cudaGetLastError());
+    return AttentionRun{download_doubles(dout, q.size())};
+}
+
+// 2. A delta-plane relocation must be operationally indistinguishable from a
+//    directly prefilled cache when read by A3 through the public entry
+//    point. The relocated cache's K still carries the source positions'
+//    rotation -- exactly what a surviving page holds after reassign_pages --
+//    and the attention kernel counter-rotates Q by the published per-page
+//    delta. This is the assertion the oracle test makes on the detail::
+//    launcher, exercised here on the public route the served runtime uses.
 void check_attention_equivalence(const Scenario& scenario) {
     const FreqTable freq     = default_inv_freq();
     const std::int32_t delta = scenario.dst - scenario.src;
@@ -167,49 +211,46 @@ void check_attention_equivalence(const Scenario& scenario) {
 
     Cache relocated(kLogicalPages, scenario.table, kKvHeads);
     append_chunk(relocated, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
-    ops::gqa_kv_rerotate_run(scenario.dst, kRelocatedRun, delta,
-                             std::span<const float, kRotaryPairs>(freq), relocated.view(), nullptr);
-    CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    CUDA_CHECK(cudaGetLastError());
+    const DeltaPlane plane = make_delta_plane(delta);
+    const PagedKVLayerView view = delta_view(relocated, plane, freq);
 
     Cache reference = make_reference_cache(scenario);
 
     const AttentionRun got_reference =
         run_cached_attention(reference, scenario.q, kQueryBase, kQueryTokens, visible);
-    const AttentionRun got_relocated =
-        run_cached_attention(relocated, scenario.q, kQueryBase, kQueryTokens, visible);
+    const AttentionRun got_relocated = run_cached_attention_view(
+        relocated, scenario.q, kQueryBase, kQueryTokens, visible, view);
 
     // Anchors the harness: the directly prefilled cache is plain prefill, so the conformance criterion
     // applies to it unchanged and a failure here means the reader, the oracle, or this test's cache
     // construction disagree, independently of any relocation.
     if (!expect_conformant(measure(got_reference.out, ideal_attention(scenario.q, reference, kQueryBase,
-                                                                kQueryTokens)),
+                                                                 kQueryTokens)),
                       "A3 over a directly prefilled page")) {
         ++failures;
     }
 
     const Error correct = measure(got_relocated.out, got_reference.out);
-    if (!expect_equivalent(correct, "A3 over a relocated page")) {
+    if (!expect_equivalent(correct, "A3 over a delta-plane relocated page")) {
         ++failures;
     }
 
-    // Negative control: a skipped re-rotation is the failure this file exists to catch. The K then
-    // still carries the source positions' rotation.
-    Cache stale(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(stale, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
-    ops::gqa_kv_rerotate_run(scenario.dst, kRelocatedRun, 0,
-                             std::span<const float, kRotaryPairs>(freq), stale.view(), nullptr);
-    CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    const AttentionRun got_stale =
-        run_cached_attention(stale, scenario.q, kQueryBase, kQueryTokens, visible);
+    // Negative control: an all-zero delta plane is a relocation that published
+    // no deltas. The K still carries the source positions' rotation, so the
+    // scores must diverge by orders of magnitude.
+    const DeltaPlane none        = make_delta_plane(0);
+    const PagedKVLayerView stale = delta_view(relocated, none, freq);
+    const AttentionRun got_stale = run_cached_attention_view(
+        relocated, scenario.q, kQueryBase, kQueryTokens, visible, stale);
     if (!expect_control_separates(correct, measure(got_stale.out, got_reference.out),
-                             "negative control: a skipped re-rotation")) {
+                                 "negative control: a relocation that published no deltas")) {
         ++failures;
     }
 }
 
-// 4. The same check through A1, which is the append-and-attend route the prefill itself uses, so the
-//    relocated page is read by the same kernel that wrote the chunk sitting after it.
+// 3. The same check through A1, which is the append-and-attend route the
+//    prefill itself uses, so the relocated page is read by the same kernel
+//    that wrote the chunk sitting after it.
 void check_append_attention_equivalence(const Scenario& scenario) {
     const FreqTable freq     = default_inv_freq();
     const std::int32_t delta = scenario.dst - scenario.src;
@@ -236,41 +277,40 @@ void check_append_attention_equivalence(const Scenario& scenario) {
 
     Cache relocated(kLogicalPages, scenario.table, kKvHeads);
     append_chunk(relocated, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
-    ops::gqa_kv_rerotate_run(scenario.dst, kRelocatedRun, delta,
-                             std::span<const float, kRotaryPairs>(freq), relocated.view(), nullptr);
-    CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    CUDA_CHECK(cudaGetLastError());
+    const DeltaPlane plane = make_delta_plane(delta);
+    const PagedKVBatchLayerView batch = delta_batch_view(relocated, plane, freq);
 
     Cache reference = make_reference_cache(scenario);
 
-    const AttentionRun got_relocated =
-        run_append_attention(relocated, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible);
-    const AttentionRun got_reference =
-        run_append_attention(reference, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible);
+    const AttentionRun got_relocated = run_append_attention_view(
+        relocated, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible, batch);
+    const AttentionRun got_reference = run_append_attention(
+        reference, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible);
 
     if (!expect_conformant(measure(got_reference.out,
-                              ideal_attention(tail_q_data, reference, tail_first, kTailTokens)),
-                      "A1 over a directly prefilled page")) {
+                                  ideal_attention(tail_q_data, reference, tail_first, kTailTokens)),
+                          "A1 over a directly prefilled page")) {
         ++failures;
     }
     const Error correct = measure(got_relocated.out, got_reference.out);
-    if (!expect_equivalent(correct, "A1 over a relocated page")) {
+    if (!expect_equivalent(correct, "A1 over a delta-plane relocated page")) {
         ++failures;
     }
 
+    // Negative control on a fresh cache: the source rotation survives and no
+    // delta is published, so the relocated page's keys are read at the wrong
+    // angles.
     Cache stale(kLogicalPages, scenario.table, kKvHeads);
     append_chunk(stale, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
-    ops::gqa_kv_rerotate_run(scenario.dst, kRelocatedRun, 0,
-                             std::span<const float, kRotaryPairs>(freq), stale.view(), nullptr);
-    CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    const AttentionRun got_stale =
-        run_append_attention(stale, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible);
+    const DeltaPlane none          = make_delta_plane(0);
+    const PagedKVBatchLayerView stale_batch = delta_batch_view(stale, none, freq);
+    const AttentionRun got_stale = run_append_attention_view(
+        stale, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible, stale_batch);
     if (!expect_control_separates(correct, measure(got_stale.out, got_reference.out),
-                             "negative control: a skipped re-rotation through A1")) {
+                                 "negative control: a relocation that published no deltas through A1")) {
         ++failures;
     }
 }
-
 
 } // namespace
 
@@ -288,7 +328,6 @@ int main() {
                 kRelocatedRun, scenario.src, scenario.dst, scenario.dst - scenario.src);
 
     check_layout_agreement(scenario);
-    check_targeting(scenario, scenario.dst - scenario.src);
     check_attention_equivalence(scenario);
     check_append_attention_equivalence(scenario);
 

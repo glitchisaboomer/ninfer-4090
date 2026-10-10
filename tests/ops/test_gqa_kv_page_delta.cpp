@@ -27,7 +27,7 @@ void fail(const std::string& what) {
 
 // Sign convention: delta = dst - src. The kernel applies R(-delta) to Q, which is equivalent to the
 // key having been at dst instead of src. This matches the Phase 4a comment in gqa_attention_decode.cuh
-// and the rerotate oracle in tests/targets/qwen3_6/test_gqa_kv_rerotate.cpp.
+// and the integration test's negative control in tests/ops/test_scr_relocation_integration.cpp.
 constexpr std::int32_t kDelta = (kDestPage * kPageSize) - (kSourcePage * kPageSize); // = -384
 
 // The detail::gqa_attention_cached_small_t_launch dispatch only accepts TOKENS in [1, 8].

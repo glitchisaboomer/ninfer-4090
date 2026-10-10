@@ -6,6 +6,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -134,6 +135,10 @@ public:
     [[nodiscard]] const Tensor& rope_deltas() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
     [[nodiscard]] Tensor rope_delta_row(std::int32_t row) const;
+    // Given a single-row block-table slice (as returned by `block_table_row`), return the
+    // matching rope-delta row. Pointer-range matching: the block_table tensor's data pointer
+    // must lie inside `block_tables_`. Throws if it does not.
+    [[nodiscard]] Tensor rope_delta_row_for_block_table(Tensor block_table) const;
 
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;

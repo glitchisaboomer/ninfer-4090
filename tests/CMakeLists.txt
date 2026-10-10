@@ -163,10 +163,6 @@ ninfer_add_test(ninfer_qwen3_6_prefill_trace_hash_test
 ninfer_add_test(ninfer_qwen3_6_scr_quality_test
   SOURCES targets/qwen3_6/test_scr_quality.cpp
   LIBRARIES ninfer_engine)
-ninfer_add_test(ninfer_qwen3_6_gqa_kv_rerotate_test
-  SOURCES targets/qwen3_6/test_gqa_kv_rerotate.cpp
-  LIBRARIES ninfer_engine ninfer_core)
-set_tests_properties(ninfer_qwen3_6_gqa_kv_rerotate_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_paged_kv_reassign_pages_test
   SOURCES test_paged_kv_reassign_pages.cpp
   LIBRARIES ninfer_core)
@@ -284,9 +280,9 @@ endforeach()
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
-# Pairs with the gqa_kv_rerotate component test: same Op, but every cache byte is written by
-# gqa_kv_append and every read goes through the attention kernels, so an addressing convention the
-# component test cannot disagree with is still exercised end to end.
+# Pairs with the per-page delta oracle test: same scenario, but every cache byte is written by
+# gqa_kv_append and every read goes through the public attention entry points, so an addressing
+# convention the component test cannot disagree with is still exercised end to end.
 ninfer_add_op_test(ninfer_scr_relocation_integration_test
   SOURCES ops/test_scr_relocation_integration.cpp
   LIBRARIES ninfer_ops)
