@@ -78,6 +78,30 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     }
     layout.block_tables = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                              "Paged KV block tables");
+
+    // The RoPE delta plane, sized by the same arithmetic the host test pins rather than by a second
+    // hand-written formula. It is allocated unconditionally: at 0.5-256 KiB against a KV cache
+    // measured in GiB it is not worth a flag that could be forgotten, and a pool that cannot carry
+    // deltas is a pool that silently cannot relocate.
+    //
+    // The extents are cross-checked against the block table rather than assumed to match it, because
+    // that mismatch is the failure this whole plane exists to avoid: a delta plane smaller than the
+    // block table beside it leaves pages whose delta can never be read, which presents as
+    // "relocation silently did nothing" rather than as an error. Here the two are derived from one
+    // source, so the check is structural -- but it is what catches the day the sources diverge.
+    const std::int32_t implied_context =
+        static_cast<std::int32_t>(static_cast<std::uint64_t>(logical_pages) *
+                                  static_cast<std::uint64_t>(kPagedKVPageSize));
+    const RopeDeltaLayout rope = resolve_rope_delta_layout(implied_context, spec.table_rows);
+    if (rope.logical_pages != logical_pages || rope.table_rows != spec.table_rows) {
+        throw std::logic_error("Paged KV rope-delta plane does not cover its block table");
+    }
+    if (!rope_delta_layout_is_supported(rope.table_rows, rope.logical_pages, spec.table_rows,
+                                        logical_pages)) {
+        throw std::invalid_argument("Paged KV rope-delta layout is not supported");
+    }
+    layout.rope_deltas = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
+                                            "Paged KV rope deltas");
     return layout;
 }
 
@@ -87,10 +111,13 @@ std::size_t PagedKVPoolLayout::payload_bytes() const noexcept {
     return total;
 }
 
-std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept { return block_tables.region.bytes; }
+std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept {
+    return block_tables.region.bytes + rope_deltas.region.bytes;
+}
 
 PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     : spec_(layout.spec), block_tables_(layout.block_tables.bind(backing)),
+      rope_deltas_(layout.rope_deltas.bind(backing)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false) {
     if (layout.planes.size() != spec_.planes.size() || layout.planes.empty()) {
         throw std::invalid_argument("Paged KV layout plane inventory is inconsistent");
@@ -100,6 +127,13 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
             checked_i32(spec_.logical_page_capacity, "Paged KV logical page capacity") ||
         block_tables_.ne[1] != spec_.table_rows) {
         throw std::logic_error("Paged KV block-table layout is inconsistent");
+    }
+    // The delta plane is read with the block table's index, so it must carry the block table's shape.
+    // A mismatch here is not a size question, it is an addressing question: every delta read would
+    // fetch the wrong page's shift.
+    if (rope_deltas_.dtype != DType::I32 || rope_deltas_.ne[0] != block_tables_.ne[0] ||
+        rope_deltas_.ne[1] != block_tables_.ne[1]) {
+        throw std::logic_error("Paged KV rope-delta layout is inconsistent with its block table");
     }
 
     planes_.reserve(layout.planes.size());
@@ -172,6 +206,8 @@ std::size_t PagedKVPool::plane_count() const noexcept { return planes_.size(); }
 const Tensor& PagedKVPool::plane(std::size_t index) const { return planes_.at(index); }
 
 const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_; }
+
+const Tensor& PagedKVPool::rope_deltas() const noexcept { return rope_deltas_; }
 
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
     if (row < 0 || row >= table_row_count()) {

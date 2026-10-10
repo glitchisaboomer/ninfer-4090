@@ -92,6 +92,11 @@ struct PagedKVPoolLayout {
     PagedKVPoolSpec spec;
     std::vector<PagedKVPlaneLayout> planes;
     TensorRegion block_tables;
+    // Per-(logical page, table row) RoPE delta, parallel to the block tables. One int32 per entry:
+    // the number of positions a page's keys were moved by relocation, so attention can counter-rotate
+    // its query tile instead of the quantized K plane being rewritten. Sized from the block table it
+    // parallels, never independently -- see plan_paged_kv_pool.
+    TensorRegion rope_deltas;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
@@ -119,6 +124,10 @@ public:
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] const Tensor& block_tables() const noexcept;
+    // The RoPE delta plane, one int32 per (logical page, table row), indexed exactly like the block
+    // table beside it. `kRopeDeltaNone` (0) means the page is ordinary and attention takes its
+    // existing route. Reading this is what makes a quantized K plane relocatable without rewriting it.
+    [[nodiscard]] const Tensor& rope_deltas() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
 
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
@@ -164,6 +173,7 @@ private:
     PagedKVPoolSpec spec_;
     std::vector<Tensor> planes_;
     Tensor block_tables_;
+    Tensor rope_deltas_;
     std::vector<std::int32_t> free_page_ids_;
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;

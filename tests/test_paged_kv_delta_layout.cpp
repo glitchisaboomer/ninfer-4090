@@ -20,11 +20,13 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 
 namespace {
 
 using ninfer::kPagedKVPageSize;
 using ninfer::kRopeDeltaNone;
+using ninfer::RopeDeltaLayout;
 using ninfer::relocated_span_is_page_aligned;
 using ninfer::resolve_rope_delta_layout;
 using ninfer::rope_delta_for_span;
@@ -168,6 +170,33 @@ void test_per_page_delta() {
           "the largest representable shift is accepted");
 }
 
+// `plan_paged_kv_pool` sizes the delta plane by reconstructing a context length from the pool's
+// logical page count and asking this header for the layout. That round trip has to be exact: if
+// logical_pages * 64 does not resolve back to logical_pages, the plane's extents silently stop
+// matching the block table it parallels, and every delta read then fetches the wrong page's shift.
+// Pinning it here keeps the planner's derivation honest without needing a CUDA build.
+void test_implied_context_round_trip() {
+    std::printf("implied-context round trip matches the block table it parallels\n");
+    for (std::int32_t pages = 1; pages <= 8192; pages *= 2) {
+        const std::int32_t implied = static_cast<std::int32_t>(
+            static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(kPagedKVPageSize));
+        for (std::int32_t rows : {std::int32_t{1}, std::int32_t{4}, std::int32_t{8}}) {
+            const RopeDeltaLayout rope = resolve_rope_delta_layout(implied, rows);
+            if (rope.logical_pages != pages || rope.table_rows != rows) {
+                std::printf("  FAIL: pages=%d rows=%d resolved to %d/%d\n", pages, rows,
+                            rope.logical_pages, rope.table_rows);
+                ++g_failures;
+            }
+        }
+    }
+    // A capacity that is not a whole number of pages must still resolve, because the pool reserves
+    // the page the partial tail lives in.
+    check(resolve_rope_delta_layout(65 * kPagedKVPageSize, 4).logical_pages == 65,
+          "a context one token past a page boundary still resolves");
+    // And an empty pool resolves to nothing rather than to a one-page plane.
+    check(resolve_rope_delta_layout(0, 4).logical_pages == 0, "no context resolves to no plane");
+}
+
 } // namespace
 
 int main() {
@@ -186,6 +215,7 @@ int main() {
     test_support_rules();
     test_span_alignment();
     test_per_page_delta();
+    test_implied_context_round_trip();
 
     if (g_failures != 0) {
         std::printf("FAILED: %d check(s)\n", g_failures);
