@@ -329,6 +329,16 @@ not go looking for an interaction that does not exist.
 **Verify:** the oracle test in §3, plus `compute-sanitizer --tool racecheck` and `--tool initcheck`,
 because the delta plane is a new read that most readers do not yet know about.
 
+**Phase 4a Completion Gate (Must pass before starting 4b):**
+1. **Spill Check:** Run `ptxas -v` on `gqa_attention_prefill_bf16_kernel`. The nested `cp.async` Q reload inside the phase loop must not push register pressure past the spilling threshold. If it spills, the common case (no relocation) regresses to pay for the rare case.
+2. **Regression Gate:** Run `test_scr_relocation_integration`. It must pass unchanged. This proves the `nullptr` delta path is perfectly neutral and introduces no silent data corruption.
+
+**Phase 4b Execution Sequence:**
+1. Write `test_gqa_kv_page_delta.cpp` with the strict non-zero delta scenario described in §3.
+2. Run it against the current unwired (`nullptr`) launchers. **It must fail with massive L2 error.**
+3. Wire the runtime delta plane (e.g., `cache.rope_deltas().data`) into the launchers in `gqa_attention_decode.cu` and `gqa_attention_prefill.cu`.
+4. Run the oracle test again. **It must now pass.**
+
 ### Step 5 — readers that are not decode attention
 
 Anything that reads the K plane must honour the delta or it will produce silently wrong scores with no
@@ -361,6 +371,9 @@ control in which skipping the re-rotation registers 2.3e-1 relative L2 versus 7.
    direct prefill at the destination. Negative control: delta ignored by the kernel must show a large
    error, or the test is blind. Run it for **every dtype**, with `rk4v4-e8` first — that is the
    configuration this change exists for and the one nobody has ever executed.
+
+**The Phase 4b Oracle Test Trap:**
+Because the unwired Phase 4a path passes `nullptr` for the delta plane, and `nullptr` is the mathematically correct behavior for a *non-relocated* sequence, a naive oracle test might accidentally pass against the unwired kernel. The test scenario *must* explicitly construct a sequence that requires a non-zero delta on at least one page (e.g., a relocated span). The test must assert that the L2 error against the FP64 oracle exceeds a threshold that a working null path cannot reach. If the test does not fail loudly and unambiguously on the unwired `nullptr` path, the harness is blind and will silently accept a broken wiring in Phase 4b.
 2. **Delta-plane lifecycle test.** Acquire a row, relocate, release, re-acquire, and assert the row's
    deltas are zero before anything writes them. This is the recycling trap, and it is the failure mode
    most likely to ship silently.

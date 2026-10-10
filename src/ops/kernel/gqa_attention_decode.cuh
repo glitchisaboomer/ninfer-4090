@@ -12,6 +12,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ninfer/ops/gqa_kv_rerotate.h"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -127,6 +128,48 @@ __device__ __forceinline__ int gqa_small_t_tc_swz(int row, int col) {
 
 __device__ __forceinline__ int gqa_small_t_tc_swz32(int row, int col) {
     return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
+}
+
+// Counter-rotate a Q A-fragment (m16n8k16 bf16 layout) by R(-delta).
+// Pairs (e, e+32) for e in [0,32). Only k-chunks 0..3 (columns 0-63) are touched.
+__device__ __forceinline__ void gqa_rope_counter_rotate_q_bf16(
+    unsigned af[/*QKKs*/][4], int lid, std::int32_t delta, const RerotateFreq& freq) {
+  if (delta == 0) { return; }
+   
+  auto rotate_pair = [&](unsigned& first_reg, unsigned& second_reg, int f0) {
+    __nv_bfloat162 first  = *reinterpret_cast<__nv_bfloat162*>(&first_reg);
+    __nv_bfloat162 second = *reinterpret_cast<__nv_bfloat162*>(&second_reg);
+
+    float s0, c0, s1, c1;
+    // sincosf gives sin/cos of +delta*freq. The R(-θ) formula below applies the
+    // negative angle: cross terms get +, direct terms get -, opposite of R(+θ).
+    sincosf(static_cast<float>(delta) * freq.v[f0],     &s0, &c0);
+    sincosf(static_cast<float>(delta) * freq.v[f0 + 1], &s1, &c1);
+
+    const float fx = __bfloat162float(first.x),  fy = __bfloat162float(first.y);
+    const float sx = __bfloat162float(second.x), sy = __bfloat162float(second.y);
+
+    // Apply R(-theta): x' = x*c + y*s, y' = y*c - x*s
+    first.x  = __float2bfloat16(fx * c0 + sx * s0);
+    first.y  = __float2bfloat16(fy * c1 + sy * s1);
+    second.x = __float2bfloat16(sx * c0 - fx * s0);
+    second.y = __float2bfloat16(sy * c1 - fy * s1);
+
+    first_reg  = *reinterpret_cast<unsigned*>(&first);
+    second_reg = *reinterpret_cast<unsigned*>(&second);
+  };
+
+  const int f_base_0 = lid * 2;
+  rotate_pair(af[0][0], af[2][0], f_base_0);
+  rotate_pair(af[0][1], af[2][1], f_base_0);
+  rotate_pair(af[0][2], af[2][2], f_base_0 + 8);
+  rotate_pair(af[0][3], af[2][3], f_base_0 + 8);
+
+  const int f_base_1 = 16 + lid * 2;
+  rotate_pair(af[1][0], af[3][0], f_base_1);
+  rotate_pair(af[1][1], af[3][1], f_base_1);
+  rotate_pair(af[1][2], af[3][2], f_base_1 + 8);
+  rotate_pair(af[1][3], af[3][3], f_base_1 + 8);
 }
 
 // Signed int8 QK MMA, k=32 contraction. A = 16x32 s8 (4 regs/thread, 4 s8 each),

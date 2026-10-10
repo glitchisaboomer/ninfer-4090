@@ -88,7 +88,8 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
 void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
-                            Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+                            Tensor& partial_m, Tensor& partial_l, cudaStream_t stream,
+                            const std::int32_t* rope_page_deltas, RerotateFreq freq) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
@@ -108,7 +109,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             : static_cast<const std::int32_t*>(invocation.table_rows->data),
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
         logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+          rope_page_deltas, freq);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -297,7 +299,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
-                    partial_acc, partial_m, partial_l, stream);                                    \
+                    partial_acc, partial_m, partial_l, stream,                                 \
+                    nullptr, RerotateFreq{}); // TODO(step-4b): Wire runtime delta plane here   \
             }                                                                                      \
         };                                                                                         \
         const bool masked = invocation.valid_columns != nullptr;                                   \
