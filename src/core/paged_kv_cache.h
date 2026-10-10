@@ -129,6 +129,7 @@ public:
     // existing route. Reading this is what makes a quantized K plane relocatable without rewriting it.
     [[nodiscard]] const Tensor& rope_deltas() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
+    [[nodiscard]] Tensor rope_delta_row(std::int32_t row) const;
 
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
@@ -231,7 +232,27 @@ public:
     // pages without copying KV and without a second allocator.
     //
     // The republished block-table row is updated when the allocation is bound.
-    void reassign_pages(std::span<const std::int32_t> mapping, cudaStream_t stream = nullptr);
+    // Replaces the whole logical-to-physical mapping with `mapping`, which describes exactly the
+    // pages this allocation should map afterwards in logical order. Each entry is either a page the
+    // allocation already owns or kPagedKVAquirePage for a page acquired from the pool. Owned pages
+    // named more than once, or not owned at all, are rejected. Owned pages the mapping does not name
+    // are returned to the pool, except that as many of them as there are acquire slots are reused as
+    // the new physical pages instead, so a remap that shrinks one region while growing another does
+    // not need free pool pages for the growth.
+    //
+    // `deltas` is parallel to `mapping`: `deltas[i]` is the RoPE delta for logical page `i`, or
+    // `kRopeDeltaNone` (zero) for a page that was not relocated. The two planes are stored together
+    // and published together, so a reader can never observe the block table without the delta plane
+    // that describes it.
+    void reassign_pages(std::span<const std::int32_t> mapping,
+                        std::span<const std::int32_t> deltas,
+                        cudaStream_t stream);
+
+    // Temporary shim: the pre-Step-3 caller in program_impl.h does not yet supply deltas. Fills
+    // all-zero deltas and delegates to the overload above. Step 3 removes this overload together with
+    // that call site. Do not use this from new code.
+    void reassign_pages(std::span<const std::int32_t> mapping,
+                        cudaStream_t stream = nullptr);
 
     void bind_row(std::int32_t row, cudaStream_t stream = nullptr);
     void publish_mapping(cudaStream_t stream = nullptr) const;
@@ -250,6 +271,7 @@ private:
 
     PagedKVPool* pool_ = nullptr;
     std::vector<std::int32_t> page_ids_;
+    std::vector<std::int32_t> rope_deltas_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
 };

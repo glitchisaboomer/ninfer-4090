@@ -263,6 +263,14 @@ Tensor PagedKVPool::block_table_row(std::int32_t row) const {
         {static_cast<std::int32_t>(logical_page_capacity())});
 }
 
+Tensor PagedKVPool::rope_delta_row(std::int32_t row) const {
+    if (row < 0 || row >= table_row_count()) {
+        throw std::out_of_range("Paged KV rope-delta row out of range");
+    }
+    return rope_deltas_.slice(1, row, 1).view(
+        {static_cast<std::int32_t>(logical_page_capacity())});
+}
+
 std::uint32_t PagedKVPool::entitled_pages() const noexcept { return entitled_pages_; }
 
 std::uint32_t PagedKVPool::mapped_pages() const noexcept { return mapped_pages_; }
@@ -533,12 +541,14 @@ void PagedKVPool::release_row(std::int32_t row) noexcept {
 PagedKVAllocation::PagedKVAllocation(PagedKVPool& pool, std::uint32_t page_entitlement)
     : pool_(&pool), page_entitlement_(page_entitlement) {
     page_ids_.reserve(page_entitlement);
+    rope_deltas_.reserve(page_entitlement);
 }
 
 PagedKVAllocation::~PagedKVAllocation() { release(); }
 
 PagedKVAllocation::PagedKVAllocation(PagedKVAllocation&& other) noexcept
     : pool_(other.pool_), page_ids_(std::move(other.page_ids_)),
+      rope_deltas_(std::move(other.rope_deltas_)),
       page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_) {
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
@@ -550,6 +560,7 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
     release();
     pool_                   = other.pool_;
     page_ids_               = std::move(other.page_ids_);
+    rope_deltas_            = std::move(other.rope_deltas_);
     page_entitlement_       = other.page_entitlement_;
     bound_row_              = other.bound_row_;
     other.pool_             = nullptr;
@@ -606,6 +617,7 @@ void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stre
         page_ids_.empty() ? -1 : static_cast<std::int32_t>(page_ids_.back() + 1);
     std::vector<std::int32_t> acquired = pool_->take_pages(count, preferred);
     page_ids_.insert(page_ids_.end(), acquired.begin(), acquired.end());
+    rope_deltas_.insert(rope_deltas_.end(), count, kRopeDeltaNone);
     if (bound_row_ >= 0) { publish_range(old_count, count, stream); }
 }
 
@@ -622,17 +634,24 @@ void PagedKVAllocation::trim_pages(std::uint32_t pages) {
     pool_->return_pages(std::span<const std::int32_t>(
         page_ids_.data() + pages, static_cast<std::size_t>(mapped_page_count() - pages)));
     page_ids_.resize(pages);
+    rope_deltas_.resize(pages);
 }
 
 void PagedKVAllocation::trim_tokens(std::uint32_t tokens) { trim_pages(pages_for_tokens(tokens)); }
 
-void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping, cudaStream_t stream) {
+void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping,
+                                       std::span<const std::int32_t> deltas,
+                                       cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot reassign an empty Paged KV allocation"); }
     if (mapping.empty()) {
         throw std::invalid_argument("Paged KV reassignment must map at least one page");
     }
     if (mapping.size() > page_entitlement_) {
         throw std::invalid_argument("Paged KV reassignment exceeds the page entitlement");
+    }
+    if (deltas.size() != mapping.size()) {
+        throw std::invalid_argument(
+            "Paged KV reassignment delta plane does not parallel its mapping");
     }
 
     // Remaining ownership, by page. An entry the mapping names consumes one occurrence, so a page
@@ -704,7 +723,17 @@ void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping, cu
     }
 
     page_ids_ = std::move(final_ids);
+    rope_deltas_.assign(deltas.begin(), deltas.end());
     if (bound_row_ >= 0) { publish_mapping(stream); }
+}
+
+void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping,
+                                       cudaStream_t stream) {
+    // Temporary shim for the pre-Step-3 caller in program_impl.h, which rerotates the K plane
+    // itself and has no deltas to supply. All-zero deltas are correct for that caller: it never
+    // relies on the delta plane. Step 3 converts that call site and deletes this overload.
+    const std::vector<std::int32_t> none(mapping.size(), kRopeDeltaNone);
+    reassign_pages(mapping, none, stream);
 }
 
 void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
@@ -741,10 +770,21 @@ void PagedKVAllocation::publish_mapping(cudaStream_t stream) const {
 void PagedKVAllocation::publish_range(std::uint32_t first_page, std::uint32_t page_count,
                                       cudaStream_t stream) const {
     if (page_count == 0) { return; }
-    Tensor row         = pool_->block_table_row(bound_row_);
-    auto* destination  = static_cast<std::int32_t*>(row.data) + first_page;
-    const auto* source = page_ids_.data() + first_page;
-    CUDA_CHECK(cudaMemcpyAsync(destination, source,
+    if (rope_deltas_.size() != page_ids_.size()) {
+        throw std::logic_error("Paged KV delta plane does not parallel its block table");
+    }
+
+    Tensor block_row = pool_->block_table_row(bound_row_);
+    auto* dst_block = static_cast<std::int32_t*>(block_row.data) + first_page;
+    const auto* src_block = page_ids_.data() + first_page;
+    CUDA_CHECK(cudaMemcpyAsync(dst_block, src_block,
+                               static_cast<std::size_t>(page_count) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    Tensor delta_row = pool_->rope_delta_row(bound_row_);
+    auto* dst_delta = static_cast<std::int32_t*>(delta_row.data) + first_page;
+    const auto* src_delta = rope_deltas_.data() + first_page;
+    CUDA_CHECK(cudaMemcpyAsync(dst_delta, src_delta,
                                static_cast<std::size_t>(page_count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
 }
@@ -766,6 +806,7 @@ void PagedKVAllocation::release() noexcept {
     pool_->return_pages(page_ids_);
     pool_->replace_entitlement(page_entitlement_, 0);
     page_ids_.clear();
+    rope_deltas_.clear();
     page_entitlement_ = 0;
     pool_             = nullptr;
 }
