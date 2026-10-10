@@ -229,6 +229,8 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .packed_k      = cache.packed_k,
         .e8_lattice    = cache.e8_lattice,
         .e8_root       = cache.e8_root,
+        .rope_deltas   = cache.rope_deltas,
+        .rope_inv_freq = cache.rope_inv_freq,
     };
 }
 
@@ -300,7 +302,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
                     partial_acc, partial_m, partial_l, stream,                                 \
-                    nullptr, RerotateFreq{}); /* TODO(step-4b): wire runtime delta plane */        \
+                    static_cast<const std::int32_t*>(cache.rope_deltas.data), make_rerotate_freq(cache.rope_inv_freq));        \
             }                                                                                      \
         };                                                                                         \
         const bool masked = invocation.valid_columns != nullptr;                                   \

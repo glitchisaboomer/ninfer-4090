@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
@@ -29,6 +31,15 @@ using RerotateFreqTable = std::span<const float, 32>;
 struct RerotateFreq {
     float v[32];
 };
+
+// Convert the std::array<float,32> stored on the view structs into the by-value kernel
+// argument. A raw aggregate initializer cannot do this because float[32] and
+// std::array<float,32> are different types.
+inline RerotateFreq make_rerotate_freq(const std::array<float, 32>& src) {
+    RerotateFreq f{};
+    for (std::size_t i = 0; i < 32; ++i) { f.v[i] = src[i]; }
+    return f;
+}
 
 /**
  * Op: rotate already-cached K in place by a per-logical-position delta.

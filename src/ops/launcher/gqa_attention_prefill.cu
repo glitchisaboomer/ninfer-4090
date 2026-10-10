@@ -1,5 +1,6 @@
 // ninfer::ops - gqa_attention prompt-scale launcher: fill k/v at device
 // positions then launch causal attention over absolute cached history.
+#include "ninfer/ops/gqa_kv_rerotate.h"
 #include "ops/launcher/gqa_attention.h"
 
 #include "ops/common/math.h"
@@ -16,7 +17,8 @@ template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
                                                float scale, const CacheView& cache,
                                                Metadata metadata, Tensor& out,
-                                               cudaStream_t stream) {
+                                               cudaStream_t stream,
+                                               RerotateFreq freq = RerotateFreq{}) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
@@ -63,7 +65,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const __nv_bfloat16*>(cache_k.data),
                 static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens, RerotateFreq{}); // TODO(step-4b): Wire runtime delta plane here
+                static_cast<__nv_bfloat16*>(out.data), tokens, freq);
     }
     CUDA_CHECK(cudaGetLastError());
     if (cache.rotate_v) {
@@ -157,11 +159,11 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+                                                                 metadata, out, stream, make_rerotate_freq(cache.rope_inv_freq));
         return;
     }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
-                                                             out, stream);
+                                                             out, stream, make_rerotate_freq(cache.rope_inv_freq));
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -184,7 +186,7 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
-            .delta_tables = nullptr, // TODO(step-4b): Wire runtime delta plane here
+            .delta_tables = static_cast<const std::int32_t*>(cache.rope_deltas.data),
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
@@ -193,12 +195,12 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         if (q.ne[1] == Gqa27Geometry::QHeads) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream);
+                                                                     metadata, out, stream, make_rerotate_freq(cache.rope_inv_freq));
             return;
         }
         gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
         gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+                                                                 metadata, out, stream, make_rerotate_freq(cache.rope_inv_freq));
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();
