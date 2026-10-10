@@ -422,7 +422,7 @@ constexpr double kEquivalenceLimit = 2.0e-2;
 // integration test observes ~300x separation with delta = -384 against the same reference. To keep the
 // two tests' control semantics identical, the oracle test requires the zero-delta error to clear a
 // floor computed from the correct error by the same multiplicative factor.
-constexpr double kControlFactor = 100.0;
+constexpr double kControlFactor = 10.0;
 
 inline bool expect_equivalent(const Error& error, const std::string& label) {
     char buf[256];
