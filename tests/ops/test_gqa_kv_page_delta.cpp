@@ -11,7 +11,7 @@
 // counter-rotation machinery. If both fail, the bug is in the scenario construction or the FP64
 // reference. This separation is the reason both tests exist.
 #include "ops/gqa_relocation_test_common.h"
-#include "src/ops/launcher/gqa_attention_test_hooks.h"
+#include "ops/launcher/gqa_attention_test_hooks.h"
 
 using namespace ninfer;
 using namespace ninfer::ops;
@@ -181,9 +181,23 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
     const std::int32_t delta  = scenario.dst - scenario.src; // = kDelta = -384
 
     constexpr std::int32_t kPrefillTokens = 128;
-    constexpr std::int32_t kPrefillBase   = kDestPage * kPageSize;
+    constexpr std::int32_t kPrefillBase   = (kDestPage + 2) * kPageSize; // = 320; two pages past dst
     const std::uint32_t visible =
         static_cast<std::uint32_t>(kPrefillBase + kPrefillTokens);
+
+    // Prefill path uses a Q sized for kPrefillTokens, not kQueryTokens. The reference must use
+    // the same Q at the same positions, or the comparison is meaningless.
+    const std::size_t prefill_q_elems = static_cast<std::size_t>(kHeadDim) *
+                                        static_cast<std::size_t>(kQHeads) *
+                                        static_cast<std::size_t>(kPrefillTokens);
+    std::vector<__nv_bfloat16> prefill_q(prefill_q_elems);
+    {
+        std::mt19937 q_rng(17u);
+        std::uniform_real_distribution<double> q_unit(-0.25, 0.25);
+        for (std::size_t i = 0; i < prefill_q_elems; ++i) {
+            prefill_q[i] = __float2bfloat16(static_cast<float>(q_unit(q_rng)));
+        }
+    }
 
     // 1. Build a cache with K at source positions (no physical re-rotation)
     Cache cache(kLogicalPages, scenario.table, kKvHeads);
@@ -217,7 +231,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
     }
 
     // 5. Run prefill attention WITH deltas
-    auto got_relocated = run_prefill_attention_detail(cache, scenario.q, tail_k, tail_v,
+    auto got_relocated = run_prefill_attention_detail(cache, prefill_q, tail_k, tail_v,
                                                       kPrefillBase, kPrefillTokens, visible,
                                                       prefill_batch_view);
 
@@ -225,12 +239,12 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
     Cache reference = make_reference_cache(scenario);
     append_chunk(reference, tail_k, tail_v, kPrefillBase, kPrefillTokens);
     auto got_reference =
-        run_cached_attention(reference, scenario.q, kQueryBase, kQueryTokens, visible);
+        run_cached_attention(reference, prefill_q, kPrefillBase, kPrefillTokens, visible);
 
     // 6b. Anchor the reference to the FP64 oracle
     if (!expect_conformant(
             measure(got_reference.out,
-                    ideal_attention(scenario.q, reference, kQueryBase, kQueryTokens)),
+                    ideal_attention(prefill_q, reference, kPrefillBase, kPrefillTokens)),
             "A1 over a directly prefilled page (anchors the harness)")) {
         ++failures;
     }
@@ -256,7 +270,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
     stale_batch_view.rope_deltas  = stale_layer_view.rope_deltas.view({kLogicalPages, 1});
     stale_batch_view.rope_inv_freq = stale_layer_view.rope_inv_freq;
 
-    auto got_stale = run_prefill_attention_detail(stale_cache, scenario.q, tail_k, tail_v,
+    auto got_stale = run_prefill_attention_detail(stale_cache, prefill_q, tail_k, tail_v,
                                                   kPrefillBase, kPrefillTokens, visible,
                                                   stale_batch_view);
 
