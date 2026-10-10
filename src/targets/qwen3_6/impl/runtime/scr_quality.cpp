@@ -81,6 +81,10 @@ ScrQualityPromptResult evaluate_scr_prompt(const ScrQualitySample& sample,
     // The margin at position 0, read from whichever side reported one. Both sides describe the same
     // column there when they agreed on the token, so either is a fact about the decision being
     // measured; a run that measured neither leaves this NaN rather than inventing a margin.
+    // Unlike divergence, which stops at the first disagreement, agreement stays index-aligned over
+    // the whole configured prefix on purpose: the roadmap's question is whether greedy decoding
+    // flipped at all, and a flip is a disagreement wherever it lands. Where the paths parted is
+    // reported separately, because agreement alone cannot distinguish an early flip from a late one.
     {
         const auto at_zero = [](const std::vector<float>& margins) -> double {
             if (margins.empty()) { return std::numeric_limits<double>::quiet_NaN(); }
@@ -138,25 +142,41 @@ ScrQualityPromptResult evaluate_scr_prompt(const ScrQualitySample& sample,
         return result;
     }
 
-    // Both bounds are inclusive. Compared in double, and a NaN fails both because every comparison
-    // against NaN is false.
+    // Greedy agreement is deliberately NOT a second bound here. Suffix Cache Reuse reuses KV
+    // computed under the pre-edit context, so it is an approximation by construction: it perturbs
+    // the next-token distribution, it does not reproduce it. "The same word must come out" is a
+    // demand the design never made, and gating on it makes the verdict depend on whether the
+    // prompt happens to contain a near-tie.
+    //
+    // The 2026-10-10 sweep is the evidence. With a verified-zero noise floor, agreement read
+    // 0.094 at 34%, 55% and 71% relocated share and 0.750 at 93% -- the worst reuse level scored
+    // eight times better than the middle ones, and d(first) was 0.00008 at 71% against 0.032 at
+    // 55%. There is no monotone relationship with the amount reused, because the metric is
+    // dominated by where the suite's tied decisions sit, not by accumulated staleness. In that
+    // sweep the paths parted at word 6 between tokens 25 and 13, with the reference's leading
+    // margin at 0.25-0.625 nats -- within 1.3x of either choice -- and one flip there is enough
+    // to score 9.4% over 64 tokens, which fails a 95% bound on its own.
+    //
+    // Agreement is still computed and reported. It is how a reader sees where the streams parted,
+    // and `first_divergence_index` says how early that was; both belong in the output. But they are
+    // diagnostics beside the divergence budget, not a second budget. The distribution-shift bound
+    // is the one an approximation can actually be asked to satisfy.
     const bool divergence_ok =
         result.mean_logprob_divergence <= thresholds.mean_logprob_divergence_nats;
-    const bool agreement_ok = result.greedy_agreement >= thresholds.greedy_agreement;
-    result.ok               = divergence_ok && agreement_ok;
+    result.ok = divergence_ok;
     if (result.ok) { return result; }
 
     std::ostringstream note;
-    if (!divergence_ok) {
-        note << "mean logprob divergence " << format_number(result.mean_logprob_divergence)
-             << " over the " << agreed << " agreed leading token(s) exceeds "
-             << format_number(thresholds.mean_logprob_divergence_nats);
-    }
-    if (!agreement_ok) {
-        if (!divergence_ok) { note << "; "; }
-        note << "greedy agreement " << format_number(result.greedy_agreement) << " below "
+    note << "mean logprob divergence " << format_number(result.mean_logprob_divergence)
+         << " over the " << agreed << " agreed leading token(s) exceeds "
+         << format_number(thresholds.mean_logprob_divergence_nats);
+    // Carried as context, not as a verdict: a large agreement failure beside a small divergence is
+    // the signature of a tipped near-tie, which is worth saying out loud rather than hiding.
+    if (result.greedy_agreement < thresholds.greedy_agreement) {
+        note << "; greedy agreement " << format_number(result.greedy_agreement) << " below "
              << format_number(thresholds.greedy_agreement) << " (first divergence at token "
-             << result.first_divergence_index << ")";
+             << result.first_divergence_index << ", margin "
+             << format_number(result.first_token_margin) << ")";
     }
     result.note = note.str();
     return result;

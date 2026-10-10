@@ -868,6 +868,12 @@ std::vector<ninfer::serve::LoggedCompletion> select_edited(
 // "relocation perturbs the first token and the rest is decoder feedback": it is measured before any
 // divergence can compound, so unlike the mean it is not inflated by a run that flips at step 3 and
 // then wanders for 60 more tokens.
+//
+// The verdict is the divergence budget alone. Greedy agreement is printed beside it because it says
+// where the streams parted, but it does not decide the column: Suffix Cache Reuse is an
+// approximation, so "the same word must come out" was never a property it promised, and on this
+// suite that metric turned out to read where the prompts happen to sit on a tie. See the note in
+// scr_quality.cpp for the sweep that established it.
 void print_curve(const char* title, const std::vector<SuitePrompt>& prompts,
                  const std::vector<ninfer::serve::LoggedCompletion>& edited,
                  const ninfer::targets::qwen3_6::detail::ScrQualityReport& scored,

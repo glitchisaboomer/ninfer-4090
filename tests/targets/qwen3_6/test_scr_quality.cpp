@@ -81,22 +81,43 @@ void test_threshold_bounds_are_inclusive() {
     thresholds.greedy_agreement            = 0.5;
     thresholds.agreement_prefix_tokens     = 64;
 
-    // Both bounds are exercised exactly. 0.5 is exactly representable, so a per-step difference of
-    // 0.5 gives a mean of exactly 0.5 rather than something just above or below it.
+    // The divergence bound is exercised exactly. 0.5 is exactly representable, so a per-step
+    // difference of 0.5 gives a mean of exactly 0.5 rather than something just above or below it.
     const auto divergence_on_bound = evaluate_scr_prompt(agreeing(64, 0.5), thresholds);
     expect(divergence_on_bound.mean_logprob_divergence == 0.5,
            "the divergence fixture sits exactly on the bound");
     expect(divergence_on_bound.ok, "a divergence exactly on the bound passes");
 
+    // Agreement is reported but no longer gates. A prompt whose word match sits exactly half the
+    // prefix used to sit on the agreement bound; it is now read as a field on the result and the
+    // verdict rests on the divergence alone, which here is zero.
     const auto at_bound = evaluate_scr_prompt(agreement(64, 32), thresholds);
     expect(at_bound.mean_logprob_divergence == 0.0, "the agreement fixture diverges by nothing");
     expect(at_bound.greedy_agreement == 0.5, "the agreement fixture sits exactly on the bound");
-    expect(at_bound.ok, "an agreement exactly on the bound passes");
+    expect(at_bound.ok, "a zero divergence passes regardless of word agreement");
+    expect(at_bound.note.empty(), "a passing prompt carries no note");
 
     const auto beyond = evaluate_scr_prompt(agreement(64, 31), thresholds);
-    expect(beyond.greedy_agreement < 0.5, "the beyond fixture sits under the bound");
-    expect(!beyond.ok, "a value under the bound fails");
-    expect(contains(beyond.note, "greedy agreement"), "the note names the failing measurement");
+    expect(beyond.greedy_agreement < 0.5, "the beyond fixture sits under the reported level");
+    expect(beyond.ok, "word-level disagreement alone does not fail");
+    expect(beyond.note.empty(), "word disagreement alone writes no note");
+
+    // The agreement figure is written as context beside a *failing* divergence, because a large
+    // agreement failure next to a small one is the signature of a tipped near-tie and is worth
+    // saying out loud rather than hiding. Here the agreed prefix genuinely moves past the bound and
+    // the word match is low, so both appear.
+    ScrQualitySample both = agreeing(64, 0.5);
+    for (float& value : both.scr_logprobs) { value = 0.6F; }
+    for (std::size_t i = 16; i < 64; ++i) {
+        both.scr_tokens[i] = static_cast<TokenId>(i) + 1000;
+    }
+    const auto both_result = evaluate_scr_prompt(both, thresholds);
+    expect(!both_result.ok, "an over-budget divergence fails");
+    expect(both_result.greedy_agreement == 0.25, "the word match is low as constructed");
+    expect(contains(both_result.note, "mean logprob divergence"),
+           "the note names the failing divergence");
+    expect(contains(both_result.note, "greedy agreement"),
+           "the note carries the agreement beside it");
 }
 
 void test_divergence_is_the_mean_absolute_difference() {
@@ -142,11 +163,13 @@ void test_agreement_prefix_is_bounded() {
     expect(prefix_only.greedy_agreement == 1.0, "the agreeing prefix scores fully");
     expect(prefix_only.ok, "a run that diverges after the prefix still passes");
 
-    // Widening the prefix to the whole run exposes the divergence.
+    // Widening the prefix to the whole run exposes the divergence, but only in the reported
+    // agreement figure -- the two runs still agree on every token they both emitted and diverge
+    // by nothing, so the verdict stays a pass. The measurement widens; the bound does not move.
     thresholds.agreement_prefix_tokens = 128;
     const auto whole_run = evaluate_scr_prompt(agreement(128, 64), thresholds);
     expect(whole_run.greedy_agreement == 0.5, "the whole run is half in agreement");
-    expect(!whole_run.ok, "the wider prefix fails");
+    expect(whole_run.ok, "a lower reported agreement does not fail a zero divergence");
 }
 
 void test_short_runs_compare_what_they_have() {
@@ -247,9 +270,12 @@ void test_divergence_stops_at_the_first_divergent_token() {
     // parted is reported separately, because agreement alone cannot distinguish an early flip from a
     // late one.
     expect(result.agreement_matched == 5, "agreement stays index-aligned over the whole prefix");
-    expect(!result.ok, "a flipped run does not pass the agreement bound");
-    expect(contains(result.note, "first divergence at token 5"),
-           "the note says where the paths parted");
+    // The mean is 0.01, well inside the default 0.05 bound, so the flip does not fail the verdict.
+    // A single tipped near-tie is not what the divergence budget measures; where the paths parted
+    // stays reported as its own field (`first_divergence_index`), which is the diagnostic a reader
+    // needs, and a passing run carries no note by design.
+    expect(result.ok, "a flip behind a small divergence does not fail");
+    expect(result.first_divergence_index == 5, "a passing run still reports where they parted");
 }
 
 // The scalar that answers "did relocation move the distribution, before decoding feedback could
