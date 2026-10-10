@@ -196,8 +196,9 @@ void test_implied_context_round_trip() {
         }
     }
     // A capacity that is not a whole number of pages must still resolve, because the pool reserves
-    // the page the partial tail lives in.
-    check(resolve_rope_delta_layout(65 * kPagedKVPageSize, 4).logical_pages == 65,
+    // the page the partial tail lives in. `65 * 64` would be exactly 65 whole pages and would not
+    // exercise the ceiling at all; one token more does.
+    check(resolve_rope_delta_layout(64 * kPagedKVPageSize + 1, 4).logical_pages == 65,
           "a context one token past a page boundary still resolves");
     // And an empty pool resolves to nothing rather than to a one-page plane. plan_paged_kv_pool
     // reads this as "unsupported" and throws, which is what makes the single equality check there

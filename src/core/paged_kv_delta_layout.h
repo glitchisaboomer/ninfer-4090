@@ -44,9 +44,10 @@ struct RopeDeltaLayout {
 //
 // The arithmetic is widened before the division because `max_context` is int32: at the top of the
 // range `max_context + 63` overflows signed, which is UB and, on the compilers this project uses,
-// wraps negative and returns a negative page count. No caller currently reaches that far -- contexts
-// are capped well below it -- but a rounding helper that is undefined at the top of its own domain is
-// a trap, not a guard.
+// wraps negative and returns a negative page count. Nothing in the product reaches that far -- real
+// contexts are capped by the variant's maximum, orders of magnitude below -- but a rounding helper
+// that is undefined at the top of its own domain is a trap rather than a guard, and a test does now
+// call it there deliberately, so the case has to behave rather than merely not be hit.
 [[nodiscard]] constexpr std::int32_t rope_delta_logical_pages(std::int32_t max_context) noexcept {
     if (max_context <= 0) { return 0; }
     const std::uint64_t pages = (static_cast<std::uint64_t>(max_context) +

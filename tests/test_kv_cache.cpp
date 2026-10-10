@@ -225,11 +225,11 @@ int main() {
         2 * ninfer::Tensor(nullptr, ninfer::DType::FP16, {1, 64, 2, 10}).bytes();
     failures +=
         expect_size(paged_plan.layout.payload_bytes(), expected_payload, "paged payload bytes");
-    // Metadata is the span the block table and the RoPE delta plane occupy, offsets included: two
-    // 80-byte int32 tensors aligned to 256 take 336 bytes, not 160, because the second one starts at
-    // offset 256. Nothing sizes an allocation from this -- LayoutBuilder::finish does that -- but the
-    // number is read as "how much metadata is there", so it has to be the span.
-    const std::size_t expected_metadata = 256 + 10 * 2 * sizeof(std::int32_t);
+    // Metadata is the sum of the block table's and the RoPE delta plane's own sizes, matching how
+    // `payload_bytes` accounts the storage planes. The alignment padding LayoutBuilder inserts
+    // between them is deliberately not included -- this is a tensor-size total, not an allocation
+    // size, and the only thing that reads it is this assertion.
+    const std::size_t expected_metadata = 2 * 10 * 2 * sizeof(std::int32_t);
     failures += expect_size(paged_plan.layout.metadata_bytes(), expected_metadata,
                             "paged metadata bytes");
     failures += check_shape(paged_pool.rope_deltas(), {10, 2, 1, 1}, "paged rope-delta plane");
