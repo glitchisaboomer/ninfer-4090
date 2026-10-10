@@ -155,6 +155,107 @@ int expect_rope_delta_row_clear(ninfer::PagedKVPool& pool, std::int32_t row, cud
     return failures == 0 ? 0 : 1;
 }
 
+// A row is recycled between sequences. The delta plane must not carry a previous sequence's
+// relocations into the next one's attention: the failure mode is a query counter-rotated by a
+// stale shift for a page that was never moved, which no type error catches and no test that
+// ignores the recycling sequence will see.
+//
+// This test exercises the sequence: write deltas into row 0 -> release the row -> bind a fresh
+// allocation to row 0 -> assert row 0's deltas are all zero *before* anything writes them.
+int expect_rope_delta_recycling(ninfer::PagedKVPool& pool, cudaStream_t stream, const char* label) {
+    const ninfer::Tensor& deltas = pool.rope_deltas();
+    const std::int32_t page_count = deltas.ne[0];
+    if (page_count <= 0 || pool.table_row_count() < 1) {
+        std::cerr << label << " pool shape is inconsistent for recycling test\n";
+        return 1;
+    }
+
+    // 1. Reserve the whole row's worth of entitlement and materialize that many distinct pages.
+    //    The pool this test runs against has page_group_count == logical_page_capacity == 10
+    //    (see `plan_paged_cache(10, 10, 2, ...)` in main), and no earlier test in main holds
+    //    entitlement on paged_pool at the point this function runs, so reserving `page_count`
+    //    pages succeeds. The distinct-pages requirement is not optional: `reassign_pages` rejects
+    //    a mapping that names the same owned physical page more than once.
+    const std::uint32_t entitlement = static_cast<std::uint32_t>(page_count);
+    auto first = pool.reserve(entitlement);
+    first.materialize_pages(entitlement, stream);
+    first.bind_row(0, stream);
+
+    // 2. Write nonzero deltas into every logical page of row 0, one distinct physical page each.
+    //    `first.page_ids()` is now exactly `page_count` distinct pages, so it can be used as the
+    //    mapping directly — no repetition, no padding.
+    std::vector<std::int32_t> mapping(first.page_ids().begin(), first.page_ids().end());
+    if (static_cast<std::int32_t>(mapping.size()) != page_count) {
+        std::cerr << label << " allocation materialized " << mapping.size()
+                  << " pages, expected " << page_count << '\n';
+        return 1;
+    }
+    std::vector<std::int32_t> deltas_in(static_cast<std::size_t>(page_count), 17);
+    first.reassign_pages(mapping, deltas_in, stream);
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " reassign sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    // 3. Read back and confirm the row is all-17. If this fails, the test cannot say anything
+    //    about recycling.
+    auto read_row = [&](std::vector<std::int32_t>& out) -> cudaError_t {
+        out.assign(static_cast<std::size_t>(page_count), 0);
+        ninfer::Tensor row = pool.rope_delta_row(0);
+        return cudaMemcpy(out.data(), row.data,
+                          static_cast<std::size_t>(page_count) * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost);
+    };
+    std::vector<std::int32_t> after_write;
+    err = read_row(after_write);
+    if (err != cudaSuccess) {
+        std::cerr << label << " first readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    for (std::int32_t p = 0; p < page_count; ++p) {
+        if (after_write[p] != 17) {
+            std::cerr << label << " precondition failed: row 0 page " << p << " is "
+                      << after_write[p] << ", expected 17\n";
+            return 1;
+        }
+    }
+
+    // 4. Release the row: unbind the allocation and drop it.
+    first.unbind_row();
+    first.release();
+
+    // 5. Bind a *different* allocation to the same row. bind_row is what must clear the row.
+    auto second = pool.reserve(1);
+    second.bind_row(0, stream);
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " second bind sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    // 6. Read back. Every entry must be zero.
+    std::vector<std::int32_t> after_rebind;
+    err = read_row(after_rebind);
+    if (err != cudaSuccess) {
+        std::cerr << label << " second readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    int failures = 0;
+    for (std::int32_t p = 0; p < page_count; ++p) {
+        if (after_rebind[p] != 0) {
+            if (failures < 4) {
+                std::cerr << label << " recycled row 0 page " << p << " is " << after_rebind[p]
+                          << ", expected 0\n";
+            }
+            ++failures;
+        }
+    }
+    second.unbind_row();
+    second.release();
+    return failures == 0 ? 0 : 1;
+}
+
 int expect_zeroed_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder order,
                         std::span<const std::int32_t> pages, cudaStream_t stream,
                         const char* label) {
@@ -311,6 +412,7 @@ int main() {
     // row must leave that row zero and the other byte-identical.
     failures += expect_rope_delta_row_clear(paged_pool, 0, ctx.stream, "rope-delta row 0 clear");
     failures += expect_rope_delta_row_clear(paged_pool, 1, ctx.stream, "rope-delta row 1 clear");
+    failures += expect_rope_delta_recycling(paged_pool, ctx.stream, "rope-delta recycling");
     if (paged_pool.rope_deltas().ne[0] != paged_pool.block_tables().ne[0] ||
         paged_pool.rope_deltas().ne[1] != paged_pool.block_tables().ne[1]) {
         ++failures;
