@@ -6,6 +6,7 @@
 #include "targets/qwen3_6/impl/runtime/yarn.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/gqa_kv_rerotate.h"
+#include "core/paged_kv_delta_layout.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
@@ -793,7 +794,38 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     throw std::logic_error("suffix relocation has no expressible page remap");
                 }
                 scr_remap = remap;
-                sequence.kv->text.reassign_pages(remap, device.stream);
+                // The delta plane is parallel to `remap`: one int32 per logical page of the new
+                // prompt, holding that page's RoPE shift or kRopeDeltaNone. It is published in the
+                // same call as the mapping so attention can never read one without the other.
+                //
+                // The arithmetic is `rope_delta_for_span`, not a second copy of `dest - source`.
+                // That helper is host-tested (tests/test_paged_kv_delta_layout.cpp) and lives in a
+                // CUDA-free header; re-deriving the same subtraction here would let the two drift,
+                // and the drift would surface as a silently wrong shift rather than as a failure.
+                std::vector<std::int32_t> deltas(remap.size(), kRopeDeltaNone);
+                for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
+                    // Spans are page-aligned by construction: `diff_prompt_edit` hashes whole
+                    // 64-token blocks and `plan_tail_relocation` trims back to whole blocks. Assert
+                    // it rather than trust it, because a misaligned span would produce a page whose
+                    // delta covers half its content, and that would rotate the wrong half silently.
+                    if (!relocated_span_is_page_aligned(span.source_begin, span.tokens) ||
+                        !relocated_span_is_page_aligned(span.dest_begin, span.tokens)) {
+                        throw std::logic_error("relocated span is not page-aligned");
+                    }
+                    for (std::uint32_t offset = 0; offset < span.tokens; offset += kPagedKVPageSize) {
+                        const std::int32_t source_page = static_cast<std::int32_t>(
+                            (span.source_begin + offset) / kPagedKVPageSize);
+                        const std::int32_t dest_page = static_cast<std::int32_t>(
+                            (span.dest_begin + offset) / kPagedKVPageSize);
+                        if (dest_page < 0 || static_cast<std::size_t>(dest_page) >= deltas.size()) {
+                            throw std::logic_error(
+                                "relocated span destination page is outside the mapping");
+                        }
+                        deltas[static_cast<std::size_t>(dest_page)] =
+                            rope_delta_for_span(span.source_begin, span.tokens, span.dest_begin, source_page);
+                    }
+                }
+                sequence.kv->text.reassign_pages(remap, deltas, device.stream);
                 suffix_prefill_ranges.clear();
                 // Diagnostic only: fingerprint the GDN slot across the invalidation below so the
                 // trace says whether the zero ran, not merely that the code path was reached.

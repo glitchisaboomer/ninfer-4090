@@ -256,6 +256,79 @@ int expect_rope_delta_recycling(ninfer::PagedKVPool& pool, cudaStream_t stream, 
     return failures == 0 ? 0 : 1;
 }
 
+// Step 3a of docs/SCR_QUANTIZED_KV_RELOCATION.md: after a reassign that carries a delta
+// plane, the plane must hold the shift for each relocated page and kRopeDeltaNone
+// elsewhere. This is the pool-side half of the writer; the runtime-side half (the loop
+// that computes the deltas from relocated spans) is in program_impl.h and needs a GPU.
+//
+// What this test can prove without a GPU is that `reassign_pages` stores and publishes
+// what it was handed, and that non-relocated pages default to zero.
+int expect_reassign_publishes_deltas(ninfer::PagedKVPool& pool, cudaStream_t stream,
+                                     const char* label) {
+    const ninfer::Tensor& deltas = pool.rope_deltas();
+    const std::int32_t page_count = deltas.ne[0];
+    if (page_count < 4 || pool.table_row_count() < 1) {
+        std::cerr << label << " pool is too small for this test\n";
+        return 1;
+    }
+
+    // Reserve enough distinct pages to map every logical page, then bind to row 0.
+    // Requires page_group_count >= logical_page_capacity (10 for the pool in main).
+    const std::uint32_t entitlement = static_cast<std::uint32_t>(page_count);
+    auto allocation = pool.reserve(entitlement);
+    allocation.materialize_pages(entitlement, stream);
+    allocation.bind_row(0, stream);
+
+    std::vector<std::int32_t> mapping(allocation.page_ids().begin(), allocation.page_ids().end());
+    if (static_cast<std::int32_t>(mapping.size()) != page_count) {
+        std::cerr << label << " materialized " << mapping.size() << " pages, expected " << page_count
+                  << '\n';
+        return 1;
+    }
+
+    // Mark logical pages 1 and 3 as relocated, everything else as not. Two pages with
+    // *different* nonzero deltas, so a bug that writes the same value everywhere is
+    // visible, and one gap between them so an "everything after the first write gets the
+    // same value" bug is visible too.
+    std::vector<std::int32_t> deltas_in(static_cast<std::size_t>(page_count),
+                                         ninfer::kRopeDeltaNone);
+    deltas_in[1] = 17;
+    deltas_in[3] = -42;
+
+    allocation.reassign_pages(mapping, deltas_in, stream);
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " reassign sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    // Read back through the pool's own row accessor, the same path a reader would use.
+    ninfer::Tensor row = pool.rope_delta_row(0);
+    std::vector<std::int32_t> after(static_cast<std::size_t>(page_count), 0);
+    err = cudaMemcpy(after.data(), row.data,
+                     static_cast<std::size_t>(page_count) * sizeof(std::int32_t),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::cerr << label << " readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    int failures = 0;
+    for (std::int32_t p = 0; p < page_count; ++p) {
+        const std::int32_t want = deltas_in[static_cast<std::size_t>(p)];
+        if (after[static_cast<std::size_t>(p)] != want) {
+            if (failures < 4) {
+                std::cerr << label << " page " << p << " is "
+                          << after[static_cast<std::size_t>(p)] << ", expected " << want << '\n';
+            }
+            ++failures;
+        }
+    }
+    allocation.unbind_row();
+    allocation.release();
+    return failures == 0 ? 0 : 1;
+}
+
 int expect_zeroed_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder order,
                         std::span<const std::int32_t> pages, cudaStream_t stream,
                         const char* label) {
@@ -413,6 +486,8 @@ int main() {
     failures += expect_rope_delta_row_clear(paged_pool, 0, ctx.stream, "rope-delta row 0 clear");
     failures += expect_rope_delta_row_clear(paged_pool, 1, ctx.stream, "rope-delta row 1 clear");
     failures += expect_rope_delta_recycling(paged_pool, ctx.stream, "rope-delta recycling");
+    failures += expect_reassign_publishes_deltas(paged_pool, ctx.stream,
+                                                 "rope-delta reassign publish");
     if (paged_pool.rope_deltas().ne[0] != paged_pool.block_tables().ne[0] ||
         paged_pool.rope_deltas().ne[1] != paged_pool.block_tables().ne[1]) {
         ++failures;
