@@ -23,7 +23,7 @@ namespace ninfer::ops::detail {
 // delta plane and the RoPE frequency table. This is the same path the public gqa_attention_cached
 // route reaches through gqa_attention_cached_small_t_launch, but reached directly so the test can
 // attach the delta plane without changing the public API.
-void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
+void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,

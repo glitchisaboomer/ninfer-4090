@@ -182,12 +182,16 @@ void check_attention_equivalence(const Scenario& scenario) {
     // Anchors the harness: the directly prefilled cache is plain prefill, so the conformance criterion
     // applies to it unchanged and a failure here means the reader, the oracle, or this test's cache
     // construction disagree, independently of any relocation.
-    expect_conformant(measure(got_reference.out, ideal_attention(scenario.q, reference, kQueryBase,
+    if (!expect_conformant(measure(got_reference.out, ideal_attention(scenario.q, reference, kQueryBase,
                                                                 kQueryTokens)),
-                      "A3 over a directly prefilled page");
+                      "A3 over a directly prefilled page")) {
+        ++failures;
+    }
 
     const Error correct = measure(got_relocated.out, got_reference.out);
-    expect_equivalent(correct, "A3 over a relocated page");
+    if (!expect_equivalent(correct, "A3 over a relocated page")) {
+        ++failures;
+    }
 
     // Negative control: a skipped re-rotation is the failure this file exists to catch. The K then
     // still carries the source positions' rotation.
@@ -198,8 +202,10 @@ void check_attention_equivalence(const Scenario& scenario) {
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     const AttentionRun got_stale =
         run_cached_attention(stale, scenario.q, kQueryBase, kQueryTokens, visible);
-    expect_control_separates(correct, measure(got_stale.out, got_reference.out),
-                             "negative control: a skipped re-rotation");
+    if (!expect_control_separates(correct, measure(got_stale.out, got_reference.out),
+                             "negative control: a skipped re-rotation")) {
+        ++failures;
+    }
 }
 
 // 4. The same check through A1, which is the append-and-attend route the prefill itself uses, so the
@@ -242,11 +248,15 @@ void check_append_attention_equivalence(const Scenario& scenario) {
     const AttentionRun got_reference =
         run_append_attention(reference, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible);
 
-    expect_conformant(measure(got_reference.out,
+    if (!expect_conformant(measure(got_reference.out,
                               ideal_attention(tail_q_data, reference, tail_first, kTailTokens)),
-                      "A1 over a directly prefilled page");
+                      "A1 over a directly prefilled page")) {
+        ++failures;
+    }
     const Error correct = measure(got_relocated.out, got_reference.out);
-    expect_equivalent(correct, "A1 over a relocated page");
+    if (!expect_equivalent(correct, "A1 over a relocated page")) {
+        ++failures;
+    }
 
     Cache stale(kLogicalPages, scenario.table, kKvHeads);
     append_chunk(stale, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
@@ -255,8 +265,10 @@ void check_append_attention_equivalence(const Scenario& scenario) {
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     const AttentionRun got_stale =
         run_append_attention(stale, tail_q_data, tail_k, tail_v, tail_first, kTailTokens, visible);
-    expect_control_separates(correct, measure(got_stale.out, got_reference.out),
-                             "negative control: a skipped re-rotation through A1");
+    if (!expect_control_separates(correct, measure(got_stale.out, got_reference.out),
+                             "negative control: a skipped re-rotation through A1")) {
+        ++failures;
+    }
 }
 
 

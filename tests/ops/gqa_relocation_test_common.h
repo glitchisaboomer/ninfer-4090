@@ -322,6 +322,46 @@ inline AttentionRun run_cached_attention(const Cache& cache, const std::vector<_
     return AttentionRun{download_doubles(dout, q.size())};
 }
 
+// A1: the append-and-attend route the prefill uses. This is the same shape as the
+// integration test's original helper: append a chunk through the production write path,
+// then run public gqa_attention over the batch view.
+inline AttentionRun run_append_attention(Cache& cache, const std::vector<__nv_bfloat16>& q,
+                                         const std::vector<__nv_bfloat16>& k,
+                                         const std::vector<__nv_bfloat16>& v,
+                                         std::int32_t first_position, std::int32_t tokens,
+                                         std::uint32_t visible) {
+    append_chunk(cache, k, v, first_position, tokens);
+
+    DeviceBuffer dq     = upload(q);
+    DeviceBuffer dk     = upload(k);
+    DeviceBuffer dv     = upload(v);
+    DeviceBuffer dtable = DeviceBuffer(sizeof(std::int32_t));
+    const std::int32_t table_row = 0;
+    dtable.copy_from_host(&table_row, sizeof(table_row));
+    DeviceBuffer dout = DeviceBuffer(q.size() * sizeof(__nv_bfloat16));
+    dout.fill(0);
+    DeviceBuffer dp = upload_positions(sequential_positions(first_position, tokens));
+
+    const ops::GqaExecutionEnvelope envelope{visible, visible};
+    const std::size_t workspace_bytes =
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, DType::BF16, envelope, 1, tokens,
+                                                   tokens);
+    DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKvHeads, tokens});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKvHeads, tokens});
+    Tensor tp(dp.p, DType::I32, {tokens});
+    Tensor ttable(dtable.p, DType::I32, {1});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable, kAttentionScale, cache.batch_view(),
+                       envelope, workspace, tout, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    CUDA_CHECK(cudaGetLastError());
+    return AttentionRun{download_doubles(dout, q.size())};
+}
+
 // Ideal GQA attention in FP64: the BF16 inputs are taken as exact and dot products, stable softmax
 // and the value reduction all run in FP64, per the numerical contract in gqa_attention.h.
 inline std::vector<double> ideal_attention(const std::vector<__nv_bfloat16>& q, const Cache& cache,
@@ -384,21 +424,22 @@ constexpr double kEquivalenceLimit = 2.0e-2;
 // floor computed from the correct error by the same multiplicative factor.
 constexpr double kControlFactor = 100.0;
 
-inline void expect_equivalent(const Error& error, const std::string& label) {
+inline bool expect_equivalent(const Error& error, const std::string& label) {
     char buf[256];
     if (error.relative_l2 > kEquivalenceLimit) {
         std::snprintf(buf, sizeof(buf),
                       "%s: relative L2 %.3e from the directly prefilled cache, over the %.2e limit",
                       label.c_str(), error.relative_l2, kEquivalenceLimit);
         std::printf("  FAIL: %s\n", buf);
-        return;
+        return false;
     }
     std::snprintf(buf, sizeof(buf), "%s: ok (relative L2 %.3e, limit %.2e)", label.c_str(),
                   error.relative_l2, kEquivalenceLimit);
     std::printf("  %s\n", buf);
+    return true;
 }
 
-inline void expect_conformant(const Error& error, const std::string& label) {
+inline bool expect_conformant(const Error& error, const std::string& label) {
     char buf[256];
     if (error.relative_l2 > kConformanceRelativeL2 || error.gross > 0.0) {
         std::snprintf(buf, sizeof(buf),
@@ -407,16 +448,17 @@ inline void expect_conformant(const Error& error, const std::string& label) {
                       label.c_str(), error.relative_l2, kConformanceRelativeL2,
                       static_cast<int>(error.gross));
         std::printf("  FAIL: %s\n", buf);
-        return;
+        return false;
     }
     std::snprintf(buf, sizeof(buf), "%s: ok (relative L2 %.3e against the FP64 oracle)", label.c_str(),
                   error.relative_l2);
     std::printf("  %s\n", buf);
+    return true;
 }
 
 // The control has to clear the limit by a wide factor, otherwise the limit is measuring nothing and
 // the test would pass on a broken kernel.
-inline void expect_control_separates(const Error& correct, const Error& control, const std::string& label) {
+inline bool expect_control_separates(const Error& correct, const Error& control, const std::string& label) {
     char buf[256];
     const double floor_error = std::max(correct.relative_l2 * kControlFactor, kEquivalenceLimit);
     if (control.relative_l2 <= floor_error) {
@@ -425,12 +467,13 @@ inline void expect_control_separates(const Error& correct, const Error& control,
                       "so this harness cannot see a skipped rotation and the limit above proves nothing",
                       label.c_str(), control.relative_l2, floor_error);
         std::printf("  FAIL: %s\n", buf);
-        return;
+        return false;
     }
     std::snprintf(buf, sizeof(buf),
                   "%s: ok (control relative L2 %.3e versus %.3e correct, %.0fx the limit)", label.c_str(),
                   control.relative_l2, correct.relative_l2, control.relative_l2 / floor_error);
     std::printf("  %s\n", buf);
+    return true;
 }
 
 // The scenario: a 64-token run that prefill wrote at `src` must, after re-pointing the destination
