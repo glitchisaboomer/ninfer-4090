@@ -31,7 +31,7 @@ using ninfer::kRopeDeltaNone;
 using ninfer::RopeDeltaLayout;
 using ninfer::relocated_span_is_page_aligned;
 using ninfer::RopeDeltaRowSpan;
-using ninfer::rope_delta_row_span;
+using ninfer::rope_delta_row_span_i32;
 using ninfer::resolve_rope_delta_layout;
 using ninfer::rope_delta_for_span;
 using ninfer::rope_delta_layout_is_supported;
@@ -238,10 +238,10 @@ void test_row_span_tiles_the_plane() {
     for (const auto& shape : shapes) {
         const std::size_t total_bytes =
             static_cast<std::size_t>(shape.pages) * shape.rows * sizeof(std::int32_t);
-        std::vector<bool> covered(total_bytes / sizeof(std::int32_t), false);
+        std::vector<char> covered(total_bytes / sizeof(std::int32_t), 0);
         for (std::int32_t row = 0; row < shape.rows; ++row) {
             const RopeDeltaRowSpan span =
-                rope_delta_row_span(shape.rows, shape.pages, row);
+                rope_delta_row_span_i32(shape.pages, shape.rows, row);
             if (span.bytes != static_cast<std::size_t>(shape.pages) * sizeof(std::int32_t)) {
                 std::printf("  FAIL: pages=%d rows=%d row=%d has %zu bytes\n", shape.pages,
                             shape.rows, row, span.bytes);
@@ -284,19 +284,21 @@ void test_row_span_tiles_the_plane() {
     // Out-of-range rows resolve to an empty span, which the caller turns into a throw. An empty span
     // is not a valid byte length to memset, so "bytes == 0" has to be distinguishable from a real
     // one -- and it is, because the plane always has at least one page per row.
-    check(rope_delta_row_span(4, 128, 4).bytes == 0, "one past the last row is empty");
-    check(rope_delta_row_span(4, 128, -1).bytes == 0, "a negative row is empty");
-    check(rope_delta_row_span(0, 128, 0).bytes == 0, "no rows is empty");
-    check(rope_delta_row_span(4, 0, 0).bytes == 0, "no pages is empty");
+    check(rope_delta_row_span_i32(128, 4, 4).bytes == 0, "one past the last row is empty");
+    check(rope_delta_row_span_i32(128, 4, -1).bytes == 0, "a negative row is empty");
+    check(rope_delta_row_span_i32(128, 0, 0).bytes == 0, "no rows is empty");
+    check(rope_delta_row_span_i32(0, 4, 0).bytes == 0, "no pages is empty");
     // The exact figures, so a change to the stride or the element size is a test failure rather
     // than something to reason about.
-    check(rope_delta_row_span(2, 10, 0).offset == 0 && rope_delta_row_span(2, 10, 0).bytes == 40,
+    check(rope_delta_row_span_i32(10, 2, 0).offset == 0 && rope_delta_row_span_i32(10, 2, 0).bytes == 40,
           "row 0 of a {10,2} plane starts at 0 and is 40 bytes");
-    check(rope_delta_row_span(2, 10, 1).offset == 40 && rope_delta_row_span(2, 10, 1).bytes == 40,
+    check(rope_delta_row_span_i32(10, 2, 1).offset == 40 && rope_delta_row_span_i32(10, 2, 1).bytes == 40,
           "row 1 of a {10,2} plane starts at byte 40");
-    check(rope_delta_row_span(8, 1024, 5).offset == 5 * 4096,
+    check(rope_delta_row_span_i32(1024, 8, 5).offset == 5 * 4096,
           "row 5 of a {1024,8} plane starts at byte 20480");
-    static_assert(rope_delta_row_span(2, 10, 1).offset == 40);
+    // Pins that the helper stays a constant expression, so a change that makes it non-constexpr
+    // fails here rather than at whichever call site next needs it in a constant context.
+    static_assert(rope_delta_row_span_i32(10, 2, 1).offset == 40);
 }
 
 } // namespace

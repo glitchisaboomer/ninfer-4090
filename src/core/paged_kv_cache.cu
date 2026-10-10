@@ -228,18 +228,29 @@ const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_;
 const Tensor& PagedKVPool::rope_deltas() const noexcept { return rope_deltas_; }
 
 void PagedKVPool::clear_rope_delta_row(std::int32_t row, cudaStream_t stream) {
+    // Own precondition, so the diagnostic names the actual cause. The degenerate-plane case is not
+    // reachable from a pool this repo builds -- `plan_paged_kv_pool` rejects `table_rows <= 0` and
+    // derives `logical_pages` through `checked_i32`, which rejects zero -- so reaching it would mean
+    // the pool was constructed from a spec that already failed. Say that, rather than reporting a
+    // row as out of range because the plane is empty.
+    if (row < 0 || row >= table_row_count()) {
+        throw std::out_of_range("Paged KV rope-delta row out of range");
+    }
+    const RopeDeltaRowSpan span = rope_delta_row_span_i32(rope_deltas_.ne[0], table_row_count(), row);
+    if (span.bytes == 0) {
+        throw std::logic_error("Paged KV rope-delta plane is degenerate");
+    }
     // `kRopeDeltaNone` is zero, so clearing the row *is* the reset. This runs on the caller's stream
     // beside `publish_mapping`, not on the default stream, because a default-stream write does not
     // order against the non-blocking stream that will read it.
     //
-    // The offset comes from the tested `rope_delta_row_span` rather than from a `Tensor::slice`, so
-    // the arithmetic that decides *which bytes get zeroed* is host-verifiable. It reads as though it
-    // should need a strided write -- the plane is `{logical_pages, table_rows}` and the row is dim 1
-    // -- but dim 0 is innermost here, so a row is contiguous. The row-span test proves the rows are
-    // disjoint and jointly tile the plane, which is what makes one memset over one row safe.
-    const RopeDeltaRowSpan span =
-        rope_delta_row_span(table_row_count(), rope_deltas_.ne[0], row);
-    if (span.bytes == 0) { throw std::out_of_range("Paged KV rope-delta row out of range"); }
+    // The offset comes from the tested `rope_delta_row_span_i32` rather than from a `Tensor::slice`,
+    // so the arithmetic that decides *which bytes get zeroed* is host-verifiable. It reads as though
+    // it should need a strided write -- the plane is `{logical_pages, table_rows}` and the row is
+    // dim 1 -- but dim 0 is innermost here, so a row is contiguous. `publish_range` proves the
+    // convention: it indexes a block-table row as `row.data + first_page` and memcpys contiguous
+    // bytes, which only works under it. The row-span test proves the rows are disjoint and jointly
+    // tile the plane, which is what makes one memset over one row safe.
     auto* row_base = static_cast<unsigned char*>(rope_deltas_.data) + span.offset;
     CUDA_CHECK(cudaMemsetAsync(row_base, 0, span.bytes, stream));
 }

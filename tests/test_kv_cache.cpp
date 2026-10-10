@@ -81,6 +81,80 @@ int expect_device_page_ids(const ninfer::Tensor& row, std::initializer_list<std:
     return expect_page_ids(actual, expected, label);
 }
 
+// The RoPE delta plane is the one tensor in this pool whose reader has no other source of truth: if
+// `clear_rope_delta_row` zeroes the wrong bytes, attention silently counter-rotates a page that was
+// never relocated. That is why the host test pins the arithmetic and this one pins the effect.
+//
+// It fills the whole plane with a non-zero pattern, clears one row, and requires that *exactly* that
+// row changed and every other row is byte-identical to before. Checking only "row 0 is zero now"
+// would pass with a stride that also clobbers row 1, which is the bug the arithmetic was extracted to
+// prevent.
+int expect_rope_delta_row_clear(ninfer::PagedKVPool& pool, std::int32_t row, cudaStream_t stream,
+                                const char* label) {
+    const ninfer::Tensor& deltas = pool.rope_deltas();
+    if (deltas.ne[0] <= 0 || deltas.ne[1] != pool.table_row_count()) {
+        std::cerr << label << " plane shape is inconsistent\n";
+        return 1;
+    }
+    const std::size_t rows      = static_cast<std::size_t>(deltas.ne[1]);
+    const std::size_t row_bytes = static_cast<std::size_t>(deltas.ne[0]) * sizeof(std::int32_t);
+
+    // A non-zero fill: 0xCC as int32, so every entry reads as a plausible-looking shift rather than
+    // as an obviously-poisoned value.
+    std::vector<std::int32_t> pattern(deltas.ne[0] * deltas.ne[1], 0);
+    const std::int32_t poison = static_cast<std::int32_t>(0xCCCCCC00u);
+    std::fill(pattern.begin(), pattern.end(), poison);
+    cudaError_t err = cudaMemcpyAsync(deltas.data, pattern.data(), pattern.size() * sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " fill failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " fill sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    pool.clear_rope_delta_row(row, stream);
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " clear sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    std::vector<std::int32_t> after(pattern.size(), 0);
+    err = cudaMemcpy(after.data(), deltas.data, after.size() * sizeof(std::int32_t),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::cerr << label << " readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    int failures = 0;
+    for (std::size_t r = 0; r < rows; ++r) {
+        for (std::int32_t p = 0; p < deltas.ne[0]; ++p) {
+            const std::size_t index = r * static_cast<std::size_t>(deltas.ne[0]) +
+                                      static_cast<std::size_t>(p);
+            const bool cleared = r == static_cast<std::size_t>(row);
+            const std::int32_t want = cleared ? 0 : poison;
+            if (after[index] != want) {
+                if (failures < 4) {
+                    std::cerr << label << " row " << r << " page " << p << " is " << after[index]
+                              << ", expected " << want << '\n';
+                }
+                ++failures;
+            }
+        }
+    }
+    if (failures != 0) {
+        std::cerr << label << " " << failures << " of " << pattern.size()
+                  << " entries wrong after clearing row " << row << " (row is " << row_bytes
+                  << " bytes)\n";
+    }
+    return failures == 0 ? 0 : 1;
+}
+
 int expect_zeroed_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder order,
                         std::span<const std::int32_t> pages, cudaStream_t stream,
                         const char* label) {
@@ -233,6 +307,10 @@ int main() {
     failures += expect_size(paged_plan.layout.metadata_bytes(), expected_metadata,
                             "paged metadata bytes");
     failures += check_shape(paged_pool.rope_deltas(), {10, 2, 1, 1}, "paged rope-delta plane");
+    // The effect, not just the arithmetic: filling the plane with a plausible shift and clearing one
+    // row must leave that row zero and the other byte-identical.
+    failures += expect_rope_delta_row_clear(paged_pool, 0, ctx.stream, "rope-delta row 0 clear");
+    failures += expect_rope_delta_row_clear(paged_pool, 1, ctx.stream, "rope-delta row 1 clear");
     if (paged_pool.rope_deltas().ne[0] != paged_pool.block_tables().ne[0] ||
         paged_pool.rope_deltas().ne[1] != paged_pool.block_tables().ne[1]) {
         ++failures;

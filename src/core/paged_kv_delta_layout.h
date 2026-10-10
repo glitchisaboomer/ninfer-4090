@@ -49,23 +49,33 @@ struct RopeDeltaLayout {
 // that is undefined at the top of its own domain is a trap rather than a guard, and a test does now
 // call it there deliberately, so the case has to behave rather than merely not be hit.
 // Byte span of one table row's slice of the delta plane: `logical_pages` contiguous int32 values at
-// `row * logical_pages * sizeof(int32_t)`.
+// `row * logical_pages * sizeof(std::int32_t)`.
 //
 // Extracted from `PagedKVPool::clear_rope_delta_row` for the same reason `q5_linear_add_catalog.h`
 // was extracted from its planner: the arithmetic that must not be wrong lives where it can be tested
 // without a CUDA toolchain. It is also the part a reviewer got wrong once already -- see the row-span
 // test, which proves the rows are disjoint and jointly tile the plane.
+//
+// The name carries the element size because the plane's dtype does. A RoPE delta is a signed position
+// count and the plane is `DType::I32`; a caller that ever changes that has to change this too, and
+// the name is what makes the coupling visible rather than something to discover from a stride bug.
 struct RopeDeltaRowSpan {
     std::size_t offset = 0;
     std::size_t bytes  = 0;
 };
 
-// The plane is `{logical_pages, table_rows}` with dim 0 innermost, so a row is contiguous and rows
-// are `logical_pages` elements apart. Returns an all-zero span for an out-of-range row rather than a
-// wrapped offset, so a caller that ignores the result still fails a shape check downstream.
-[[nodiscard]] constexpr RopeDeltaRowSpan rope_delta_row_span(std::int32_t table_rows,
-                                                            std::int32_t logical_pages,
-                                                            std::int32_t row) noexcept {
+// The plane is `{logical_pages, table_rows}` -- the parameter order matches the tensor's own shape,
+// so the call site reads `span(plane.ne[0], plane.ne[1], row)` -- with dim 0 innermost, so a row is
+// contiguous and rows are `logical_pages` elements apart.
+//
+// Returns an all-zero span when the row is out of range. The degenerate plane shapes are not
+// reachable from a pool this repo builds: `plan_paged_kv_pool` requires `table_rows > 0` and derives
+// `logical_pages` through `checked_i32`, which rejects zero. They are rejected here anyway so the
+// caller gets a span it can refuse rather than a wrapped offset, but the caller checks the row itself
+// so that its diagnostic names the right cause.
+[[nodiscard]] constexpr RopeDeltaRowSpan rope_delta_row_span_i32(std::int32_t logical_pages,
+                                                                std::int32_t table_rows,
+                                                                std::int32_t row) noexcept {
     if (table_rows <= 0 || logical_pages <= 0 || row < 0 || row >= table_rows) {
         return RopeDeltaRowSpan{0, 0};
     }
