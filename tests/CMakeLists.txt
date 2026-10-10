@@ -296,6 +296,13 @@ ninfer_add_op_test(ninfer_gqa_kv_page_delta_test
 ninfer_add_op_test(ninfer_gqa_kv_page_delta_i8_test
   SOURCES ops/test_gqa_kv_page_delta_i8.cpp
   LIBRARIES ninfer_ops)
+# Rotated int8 variants (rk8v4, rk4v4-e8): the same delta scenario with packed int4 planes and a host
+# port of the 64-point Hadamard, plus the I8 prefill route the plain-int8 oracle test defers. Its own
+# self-checks (DC gain, involution, orthogonality, nibble order) and its negative control are what
+# prove the host rotation and the packed decode are not no-ops.
+ninfer_add_op_test(ninfer_gqa_kv_page_delta_rotated_test
+  SOURCES ops/test_gqa_kv_page_delta_rotated.cpp
+  LIBRARIES ninfer_ops)
 # Log-probability of the chosen token, against an FP64 log-softmax oracle. Phase 5.5 of
 # docs/SCR_ROADMAP.md scores the two reuse paths in nats, so this measures the quantity that score
 # consumes rather than the argmax it is often confused with.

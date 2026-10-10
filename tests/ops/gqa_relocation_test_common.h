@@ -25,6 +25,7 @@
 #include <limits>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -251,42 +252,137 @@ struct Cache {
     }
 };
 
-// One INT8-G64 paged K/V cache with a host-mirrored block table. K/V codes and per-group
-// half scales are separate device buffers, matching the shape PagedKVCache::layer_view
-// produces for DType::I8. The flag combination (packed_v / rotate_k / rotate_v / packed_k /
-// e8_lattice / e8_root) is the combination for KvCacheStorage::Int8Group64, confirmed in
-// Part 0a; see layouts_impl.h around lines 711-728 and the constants in this test's
-// constructor.
+// The three plane models the oracle can decode, selected by the runtime flag combination rather
+// than by the storage enum: the oracle's input is a cache view, and the view carries flags.
+// `e8_lattice` is deliberately absent from this list -- the E8 projection is encode-side, and the
+// read branch of every PackedK variant is gqa_kv_unpack_i4x16 followed by a scale multiply.
+enum class KvCodec {
+    I8G64,   // full-width int8 K and V, no rotation
+    RK8V4,   // full-width int8 K, packed int4 V, K and V Hadamard-rotated
+    RK4V4E8, // packed int4 K and V, K and V Hadamard-rotated
+};
+
+// Deliberately not constexpr and deliberately not optional<KvCodec>: the e8_root case throws, and a
+// throwing body is ill-formed in a constant expression, while a nullopt is something a caller can
+// ignore. A variant the oracle cannot decode has to be loud.
+[[nodiscard]] inline KvCodec codec_of(bool packed_v, bool rotate_k, bool rotate_v, bool packed_k,
+                                      bool e8_lattice, bool e8_root) {
+    if (e8_root) {
+        // rk2v4-e8's K read path is e8_root_decode_8d_int8: root table + axis table + radius scale
+        // beside the packed layout at paged_kv_page_head_offset<64, KVHeads>. That host port is
+        // Phase 4d-4; never approximate it with the packed-int4 model below.
+        throw std::invalid_argument("codec_of: the rk2v4-e8 oracle is Phase 4d-4");
+    }
+    // Mirror both wrapper invariants (src/ops/wrapper/gqa_attention.cpp:64-69) so an illegal flag
+    // set fails at cache construction instead of aborting mid-run inside gqa_attention_cached.
+    if (e8_lattice && !packed_k) {
+        throw std::invalid_argument("codec_of: E8 lattice requires packed K");
+    }
+    if (rotate_v && !packed_v) {
+        throw std::invalid_argument("codec_of: rotate_v requires packed V");
+    }
+    if (packed_k) { return KvCodec::RK4V4E8; }
+    if (packed_v || rotate_k || rotate_v) { return KvCodec::RK8V4; }
+    return KvCodec::I8G64;
+}
+
+// Matches gqa_kv_unpack_i4 exactly: the low nibble is the even dim, the high nibble is the odd dim,
+// and the value is a 4-bit two's-complement sign extension, not a biased offset.
+[[nodiscard]] inline std::int8_t unpack_i4(std::uint8_t packed, std::int32_t parity) {
+    const unsigned nibble = parity ? (packed >> 4) : (packed & 0x0Fu);
+    return static_cast<std::int8_t>(static_cast<int>(nibble ^ 8u) - 8);
+}
+
+// Host port of gqa_kv_hadamard64 (src/ops/kernel/gqa_attention_kv_quant.cuh:75-91). Device lane L
+// holds group elements [L] and [L + 32]; each butterfly stage reads the pre-stage values of lane
+// L ^ offset, because __shfl_xor_sync is simultaneous across lanes; and the final stage folds the two
+// registers with a 0.125 scale, which leaves the orthonormal transform with a DC gain of 8
+// (64 * 0.125) -- a constant group [c, c, ...] maps to [8c, 0, ...]. H is symmetric and involutory
+// (H^2 = I), which is why this one function both applies and undoes the rotation; the production V
+// path relies on exactly that in gqa_kv_inverse_rotate_output_kernel.
+inline void hadamard64_group(double* y) {
+    std::array<double, 64> prev{};
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        std::copy(y, y + 64, prev.begin());
+        for (int lane = 0; lane < 32; ++lane) {
+            const int  src = lane ^ offset;
+            const bool hi  = (lane & offset) != 0;
+            y[lane]      = hi ? prev[src] - prev[lane] : prev[lane] + prev[src];
+            y[lane + 32] = hi ? prev[src + 32] - prev[lane + 32]
+                              : prev[lane + 32] + prev[src + 32];
+        }
+    }
+    for (int lane = 0; lane < 32; ++lane) {
+        const double a = y[lane];
+        const double b = y[lane + 32];
+        y[lane]        = (a + b) * 0.125;
+        y[lane + 32]   = (a - b) * 0.125;
+    }
+}
+
+// Undo the per-64-group Hadamard the write path applies before quantization, on one decoded plane
+// whose leading index is d (so each row of kHeadDim elements holds kQuantGroups contiguous groups).
+inline void inverse_hadamard_plane(std::vector<double>& plane) {
+    static_assert(kQuantGroup == 64, "the host Hadamard port is the 64-point transform");
+    static_assert(kQuantGroups * kQuantGroup == kHeadDim, "groups must tile the head dim");
+    std::array<double, 64> group{};
+    for (std::size_t row = 0; row + static_cast<std::size_t>(kHeadDim) <= plane.size();
+         row += static_cast<std::size_t>(kHeadDim)) {
+        for (std::int32_t g = 0; g < kQuantGroups; ++g) {
+            const std::size_t base = row + static_cast<std::size_t>(g) * kQuantGroup;
+            for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+                group[static_cast<std::size_t>(i)] = plane[base + static_cast<std::size_t>(i)];
+            }
+            hadamard64_group(group.data());
+            for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+                plane[base + static_cast<std::size_t>(i)] = group[static_cast<std::size_t>(i)];
+            }
+        }
+    }
+}
+
+// One INT8 paged K/V cache with a host-mirrored block table, covering every int8 storage variant
+// whose decode this oracle models. Codes and per-group half scales are separate device buffers,
+// matching the shape PagedKVCache::layer_view produces for DType::I8. Both code planes are byte
+// storage; whether a plane is full width (DType::I8, leading extent kHeadDim) or packed (DType::U8
+// nibble pairs, leading extent kHeadDim / 2) is exactly what the wrapper validates at
+// src/ops/wrapper/gqa_attention.cpp:80-86, so the view published below declares that, and image()
+// reads each plane with the matching host element type.
 struct Int8Cache {
-    DeviceBuffer k_codes;   // int8 plane, [kHeadDim, kPageSize, kKvHeads, physical_pages]
-    DeviceBuffer v_codes;   // int8 plane, same layout; the uint8_t* in the fill kernel is
-                            // a two's-complement write alias, not a different dtype
-    DeviceBuffer k_scale;   // half plane,  [kQuantGroups, kPageSize, kKvHeads, physical_pages]
-    DeviceBuffer v_scale;   // half plane,  [kQuantGroups, kPageSize, kKvHeads, physical_pages]
+    DeviceBuffer k_codes;   // byte plane, [k_leading(), kPageSize, kKvHeads, physical_pages]
+    DeviceBuffer v_codes;   // byte plane, [v_leading(), kPageSize, kKvHeads, physical_pages]
+    DeviceBuffer k_scale;   // half plane, [kQuantGroups, kPageSize, kKvHeads, physical_pages]
+    DeviceBuffer v_scale;   // half plane, [kQuantGroups, kPageSize, kKvHeads, physical_pages]
     DeviceBuffer table;
     std::vector<std::int32_t> table_host;
     std::int32_t logical_pages  = 0;
     std::int32_t physical_pages = 0;
+    KvCodec codec = KvCodec::I8G64;
     bool packed_v = false, rotate_k = false, rotate_v = false, packed_k = false;
     bool e8_lattice = false, e8_root = false;
 
     Int8Cache(std::int32_t logical, const std::vector<std::int32_t>& mapping,
               std::int32_t kv_heads, bool packed_v_in, bool rotate_k_in, bool rotate_v_in,
               bool packed_k_in, bool e8_lattice_in, bool e8_root_in)
-        : table_host(mapping), logical_pages(logical), packed_v(packed_v_in),
-          rotate_k(rotate_k_in), rotate_v(rotate_v_in), packed_k(packed_k_in),
-          e8_lattice(e8_lattice_in), e8_root(e8_root_in) {
+        : table_host(mapping), logical_pages(logical),
+          codec(codec_of(packed_v_in, rotate_k_in, rotate_v_in, packed_k_in, e8_lattice_in,
+                         e8_root_in)),
+          packed_v(packed_v_in), rotate_k(rotate_k_in), rotate_v(rotate_v_in),
+          packed_k(packed_k_in), e8_lattice(e8_lattice_in), e8_root(e8_root_in) {
         for (const std::int32_t p : table_host) {
             physical_pages = std::max(physical_pages, p + 1);
         }
-        const std::size_t elements_per_plane =
-            static_cast<std::size_t>(kHeadDim) * kPageSize * kv_heads *
+        const std::size_t elements_per_k_plane =
+            static_cast<std::size_t>(k_leading()) * kPageSize * kv_heads *
+            static_cast<std::size_t>(physical_pages);
+        const std::size_t elements_per_v_plane =
+            static_cast<std::size_t>(v_leading()) * kPageSize * kv_heads *
             static_cast<std::size_t>(physical_pages);
         const std::size_t scale_elements =
             static_cast<std::size_t>(kQuantGroups) * kPageSize * kv_heads *
             static_cast<std::size_t>(physical_pages);
-        k_codes  = DeviceBuffer(elements_per_plane * sizeof(std::int8_t));
-        v_codes  = DeviceBuffer(elements_per_plane * sizeof(std::int8_t));
+        k_codes  = DeviceBuffer(elements_per_k_plane);
+        v_codes  = DeviceBuffer(elements_per_v_plane);
         k_scale  = DeviceBuffer(scale_elements * sizeof(__half));
         v_scale  = DeviceBuffer(scale_elements * sizeof(__half));
         k_codes.fill(0);
@@ -301,12 +397,29 @@ struct Int8Cache {
     Int8Cache(Int8Cache&&)                 = default;
     Int8Cache& operator=(Int8Cache&&)      = default;
 
+    // Plane extent and dtype per plane, derived from the codec the constructor selected. These must
+    // match what validate_cache / validate_batch_cache require (gqa_attention.cpp:79-86): a packed
+    // plane is U8 with leading extent kHeadDim / 2, a full-width plane is the code dtype with
+    // leading extent kHeadDim.
+    [[nodiscard]] std::int32_t k_leading() const {
+        return codec == KvCodec::RK4V4E8 ? kHeadDim / 2 : kHeadDim;
+    }
+    [[nodiscard]] std::int32_t v_leading() const {
+        return codec == KvCodec::I8G64 ? kHeadDim : kHeadDim / 2;
+    }
+    [[nodiscard]] DType k_dtype() const {
+        return codec == KvCodec::RK4V4E8 ? DType::U8 : DType::I8;
+    }
+    [[nodiscard]] DType v_dtype() const {
+        return codec == KvCodec::I8G64 ? DType::I8 : DType::U8;
+    }
+
     [[nodiscard]] PagedKVLayerView view(std::int32_t kv_heads = kKvHeads) const {
         PagedKVLayerView result;
-        result.k_pages = Tensor(k_codes.p, DType::I8,
-                                {kHeadDim, kPageSize, kv_heads, physical_pages});
-        result.v_pages = Tensor(v_codes.p, DType::I8,
-                                {kHeadDim, kPageSize, kv_heads, physical_pages});
+        result.k_pages = Tensor(k_codes.p, k_dtype(),
+                                {k_leading(), kPageSize, kv_heads, physical_pages});
+        result.v_pages = Tensor(v_codes.p, v_dtype(),
+                                {v_leading(), kPageSize, kv_heads, physical_pages});
         result.k_scale_pages = Tensor(k_scale.p, DType::FP16,
                                       {kQuantGroups, kPageSize, kv_heads, physical_pages});
         result.v_scale_pages = Tensor(v_scale.p, DType::FP16,
@@ -325,10 +438,38 @@ struct Int8Cache {
         return result;
     }
 
-    // Decode the int8 codes with their half scale, exactly per the contract in
+    // The multi-sequence form of the same planes, mirroring Cache::batch_view(): identical plane
+    // tensors and flags, the block table already reshaped to one row, and rope_deltas left unset for
+    // the caller to attach (which is what the prefill path needs to carry the delta plane).
+    [[nodiscard]] PagedKVBatchLayerView batch_view(std::int32_t kv_heads = kKvHeads) const {
+        const PagedKVLayerView direct = view(kv_heads);
+        return PagedKVBatchLayerView{.k_pages       = direct.k_pages,
+                                     .v_pages       = direct.v_pages,
+                                     .k_scale_pages = direct.k_scale_pages,
+                                     .v_scale_pages = direct.v_scale_pages,
+                                     .block_tables  = direct.block_table.view({logical_pages, 1}),
+                                     .rope_deltas   = Tensor{},
+                                     .rope_inv_freq = direct.rope_inv_freq,
+                                     .head_dim      = direct.head_dim,
+                                     .num_kv_heads  = direct.num_kv_heads,
+                                     .dtype         = direct.dtype,
+                                     .quant_group   = direct.quant_group,
+                                     .packed_v      = direct.packed_v,
+                                     .rotate_k      = direct.rotate_k,
+                                     .rotate_v      = direct.rotate_v,
+                                     .packed_k      = direct.packed_k,
+                                     .e8_lattice    = direct.e8_lattice,
+                                     .e8_root       = direct.e8_root};
+    }
+
+    // Decode the code planes with their half per-group scales, exactly per the contract in
     // include/ninfer/ops/gqa_attention.h lines 24-32:
     //   decode[i] = FP32(code[i]) * FP32(scale[group(i)])
-    // Both K and V codes are signed; the returned image is [physical page][kv head][page
+    // A full-width plane holds signed int8 codes; a packed plane holds int4 nibble pairs, which must
+    // go through unpack_i4 and never through a direct cast. A rotated variant's codes hold
+    // Hadamard-rotated values, so the decoded plane is then passed through the inverse Hadamard one
+    // 64-dim group at a time -- which is what makes this oracle's raw-BF16 query comparable to the
+    // kernel's rotated-and-quantized one. The returned image is [physical page][kv head][page
     // offset][d], the same plane order k_logical / v_logical index into below.
     struct HostImage {
         std::vector<double> k;
@@ -341,40 +482,80 @@ struct Int8Cache {
         const std::size_t scale_elems =
             static_cast<std::size_t>(kQuantGroups) * kPageSize * kKvHeads *
             static_cast<std::size_t>(physical_pages);
-        std::vector<std::int8_t> k_codes_host(elems);
-        std::vector<std::int8_t> v_codes_host(elems);
-        std::vector<__half>      k_scale_host(scale_elems);
-        std::vector<__half>      v_scale_host(scale_elems);
-        k_codes.copy_to_host(k_codes_host.data(), elems * sizeof(std::int8_t));
-        v_codes.copy_to_host(v_codes_host.data(), elems * sizeof(std::int8_t));
+        const bool k_full = k_leading() == kHeadDim;
+        const bool v_full = v_leading() == kHeadDim;
+
+        // Each plane is read with the element type its published view declares, so the host vector's
+        // type carries the interpretation: a plain static_cast<double> is only ever correct for a
+        // signed full-width plane, and a packed plane only ever goes through unpack_i4.
+        std::vector<std::int8_t>  k_i8;
+        std::vector<std::int8_t>  v_i8;
+        std::vector<std::uint8_t> k_u8;
+        std::vector<std::uint8_t> v_u8;
+        if (k_full) {
+            k_i8.resize(elems);
+            k_codes.copy_to_host(k_i8.data(), elems * sizeof(std::int8_t));
+        } else {
+            k_u8.resize(elems / 2);
+            k_codes.copy_to_host(k_u8.data(), k_u8.size() * sizeof(std::uint8_t));
+        }
+        if (v_full) {
+            v_i8.resize(elems);
+            v_codes.copy_to_host(v_i8.data(), elems * sizeof(std::int8_t));
+        } else {
+            v_u8.resize(elems / 2);
+            v_codes.copy_to_host(v_u8.data(), v_u8.size() * sizeof(std::uint8_t));
+        }
+        std::vector<__half> k_scale_host(scale_elems);
+        std::vector<__half> v_scale_host(scale_elems);
         k_scale.copy_to_host(k_scale_host.data(), scale_elems * sizeof(__half));
         v_scale.copy_to_host(v_scale_host.data(), scale_elems * sizeof(__half));
 
         HostImage out{std::vector<double>(elems), std::vector<double>(elems)};
-        // The leading element index runs [d, page_offset, kv_head, physical_page] in the plane;
-        // the group index is d / kQuantGroup. This matches paged_kv_element_offset for both
-        // the code and scale planes when the leading dim is head_dim and groups respectively.
+        // The element index runs [d, page_offset, kv_head, physical_page] in the plane, and the group
+        // index is d / kQuantGroup. This matches paged_kv_element_offset for the code plane (leading
+        // dim kHeadDim, or kHeadDim / 2 when packed) and for the scale plane (leading dim
+        // kQuantGroups).
         for (std::int32_t page = 0; page < physical_pages; ++page) {
             for (std::int32_t head = 0; head < kKvHeads; ++head) {
                 for (std::int32_t offset = 0; offset < kPageSize; ++offset) {
+                    const std::size_t row =
+                        (static_cast<std::size_t>(page) * kKvHeads + head) * kPageSize + offset;
                     for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                        const std::size_t code_idx =
-                            ((static_cast<std::size_t>(page) * kKvHeads + head) * kPageSize + offset) *
-                                kHeadDim +
-                            d;
-                        const std::int32_t group = d / kQuantGroup;
+                        const std::size_t elem_idx = row * kHeadDim + static_cast<std::size_t>(d);
+                        const std::int32_t group   = d / kQuantGroup;
                         const std::size_t scale_idx =
-                            ((static_cast<std::size_t>(page) * kKvHeads + head) * kPageSize + offset) *
-                                kQuantGroups +
-                            group;
-                        out.k[code_idx] = static_cast<double>(k_codes_host[code_idx]) *
-                                          static_cast<double>(__half2float(k_scale_host[scale_idx]));
-                        out.v[code_idx] = static_cast<double>(v_codes_host[code_idx]) *
-                                          static_cast<double>(__half2float(v_scale_host[scale_idx]));
+                            row * kQuantGroups + static_cast<std::size_t>(group);
+                        const double ks = static_cast<double>(__half2float(k_scale_host[scale_idx]));
+                        const double vs = static_cast<double>(__half2float(v_scale_host[scale_idx]));
+                        // Packed planes are indexed with their own leading extent, kHeadDim / 2, so
+                        // d / 2 lands on the byte holding dims {d & ~1, d | 1}.
+                        out.k[elem_idx] =
+                            k_full ? static_cast<double>(
+                                         k_i8[row * static_cast<std::size_t>(k_leading()) +
+                                              static_cast<std::size_t>(d)]) *
+                                         ks
+                                   : static_cast<double>(unpack_i4(
+                                         k_u8[row * static_cast<std::size_t>(k_leading()) +
+                                              static_cast<std::size_t>(d / 2)],
+                                         d & 1)) *
+                                         ks;
+                        out.v[elem_idx] =
+                            v_full ? static_cast<double>(
+                                         v_i8[row * static_cast<std::size_t>(v_leading()) +
+                                              static_cast<std::size_t>(d)]) *
+                                         vs
+                                   : static_cast<double>(unpack_i4(
+                                         v_u8[row * static_cast<std::size_t>(v_leading()) +
+                                              static_cast<std::size_t>(d / 2)],
+                                         d & 1)) *
+                                         vs;
                     }
                 }
             }
         }
+        if (rotate_k) { inverse_hadamard_plane(out.k); }
+        if (rotate_v) { inverse_hadamard_plane(out.v); }
         return out;
     }
 
