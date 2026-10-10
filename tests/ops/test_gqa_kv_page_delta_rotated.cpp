@@ -9,7 +9,15 @@
 //     (src/ops/kernel/gqa_attention_decode_i8.cuh:377-383) -- so no lattice codec is needed here;
 //   * a host port of the 64-point Hadamard, because the rotated variants store H-rotated codes and
 //     the FP64 oracle reads raw BF16 queries. H is orthonormal, so the oracle can inverse-rotate the
-//     decoded plane instead of rotating Q, and the two are equal in exact arithmetic.
+//     decoded plane instead of rotating Q, and the two are equal in exact arithmetic;
+//   * an FP64 anchor for the delta path itself. ideal_attention_with_delta rotates each decoded key
+//     back by its page's delta -- the key-side form of the kernel's Q counter-rotation -- so the
+//     relocated run is compared against mathematics rather than only against a second cache. The
+//     cache-against-cache equivalence is kept, but it cannot carry the discrimination on a coarse
+//     (int4) K plane: there the correct path's error against a directly prefilled cache is itself of
+//     the order of that plane's encode error, which is not separable from a zero-delta run. The
+//     anchor rotates the *decoded* key, so it models that encode error exactly and still sees a
+//     skipped rotation at ~5.7e-2 against a 5.0e-3 criterion.
 //
 // rk2v4-e8 is out of scope (Phase 4d-4): its K read path is e8_root_decode_8d_int8, a real codec
 // port, and codec_of refuses it loudly rather than decoding it as something else.
@@ -251,6 +259,25 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
     auto got_relocated = run_cached_attention_view_i8(cache, scenario.q, kDecodeBase,
                                                       kDecodeTokens, visible, view);
 
+    // The FP64 reference for the relocated path itself: the same cache, with every key rotated back
+    // by its page's delta (the key-side form of the kernel's Q counter-rotation). Anchoring here is
+    // what lets a correct relocation be told apart from a skipped rotation at the criterion's own
+    // resolution: the oracle rotates the *decoded* key, so it carries the plane's encode error
+    // exactly and the comparison does not inherit the coarse-int4 noise that swamps the
+    // cache-against-cache equivalence below.
+    const std::vector<double> delta_reference =
+        ideal_attention_with_delta(scenario.q, cache, kDecodeBase, kDecodeTokens, delta_host, freq);
+
+    // kConformanceRotatedI8 goes to BOTH calls -- measure() uses it for the gross thresholds and
+    // expect_conformant for relative L2 -- so the delta path is judged against the rotated profile
+    // end to end. This is the check that validates the counter-rotation: a skipped rotation lands at
+    // ~5.7e-2 and fails here and nowhere else.
+    if (!expect_conformant(measure(got_relocated.out, delta_reference, kConformanceRotatedI8),
+                           named("A3 delta plane against the FP64 delta oracle", variant.name),
+                           kConformanceRotatedI8)) {
+        ++failures;
+    }
+
     Int8Cache reference(kLogicalPages, scenario.table, kKvHeads, variant.packed_v, variant.rotate_k,
                         variant.rotate_v, variant.packed_k, variant.e8_lattice, variant.e8_root);
     append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
@@ -258,16 +285,15 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
     auto got_reference = run_cached_attention_view_i8(reference, scenario.q, kDecodeBase,
                                                       kDecodeTokens, visible, ref_view);
 
-    // FP64 anchor, enabled for every rotated variant. kConformanceInt8 goes to BOTH calls -- measure()
-    // uses it for the gross thresholds and expect_conformant for relative L2 -- so the anchor is
-    // judged against the INT8 profile end to end. This is the check that validates the host Hadamard
-    // and the packed-plane decode: a wrong parity, extent or DC gain fails here and nowhere else.
+    // FP64 anchor of the directly prefilled page, under the same rotated profile. This is the check
+    // that validates the host Hadamard and the packed-plane decode: a wrong parity, extent or DC gain
+    // fails here and nowhere else.
     if (!expect_conformant(measure(got_reference.out,
                                    ideal_attention(scenario.q, reference, kDecodeBase,
                                                    kDecodeTokens),
-                                   kConformanceInt8),
+                                   kConformanceRotatedI8),
                            named("A3 over a directly prefilled int8 page", variant.name),
-                           kConformanceInt8)) {
+                           kConformanceRotatedI8)) {
         ++failures;
     }
 
@@ -284,12 +310,15 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
     auto got_stale = run_cached_attention_view_i8(cache, scenario.q, kDecodeBase,
                                                   kDecodeTokens, visible, stale_view);
 
-    // expect_equivalent and expect_control_separates read only relative_l2, so these two measure()
-    // calls keep the BF16 default for the gross field without affecting what they assert.
-    if (!expect_control_separates(measure(got_relocated.out, got_reference.out),
-                                  measure(got_stale.out, got_reference.out),
-                                  named("negative control: int8 decode with zero deltas",
-                                        variant.name))) {
+    // The control is anchored on the same delta oracle as the correct run, so what it measures is the
+    // one difference that matters -- the missing delta plane on byte-identical codes. It asserts the
+    // skipped rotation breaks the criterion the correct run is judged by, which holds for every
+    // variant here; the multiplicative form does not, because the correct path's error against a
+    // directly prefilled cache is itself O(the int4 K plane's encode error).
+    if (!expect_control_outside(measure(got_stale.out, delta_reference, kConformanceRotatedI8),
+                                named("negative control: int8 decode with zero deltas",
+                                      variant.name),
+                                kConformanceRotatedI8)) {
         ++failures;
     }
 }
@@ -399,6 +428,18 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const Variant&
     auto got_relocated = run_prefill_attention_i8(prefill_q, tail_k, tail_v, kPrefillBase,
                                                   kPrefillTokens, visible, batch_view);
 
+    // 5b. Anchor the relocated path to the FP64 delta oracle. The call above has just written the tail
+    // chunk into `cache`, so the cache now holds exactly the codes the run read: the source-phase run
+    // plus the tail. Rotating each key back by its page's delta is what a skipped rotation cannot
+    // survive -- and the tail's page carries no delta, so it must pass through untouched.
+    const std::vector<double> delta_reference = ideal_attention_with_delta(
+        prefill_q, cache, kPrefillBase, kPrefillTokens, delta_host, freq);
+    if (!expect_conformant(measure(got_relocated.out, delta_reference, kConformanceRotatedI8),
+                           named("A1 delta plane against the FP64 delta oracle", variant.name),
+                           kConformanceRotatedI8)) {
+        ++failures;
+    }
+
     // 6. Reference: direct prefill at the destination, then the same tail chunk
     Int8Cache reference(kLogicalPages, scenario.table, kKvHeads, variant.packed_v, variant.rotate_k,
                         variant.rotate_v, variant.packed_k, variant.e8_lattice, variant.e8_root);
@@ -411,9 +452,9 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const Variant&
     if (!expect_conformant(measure(got_reference.out,
                                    ideal_attention(prefill_q, reference, kPrefillBase,
                                                    kPrefillTokens),
-                                   kConformanceInt8),
+                                   kConformanceRotatedI8),
                            named("A1 over a directly prefilled int8 page", variant.name),
-                           kConformanceInt8)) {
+                           kConformanceRotatedI8)) {
         ++failures;
     }
 
@@ -439,10 +480,13 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const Variant&
     auto got_stale = run_prefill_attention_i8(prefill_q, tail_k, tail_v, kPrefillBase,
                                               kPrefillTokens, visible, stale_batch_view);
 
-    if (!expect_control_separates(measure(got_relocated.out, got_reference.out),
-                                  measure(got_stale.out, got_reference.out),
-                                  named("negative control: zero deltas on prefill path",
-                                        variant.name))) {
+    // Same anchored control as the decode path: `stale_cache` holds byte-identical codes (the same
+    // source-phase run and the same tail chunk), so against `delta_reference` the missing delta plane
+    // is the only difference being measured.
+    if (!expect_control_outside(measure(got_stale.out, delta_reference, kConformanceRotatedI8),
+                                named("negative control: zero deltas on prefill path",
+                                      variant.name),
+                                kConformanceRotatedI8)) {
         ++failures;
     }
 }

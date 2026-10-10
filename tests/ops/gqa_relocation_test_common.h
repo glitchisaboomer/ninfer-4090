@@ -109,6 +109,20 @@ constexpr Criterion kConformanceBf16{2.8e-3, 1.0e-3, 2.7e-3};
 // The INT8 criterion, matching kAttentionInt8Criterion in test_gqa_attention.cpp.
 constexpr Criterion kConformanceInt8{3.15e-3, 1.1e-3, 2.2e-3};
 
+// The rotated int8 profile: the same cache with a per-64-group Hadamard interposed on K and V. It
+// differs from kConformanceInt8 by exactly one term the FP64 oracle cannot model -- the production
+// output is staged through bf16 *before* the output inverse Hadamard
+// (gqa_kv_inverse_rotate_output_kernel, used by both the decode and the prefill launcher), where a
+// plain int8 cache writes bf16 once. That term is variant-independent, and so is the measurement:
+// the A3 reference anchor of tests/ops/test_gqa_kv_page_delta_rotated.cpp reads 3.750e-3 (rk8v4),
+// 3.777e-3 (rk4v4-e8) and 3.757e-3 (rk4v4) -- three digits agreeing across an int8 vs a packed int4
+// K plane and across an E8-projected vs a plain encoder, which is what rules out a decode, extent or
+// parity error (those scale with the codec) and attributes the excess to the shared staging term.
+// kConformanceInt8 is left untouched so the plain path keeps its own profile; 5.0e-3 is the measured
+// maximum plus a third of margin, and the gross thresholds are carried over unchanged so only the
+// L2 side of the profile moves.
+constexpr Criterion kConformanceRotatedI8{5.0e-3, 1.1e-3, 2.2e-3};
+
 struct Error {
     double relative_l2 = 0.0;
     double gross       = 0.0;
@@ -789,17 +803,26 @@ inline AttentionRun run_append_attention(Cache& cache, const std::vector<__nv_bf
     return AttentionRun{download_doubles(dout, q.size())};
 }
 
-// Ideal GQA attention in FP64: the BF16 inputs are taken as exact and dot products, stable softmax
-// and the value reduction all run in FP64, per the numerical contract in gqa_attention.h.
+// The attention core both FP64 oracles share, so the delta form cannot drift from the plain one:
+// the BF16 inputs are taken as exact and the dot products, stable softmax and value reduction all
+// run in FP64, per the numerical contract in gqa_attention.h. Keys are read from a
+// [kv_head][position][d] plane the caller has already resolved to the reference position; V comes
+// through the cache's own logical view.
 template <typename CacheType>
-inline std::vector<double> ideal_attention(const std::vector<__nv_bfloat16>& q,
-                                           const CacheType& cache,
-                                           std::int32_t first_position, std::int32_t tokens) {
-    const typename CacheType::HostImage img = cache.image();
-    const std::int32_t max_position    = first_position + tokens - 1;
+inline std::vector<double> attention_against_key_plane(const std::vector<__nv_bfloat16>& q,
+                                                       const CacheType& cache,
+                                                       const typename CacheType::HostImage& img,
+                                                       const std::vector<double>& key_plane,
+                                                       std::int32_t first_position,
+                                                       std::int32_t tokens) {
+    const std::int32_t max_position = first_position + tokens - 1;
     std::vector<double> reference(q.size());
     std::vector<double> head_q(static_cast<std::size_t>(kHeadDim));
     std::vector<double> weights(static_cast<std::size_t>(max_position) + 1);
+    const auto key_at = [&](std::int32_t x, std::int32_t kv_head, std::int32_t d) {
+        return key_plane[(static_cast<std::size_t>(kv_head) * (max_position + 1) + x) * kHeadDim +
+                         d];
+    };
 
     for (std::int32_t q_head = 0; q_head < kQHeads; ++q_head) {
         const std::int32_t kv_head = q_head / kQGroup;
@@ -814,8 +837,7 @@ inline std::vector<double> ideal_attention(const std::vector<__nv_bfloat16>& q,
             for (std::int32_t x = 0; x <= position; ++x) {
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    dot += head_q[static_cast<std::size_t>(d)] *
-                           cache.k_logical(img, x, kv_head, d);
+                    dot += head_q[static_cast<std::size_t>(d)] * key_at(x, kv_head, d);
                 }
                 const double score = static_cast<double>(kAttentionScale) * dot;
                 weights[static_cast<std::size_t>(x)] = score;
@@ -838,6 +860,66 @@ inline std::vector<double> ideal_attention(const std::vector<__nv_bfloat16>& q,
         }
     }
     return reference;
+}
+
+// Ideal GQA attention in FP64 for a cache whose keys are read exactly as stored.
+template <typename CacheType>
+inline std::vector<double> ideal_attention(const std::vector<__nv_bfloat16>& q,
+                                           const CacheType& cache,
+                                           std::int32_t first_position, std::int32_t tokens) {
+    const typename CacheType::HostImage img = cache.image();
+    const std::int32_t max_position         = first_position + tokens - 1;
+    std::vector<double> keys(static_cast<std::size_t>(kKvHeads) * (max_position + 1) * kHeadDim);
+    for (std::int32_t kv_head = 0; kv_head < kKvHeads; ++kv_head) {
+        for (std::int32_t x = 0; x <= max_position; ++x) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                keys[(static_cast<std::size_t>(kv_head) * (max_position + 1) + x) * kHeadDim + d] =
+                    cache.k_logical(img, x, kv_head, d);
+            }
+        }
+    }
+    return attention_against_key_plane(q, cache, img, keys, first_position, tokens);
+}
+
+// The delta-plane oracle: the FP64 reference for a cache whose keys were quantized at the *source* RoPE
+// phase and are read at the destination positions. The kernel counter-rotates Q by -delta at its load
+// site (gqa_attention_decode_i8.cuh:428-433, group 0 only -- the rotary region is dims
+// [0, 2 * kRotaryPairs)), and R is orthonormal, so the same equality can be evaluated on the key side
+// and stay exact in FP64:
+//
+//     <R(-delta) q, K_src> == <q, R(delta) K_src>
+//
+// forward_rope(., +delta) is the exact inverse of the kernel's counter-rotation (it applies R(+delta)
+// with the same per-pair convention build_scenario uses), and composing it with the stored R(src + t) key
+// yields the R(dst + t) key a direct prefill would have written. That composition is what makes this
+// the *anchored* form of the relocation check: it rotates the decoded key, so it models the encode
+// error of the plane exactly, and a skipped rotation cannot hide behind a coarse plane's own noise the
+// way it does when the reference is another cache.
+//
+// page_deltas is the view's rope_deltas plane, indexed by logical page, and is read per key -- the same
+// plane the kernel indexes for the K tiles it processes.
+template <typename CacheType>
+inline std::vector<double> ideal_attention_with_delta(
+    const std::vector<__nv_bfloat16>& q, const CacheType& cache, std::int32_t first_position,
+    std::int32_t tokens, const std::vector<std::int32_t>& page_deltas, const FreqTable& freq) {
+    const typename CacheType::HostImage img = cache.image();
+    const std::int32_t max_position         = first_position + tokens - 1;
+    std::vector<double> keys(static_cast<std::size_t>(kKvHeads) * (max_position + 1) * kHeadDim);
+    std::array<double, kHeadDim> stored{};
+    for (std::int32_t kv_head = 0; kv_head < kKvHeads; ++kv_head) {
+        for (std::int32_t x = 0; x <= max_position; ++x) {
+            double* row = &keys[(static_cast<std::size_t>(kv_head) * (max_position + 1) + x) *
+                                kHeadDim];
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                stored[static_cast<std::size_t>(d)] = cache.k_logical(img, x, kv_head, d);
+            }
+            // delta == 0 is the identity in this convention, so a page without a delta passes
+            // through unchanged and needs no branch.
+            forward_rope(stored.data(), page_deltas[static_cast<std::size_t>(x / kPageSize)], freq,
+                         row);
+        }
+    }
+    return attention_against_key_plane(q, cache, img, keys, first_position, tokens);
 }
 
 // A correctly relocated cache must be operationally indistinguishable from a directly prefilled one.
@@ -886,8 +968,37 @@ inline bool expect_conformant(const Error& error, const std::string& label,
     return true;
 }
 
-// The control has to clear the limit by a wide factor, otherwise the limit is measuring nothing and
-// the test would pass on a broken kernel.
+// The anchored control: the correct run has to conform to the criterion and the control run has to
+// break the same criterion, so the discrimination is stated at the resolution of the criterion
+// itself rather than as a multiple of the correct path's own noise. This is what a variant with a
+// coarse (int4) K plane needs: there the correct path's error against a directly prefilled cache is
+// dominated by the encode error of a plane that was quantized at the source RoPE phase, so the
+// multiplicative separation against a zero-delta run collapses even though the relocation is right.
+// Pair it with `expect_conformant` on the same oracle and the two together say "the correct path
+// conforms, the skipped rotation does not".
+inline bool expect_control_outside(const Error& control, const std::string& label,
+                                   const Criterion& criterion) {
+    char buf[256];
+    if (control.relative_l2 > criterion.relative_l2) {
+        std::snprintf(buf, sizeof(buf),
+                      "%s: ok (control relative L2 %.3e, %.0fx the %.2e criterion it must break%s)",
+                      label.c_str(), control.relative_l2,
+                      control.relative_l2 / criterion.relative_l2, criterion.relative_l2,
+                      control.gross > 0.0 ? ", with gross errors" : "");
+        std::printf("  %s\n", buf);
+        return true;
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "%s: control only reached relative L2 %.3e, inside the %.2e criterion, so the "
+                  "anchor it is paired with is not discriminating a skipped rotation at all",
+                  label.c_str(), control.relative_l2, criterion.relative_l2);
+    std::printf("  FAIL: %s\n", buf);
+    return false;
+}
+
+// The multiplicative control, kept for the plain-int8 and BF16 delta tests, whose correct-path error
+// is small enough for a 10x separation to be measurable. The control has to clear the limit by a wide
+// factor, otherwise the limit is measuring nothing and the test would pass on a broken kernel.
 inline bool expect_control_separates(const Error& correct, const Error& control, const std::string& label) {
     char buf[256];
     const double floor_error = std::max(correct.relative_l2 * kControlFactor, kEquivalenceLimit);
