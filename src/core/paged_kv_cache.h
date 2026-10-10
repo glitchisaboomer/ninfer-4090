@@ -35,6 +35,8 @@ struct PagedKVLayerView {
     bool packed_k             = false;
     bool e8_lattice           = false;
     bool e8_root              = false;
+    Tensor rope_deltas;          // [logical_pages] int32, or empty (data==nullptr)
+    std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
 };
 
 /**
@@ -50,6 +52,8 @@ struct PagedKVBatchLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_tables;
+    Tensor rope_deltas;          // [table_rows, logical_pages] int32, or empty
+    std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;

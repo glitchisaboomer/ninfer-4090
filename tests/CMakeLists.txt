@@ -290,6 +290,13 @@ ninfer_add_op_test(ninfer_gqa_attention_test
 ninfer_add_op_test(ninfer_scr_relocation_integration_test
   SOURCES ops/test_scr_relocation_integration.cpp
   LIBRARIES ninfer_ops)
+
+# Oracle test for the per-page RoPE delta machinery. It calls detail:: launchers directly with a real
+# delta plane, so it validates the Phase 4a Q counter-rotation path independently of the physical K
+# re-rotation Op, and its own negative control proves the harness is not blind.
+ninfer_add_op_test(ninfer_gqa_kv_page_delta_test
+  SOURCES ops/test_gqa_kv_page_delta.cpp
+  LIBRARIES ninfer_ops)
 # Log-probability of the chosen token, against an FP64 log-softmax oracle. Phase 5.5 of
 # docs/SCR_ROADMAP.md scores the two reuse paths in nats, so this measures the quantity that score
 # consumes rather than the argmax it is often confused with.
