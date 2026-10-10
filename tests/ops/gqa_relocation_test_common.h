@@ -109,18 +109,21 @@ constexpr Criterion kConformanceBf16{2.8e-3, 1.0e-3, 2.7e-3};
 // The INT8 criterion, matching kAttentionInt8Criterion in test_gqa_attention.cpp.
 constexpr Criterion kConformanceInt8{3.15e-3, 1.1e-3, 2.2e-3};
 
-// The rotated int8 profile: the same cache with a per-64-group Hadamard interposed on K and V. It
-// differs from kConformanceInt8 by exactly one term the FP64 oracle cannot model -- the production
-// output is staged through bf16 *before* the output inverse Hadamard
-// (gqa_kv_inverse_rotate_output_kernel, used by both the decode and the prefill launcher), where a
-// plain int8 cache writes bf16 once. That term is variant-independent, and so is the measurement:
-// the A3 reference anchor of tests/ops/test_gqa_kv_page_delta_rotated.cpp reads 3.750e-3 (rk8v4),
-// 3.777e-3 (rk4v4-e8) and 3.757e-3 (rk4v4) -- three digits agreeing across an int8 vs a packed int4
-// K plane and across an E8-projected vs a plain encoder, which is what rules out a decode, extent or
-// parity error (those scale with the codec) and attributes the excess to the shared staging term.
-// kConformanceInt8 is left untouched so the plain path keeps its own profile; 5.0e-3 is the measured
-// maximum plus a third of margin, and the gross thresholds are carried over unchanged so only the
-// L2 side of the profile moves.
+// The rotated int8 profile: the same cache with a per-64-group Hadamard interposed on K and V.
+//
+// This is not a rotation-shaped exemption. The A3 decode anchor of the delta test is a shape that
+// all but saturates kConformanceInt8: the plain Int8Group64 variant measures 3.142e-3 against that
+// criterion's 3.15e-3 (ninfer_gqa_kv_page_delta_i8_test -- same scenario, same query tokens, same
+// decode path), leaving 0.25% of headroom. The rotated variants measure 3.750e-3 (rk8v4), 3.777e-3
+// (rk4v4-e8) and 3.757e-3 (rk4v4): 19% above the plain path, and variant-independent to three
+// digits across an int8 vs a packed int4 K plane and an E8-projected vs a plain encoder, which is
+// what rules out a decode, extent or parity error (those scale with the codec). A shape with 0.25%
+// of headroom cannot absorb any added rounding, so the rotated row needs its own profile while the
+// plain row keeps kConformanceInt8 untouched. That near-saturation is a property of the A3 shape
+// and stands on its own: it is the number to watch if that scenario or query width is ever touched.
+//
+// 5.0e-3 is the measured maximum plus 24% of margin, and the gross thresholds are carried over
+// unchanged so only the L2 side of the profile moves.
 constexpr Criterion kConformanceRotatedI8{5.0e-3, 1.1e-3, 2.2e-3};
 
 struct Error {
