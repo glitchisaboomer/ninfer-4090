@@ -41,9 +41,18 @@ struct RopeDeltaLayout {
 
 // Logical pages a `max_context`-token context needs. Rounds up, so a context that is not a whole
 // number of pages still reserves every page its last partial page lives in.
+//
+// The arithmetic is widened before the division because `max_context` is int32: at the top of the
+// range `max_context + 63` overflows signed, which is UB and, on the compilers this project uses,
+// wraps negative and returns a negative page count. No caller currently reaches that far -- contexts
+// are capped well below it -- but a rounding helper that is undefined at the top of its own domain is
+// a trap, not a guard.
 [[nodiscard]] constexpr std::int32_t rope_delta_logical_pages(std::int32_t max_context) noexcept {
     if (max_context <= 0) { return 0; }
-    return (max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
+    const std::uint64_t pages = (static_cast<std::uint64_t>(max_context) +
+                                 static_cast<std::uint64_t>(kPagedKVPageSize) - 1) /
+                                static_cast<std::uint64_t>(kPagedKVPageSize);
+    return static_cast<std::int32_t>(pages);
 }
 
 [[nodiscard]] constexpr std::size_t rope_delta_plane_bytes(std::int32_t table_rows,

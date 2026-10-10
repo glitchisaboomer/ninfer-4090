@@ -225,11 +225,11 @@ int main() {
         2 * ninfer::Tensor(nullptr, ninfer::DType::FP16, {1, 64, 2, 10}).bytes();
     failures +=
         expect_size(paged_plan.layout.payload_bytes(), expected_payload, "paged payload bytes");
-    // Metadata is the block table plus the RoPE delta plane beside it, which parallels the block
-    // table exactly: one int32 per (logical page, table row). The delta plane is what lets a
-    // quantized K plane be relocated without rewriting it, so its size is pinned here rather than
-    // left to drift with whatever else gets added to the layout.
-    const std::size_t expected_metadata = 2 * 10 * 2 * sizeof(std::int32_t);
+    // Metadata is the span the block table and the RoPE delta plane occupy, offsets included: two
+    // 80-byte int32 tensors aligned to 256 take 336 bytes, not 160, because the second one starts at
+    // offset 256. Nothing sizes an allocation from this -- LayoutBuilder::finish does that -- but the
+    // number is read as "how much metadata is there", so it has to be the span.
+    const std::size_t expected_metadata = 256 + 10 * 2 * sizeof(std::int32_t);
     failures += expect_size(paged_plan.layout.metadata_bytes(), expected_metadata,
                             "paged metadata bytes");
     failures += check_shape(paged_pool.rope_deltas(), {10, 2, 1, 1}, "paged rope-delta plane");

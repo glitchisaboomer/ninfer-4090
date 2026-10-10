@@ -80,25 +80,30 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
                                              "Paged KV block tables");
 
     // The RoPE delta plane, sized by the same arithmetic the host test pins rather than by a second
-    // hand-written formula. It is allocated unconditionally: at 0.5-256 KiB against a KV cache
-    // measured in GiB it is not worth a flag that could be forgotten, and a pool that cannot carry
-    // deltas is a pool that silently cannot relocate.
+    // hand-written formula. It is allocated unconditionally: table_rows is max_concurrency, capped at
+    // kMaximumConcurrency (8), so the plane is between 0.5 KiB at 8k context and 256 KiB at 500k --
+    // against a KV cache measured in GiB, a flag that could be forgotten is not worth the risk.
     //
-    // The extents are cross-checked against the block table rather than assumed to match it, because
-    // that mismatch is the failure this whole plane exists to avoid: a delta plane smaller than the
-    // block table beside it leaves pages whose delta can never be read, which presents as
-    // "relocation silently did nothing" rather than as an error. Here the two are derived from one
-    // source, so the check is structural -- but it is what catches the day the sources diverge.
-    const std::int32_t implied_context =
-        static_cast<std::int32_t>(static_cast<std::uint64_t>(logical_pages) *
-                                  static_cast<std::uint64_t>(kPagedKVPageSize));
-    const RopeDeltaLayout rope = resolve_rope_delta_layout(implied_context, spec.table_rows);
+    // The extents are cross-checked rather than assumed to match, because the mismatch is the failure
+    // this plane exists to avoid: a delta plane smaller than the block table beside it leaves pages
+    // whose delta can never be read, which presents as "relocation silently did nothing" rather than
+    // as an error. Both are derived from one source here, so the check is structural rather than
+    // load-bearing -- it is what catches the day the sources diverge.
+    //
+    // No separate `rope_delta_layout_is_supported` call follows: `resolve_rope_delta_layout`
+    // already returns an all-zero layout when the extents are unsupported, and an all-zero layout
+    // fails the equality below, so one check covers both. Passing the block table's extents to the
+    // four-argument form as well would compare values just shown equal, which is the tautology this
+    // whole check was added to remove.
+    const std::uint64_t implied_context =
+        static_cast<std::uint64_t>(logical_pages) * static_cast<std::uint64_t>(kPagedKVPageSize);
+    if (implied_context > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Paged KV rope-delta context length exceeds int32");
+    }
+    const RopeDeltaLayout rope =
+        resolve_rope_delta_layout(static_cast<std::int32_t>(implied_context), spec.table_rows);
     if (rope.logical_pages != logical_pages || rope.table_rows != spec.table_rows) {
         throw std::logic_error("Paged KV rope-delta plane does not cover its block table");
-    }
-    if (!rope_delta_layout_is_supported(rope.table_rows, rope.logical_pages, spec.table_rows,
-                                        logical_pages)) {
-        throw std::invalid_argument("Paged KV rope-delta layout is not supported");
     }
     layout.rope_deltas = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                             "Paged KV rope deltas");
@@ -111,8 +116,13 @@ std::size_t PagedKVPoolLayout::payload_bytes() const noexcept {
     return total;
 }
 
+// The span the pool's metadata occupies, offsets included. Summing `region.bytes` would understate
+// it: `add_tensor` records the exact tensor size and places each tensor at an aligned offset, so
+// two 256-aligned tensors of 80 bytes each occupy 256 + 80, not 160. No caller sizes an allocation
+// from this -- `LayoutBuilder::finish` does that, from its own peak -- but a number named
+// "metadata bytes" that is not the metadata span is a number that will mislead whoever reads it.
 std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept {
-    return block_tables.region.bytes + rope_deltas.region.bytes;
+    return rope_deltas.region.offset + rope_deltas.region.bytes;
 }
 
 PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
@@ -130,9 +140,11 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     }
     // The delta plane is read with the block table's index, so it must carry the block table's shape.
     // A mismatch here is not a size question, it is an addressing question: every delta read would
-    // fetch the wrong page's shift.
-    if (rope_deltas_.dtype != DType::I32 || rope_deltas_.ne[0] != block_tables_.ne[0] ||
-        rope_deltas_.ne[1] != block_tables_.ne[1]) {
+    // fetch the wrong page's shift. All four dims, not just the two the block-table check above
+    // looks at, because ne[2] and ne[3] being anything but 1 would change the element stride.
+    if (rope_deltas_.dtype != DType::I32 ||
+        rope_deltas_.ne[0] != block_tables_.ne[0] || rope_deltas_.ne[1] != block_tables_.ne[1] ||
+        rope_deltas_.ne[2] != 1 || rope_deltas_.ne[3] != 1) {
         throw std::logic_error("Paged KV rope-delta layout is inconsistent with its block table");
     }
 
@@ -208,6 +220,18 @@ const Tensor& PagedKVPool::plane(std::size_t index) const { return planes_.at(in
 const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_; }
 
 const Tensor& PagedKVPool::rope_deltas() const noexcept { return rope_deltas_; }
+
+void PagedKVPool::clear_rope_delta_row(std::int32_t row, cudaStream_t stream) {
+    if (row < 0 || row >= table_row_count()) {
+        throw std::out_of_range("Paged KV rope-delta row out of range");
+    }
+    // `kRopeDeltaNone` is zero, so clearing the row *is* the reset. This runs on the caller's stream
+    // beside `publish_mapping`, not on the default stream, because a default-stream write does not
+    // order against the non-blocking stream that will read it.
+    const Tensor slice = rope_deltas_.slice(1, row, 1);
+    CUDA_CHECK(cudaMemsetAsync(slice.data, 0,
+                               static_cast<std::size_t>(slice.ne[0]) * sizeof(std::int32_t), stream));
+}
 
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
     if (row < 0 || row >= table_row_count()) {
@@ -665,6 +689,14 @@ void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot bind an empty Paged KV allocation"); }
     if (bound_row_ >= 0) { throw std::logic_error("Paged KV allocation is already bound"); }
     pool_->acquire_row(row);
+    // Reset the row's RoPE deltas before anything can read them. `acquire_row` is the only path that
+    // claims a row, and a row is handed to a new sequence every time the previous one releases it, so
+    // this is the one place the invariant can be established: a row carries either `kRopeDeltaNone`
+    // or a delta relocation wrote for the sequence currently bound to it. Without it, a page
+    // relocated for one sequence keeps its shift after the row is reused, and the next sequence's
+    // attention counter-rotates a page that was never moved -- silently, because a stale shift is a
+    // plausible number.
+    pool_->clear_rope_delta_row(row, stream);
     bound_row_ = row;
     publish_mapping(stream);
 }

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
+#include <limits>
 
 namespace {
 
@@ -175,12 +176,17 @@ void test_per_page_delta() {
 // logical_pages * 64 does not resolve back to logical_pages, the plane's extents silently stop
 // matching the block table it parallels, and every delta read then fetches the wrong page's shift.
 // Pinning it here keeps the planner's derivation honest without needing a CUDA build.
+//
+// Powers of two alone would not show much: they are the values where a rounding rule that is wrong
+// only on a remainder still agrees. Odd and prime page counts are where ceil and floor part company.
 void test_implied_context_round_trip() {
     std::printf("implied-context round trip matches the block table it parallels\n");
-    for (std::int32_t pages = 1; pages <= 8192; pages *= 2) {
+    const std::int32_t page_counts[] = {1,   2,   3,   5,   7,   8,   13,  31,   63,
+                                        64,  65,  127, 128, 255, 1023, 1025, 4095, 8192};
+    for (const std::int32_t pages : page_counts) {
         const std::int32_t implied = static_cast<std::int32_t>(
             static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(kPagedKVPageSize));
-        for (std::int32_t rows : {std::int32_t{1}, std::int32_t{4}, std::int32_t{8}}) {
+        for (const std::int32_t rows : {std::int32_t{1}, std::int32_t{4}, std::int32_t{8}}) {
             const RopeDeltaLayout rope = resolve_rope_delta_layout(implied, rows);
             if (rope.logical_pages != pages || rope.table_rows != rows) {
                 std::printf("  FAIL: pages=%d rows=%d resolved to %d/%d\n", pages, rows,
@@ -193,8 +199,18 @@ void test_implied_context_round_trip() {
     // the page the partial tail lives in.
     check(resolve_rope_delta_layout(65 * kPagedKVPageSize, 4).logical_pages == 65,
           "a context one token past a page boundary still resolves");
-    // And an empty pool resolves to nothing rather than to a one-page plane.
+    // And an empty pool resolves to nothing rather than to a one-page plane. plan_paged_kv_pool
+    // reads this as "unsupported" and throws, which is what makes the single equality check there
+    // cover both an unsupported layout and a mismatched one.
     check(resolve_rope_delta_layout(0, 4).logical_pages == 0, "no context resolves to no plane");
+    // The top of the int32 range: the rounding must stay defined rather than wrap, and the round trip
+    // must still close. `max_context + 63` overflows signed at this value, which is why the widening
+    // in rope_delta_logical_pages is there.
+    check(rope_delta_logical_pages(std::numeric_limits<std::int32_t>::max()) == 33554432,
+          "the largest int32 context rounds without wrapping");
+    check(resolve_rope_delta_layout(std::numeric_limits<std::int32_t>::max(), 8).logical_pages ==
+              33554432,
+          "the round trip closes at the top of the int32 range");
 }
 
 } // namespace

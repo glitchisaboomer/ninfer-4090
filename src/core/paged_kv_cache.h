@@ -139,6 +139,13 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
+    // Resets one table row's RoPE deltas to `kRopeDeltaNone`. Called by `PagedKVAllocation::bind_row`
+    // on the caller's stream, which is what establishes the plane's invariant: a row carries either
+    // no delta or one relocation wrote for the sequence currently bound to it. Runs on a caller's
+    // stream rather than the default one because a default-stream write does not order against the
+    // non-blocking stream that will read it.
+    void clear_rope_delta_row(std::int32_t row, cudaStream_t stream = nullptr);
+
     [[nodiscard]] std::size_t page_bytes(std::size_t plane_index) const;
     void copy_page_to_host(std::size_t plane_index, std::int32_t page_id, void* dst,
                            cudaStream_t stream = nullptr) const;
