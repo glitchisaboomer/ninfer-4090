@@ -217,8 +217,8 @@ void logprob_of_choice(const Tensor& logits, const Tensor& chosen, std::int32_t 
 `logits` is contiguous BF16 `[physical_rows, T]` with the vocabulary contiguous inside each column —
 the same layout `ops::sample` and `ops::argmax` already consume, so nothing needs reshaping.
 
-**Call sites.** Only two, because SCR is gated to `SpeculativeBackend::None`
-(`request_plan_impl.h:257`) — the default, so the e2e path uses them:
+**Call sites.** Only two, because SCR is gated to the plain decode backend and MTP
+(`request_plan_impl.h`) — the default backend is among them, so the e2e path uses these:
 
 1. `src/targets/qwen3_6/impl/runtime/decode_impl.h:43` — ordinary decode, inside
    `ordinary_batch_body`, which is **CUDA-graph captured**. This is fine: the Op writes to the egress
@@ -228,7 +228,8 @@ the same layout `ops::sample` and `ops::argmax` already consume, so nothing need
    so `[rows, 1]`.
 
 Skip the MTP/DFlash sites (`mtp_impl.h`, `dflash_impl.h`, `text_prefill_impl.h:152`) — out of scope
-and not exercised by SCR.
+for this probe. DFlash is still not exercised by SCR; MTP is, since the second-allocation relocation
+landed, so an MTP probe would now be a third call site rather than a dead one.
 
 **Egress.** Add one field beside the existing token array in
 `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h:40`:

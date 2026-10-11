@@ -8,6 +8,7 @@
 
 #include "targets/qwen3_6/impl/runtime/prompt_edit.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -611,6 +612,163 @@ void test_plan_page_remap() {
            "a prefix reaching past the resident mapping is refused");
 }
 
+// The second allocation's relocation. MTP keeps its KV in its own pool (`sequence.kv->backend`), so
+// its physical pages are numbered independently of the Text allocation's even though its logical
+// pages cover the same tokens. `start_prefill_lane` derives one mapping per allocation from the same
+// spans, so it is sound only if the spans select the same *logical* page in both. This checks the
+// property that makes it sound -- same source logical page to same destination logical page,
+// whatever the physical ids are -- and that an allocation which cannot express a span is refused
+// outright rather than handed back a mapping of a different length.
+void test_plan_page_remap_second_allocation() {
+    using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
+    using ninfer::targets::qwen3_6::detail::plan_page_remap;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    const std::vector<std::int32_t> text_resident{10, 11, 12, 13, 14};
+    const std::vector<std::int32_t> backend_resident{70, 71, 72, 73, 74};
+    const std::vector<RelocatedSpan> shift{RelocatedSpan{.source_begin = block_tokens(3),
+                                                        .dest_begin = block_tokens(1),
+                                                        .tokens = block_tokens(1)}};
+
+    const auto text_remap =
+        plan_page_remap(text_resident, shift, block_tokens(1), block_tokens(3));
+    const auto backend_remap =
+        plan_page_remap(backend_resident, shift, block_tokens(1), block_tokens(3));
+    expect(text_remap.size() == backend_remap.size(),
+           "both allocations are mapped over the same logical page count");
+
+    // The logical page an entry came from, -1 for a page prefill will write, and -2 for an entry
+    // naming a page the allocation does not own.
+    const auto carried_from = [](const std::vector<std::int32_t>& resident,
+                                 std::int32_t id) -> std::int32_t {
+        if (id == kRemapAcquirePage) { return -1; }
+        for (std::size_t page = 0; page < resident.size(); ++page) {
+            if (resident[page] == id) { return static_cast<std::int32_t>(page); }
+        }
+        return -2;
+    };
+    if (text_remap.size() == backend_remap.size()) {
+        for (std::size_t page = 0; page < text_remap.size(); ++page) {
+            expect(carried_from(text_resident, text_remap[page]) ==
+                       carried_from(backend_resident, backend_remap[page]),
+                   "both allocations carry the same source logical page to the same destination");
+        }
+        expect(carried_from(text_resident, text_remap[1]) == 3,
+               "the relocated block still comes from the source allocation's page 3");
+    }
+
+    // A second allocation too short to name the spans' source pages cannot be relocated at all. The
+    // runtime relies on this being a refusal: a mapping of a different length would leave one cache
+    // moved and the other not, which is the corruption the paired derivation exists to prevent.
+    const std::vector<std::int32_t> short_backend{70, 71, 72};
+    expect(plan_page_remap(short_backend, shift, block_tokens(1), block_tokens(3)).empty(),
+           "a second allocation too short for the spans is refused");
+}
+
+// The pool demand of a remap: the free pages `reassign_pages` must report, priced before either of a
+// paired relocation's two publishes. The hand-computed cases are the shapes a relocation actually
+// produces. The randomized half replays the allocation's documented steps -- consume each named page,
+// then spend the leftovers on acquire slots -- rather than reusing the closed form, so an off-by-one
+// in the surplus shows up as a disagreement instead of a shared mistake.
+void test_remap_pages_from_pool() {
+    using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
+    using ninfer::targets::qwen3_6::detail::remap_pages_from_pool;
+
+    // The Scope A shift of `test_plan_page_remap`: page 3 is promoted to page 1 and the tail is
+    // acquired. Three pages are dropped and one is acquired, so the surplus pays for the acquire and
+    // the pool is never asked.
+    const std::vector<std::int32_t> five_pages{10, 11, 12, 13, 14};
+    const std::vector<std::int32_t> promoted{10, 13, kRemapAcquirePage};
+    expect(remap_pages_from_pool(five_pages, promoted) == 0,
+           "a dropped page pays for an acquired one");
+
+    // Nothing kept: every slot is acquired, both dropped pages are reused for the job, and the third
+    // still has to come from the pool.
+    const std::vector<std::int32_t> two_pages{10, 11};
+    const std::vector<std::int32_t> all_acquired{kRemapAcquirePage, kRemapAcquirePage,
+                                                 kRemapAcquirePage};
+    expect(remap_pages_from_pool(two_pages, all_acquired) == 1,
+           "acquires past the surplus reach the pool");
+
+    // An identity mapping keeps everything and acquires nothing.
+    const std::vector<std::int32_t> three_pages{10, 11, 12};
+    expect(remap_pages_from_pool(three_pages, three_pages) == 0,
+           "an identity remap costs the pool nothing");
+
+    // Growth against a surplus too small to matter: one page kept, three acquired.
+    const std::vector<std::int32_t> one_page{10};
+    const std::vector<std::int32_t> one_kept_three_acquired{10, kRemapAcquirePage,
+                                                            kRemapAcquirePage, kRemapAcquirePage};
+    expect(remap_pages_from_pool(one_page, one_kept_three_acquired) == 3,
+           "growth past a single kept page needs every page from the pool");
+
+    // A partially reused frontier block is carried, because prefill overwrites only its tail, so it
+    // is not surplus and cannot pay for an acquire: two acquires against one carried page and one
+    // dropped page needs one page from the pool. Counting the carried page as surplus instead would
+    // report zero and let the second publish fail after the first.
+    const std::vector<std::int32_t> frontier_carried{10, kRemapAcquirePage, kRemapAcquirePage};
+    expect(remap_pages_from_pool(two_pages, frontier_carried) == 1,
+           "a carried frontier page is not surplus");
+
+    // `reassign_pages` rejects a mapping naming unowned pages before this arithmetic matters; the
+    // helper must still not underflow on one (owned 1, named 2, surplus clamps to zero).
+    const std::vector<std::int32_t> more_named_than_owned{10, 11, kRemapAcquirePage};
+    expect(remap_pages_from_pool(one_page, more_named_than_owned) == 1,
+           "a mapping naming more pages than owned clamps its surplus to zero");
+
+    std::uint32_t seed = 0x9e3779b9u;
+    const auto next    = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed;
+    };
+    std::uint32_t mismatches = 0;
+    std::uint32_t cases      = 0;
+    for (int iteration = 0; iteration < 5000; ++iteration) {
+        const std::uint32_t owned_count   = 1 + (next() % 12);
+        const std::uint32_t keep_count    = next() % (owned_count + 1);
+        const std::uint32_t acquire_count = next() % 6;
+
+        std::vector<std::int32_t> owned;
+        owned.reserve(owned_count);
+        for (std::uint32_t i = 0; i < owned_count; ++i) {
+            owned.push_back(static_cast<std::int32_t>(100 + i));
+        }
+        // Shuffle the owned pages, so the kept set is not always a prefix of them.
+        for (std::uint32_t i = owned_count; i > 1; --i) {
+            const std::uint32_t j = next() % i;
+            std::swap(owned[i - 1], owned[j]);
+        }
+
+        std::vector<std::int32_t> mapping(owned.begin(),
+                                          owned.begin() + static_cast<std::ptrdiff_t>(keep_count));
+        for (std::uint32_t i = 0; i < acquire_count; ++i) {
+            mapping.push_back(kRemapAcquirePage);
+        }
+        // Interleave, so carried and acquired slots alternate the way a real remap lays them out.
+        for (std::size_t i = mapping.size(); i > 1; --i) {
+            const std::size_t j = next() % i;
+            std::swap(mapping[i - 1], mapping[j]);
+        }
+
+        std::vector<std::int32_t> remaining(owned);
+        std::uint32_t acquires = 0;
+        for (const std::int32_t page : mapping) {
+            if (page == kRemapAcquirePage) {
+                ++acquires;
+                continue;
+            }
+            const auto found = std::find(remaining.begin(), remaining.end(), page);
+            if (found != remaining.end()) { remaining.erase(found); }
+        }
+        const std::uint32_t surplus = static_cast<std::uint32_t>(remaining.size());
+        const std::uint32_t oracle  = acquires > surplus ? acquires - surplus : 0;
+        if (remap_pages_from_pool(owned, mapping) != oracle) { ++mismatches; }
+        ++cases;
+    }
+    expect(mismatches == 0, "every randomized remap's pool demand matches the oracle");
+    expect(cases == 5000, "the randomized remap sweep ran every case");
+}
+
 void test_determinism() {
     Tokens previous;
     append(previous, segment(1, 2));
@@ -644,6 +802,8 @@ int main() {
     test_plan_tail_relocation_picks_one_run();
     test_plan_tail_relocation_merges_adjacent_survivors();
     test_plan_page_remap();
+    test_plan_page_remap_second_allocation();
+    test_remap_pages_from_pool();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

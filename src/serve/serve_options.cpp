@@ -99,7 +99,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-prefix-reuse           Disable KV prefix cache reuse across requests (prefix reuse enabled by default)\n"
            "  --scr                       Enable Suffix Cache Reuse: after an in-the-middle context\n"
            "                              edit, reuse resident KV for the surviving suffix instead\n"
-           "                              of re-prefilling it (experimental; off by default)\n"
+           "                              of re-prefilling it (experimental; off by default; applies\n"
+           "                              with the plain decode backend and with --spec mtp, not\n"
+           "                              with --spec dflash)\n"
            "  --scr-max-spans <N>         Maximum surviving spans relocated per edit (default: " +
                std::to_string(kDefaultSuffixReuseMaxSpans) +
                "; 0 keeps --scr set and\n"

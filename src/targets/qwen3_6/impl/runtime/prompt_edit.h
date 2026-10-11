@@ -255,6 +255,24 @@ inline constexpr std::int32_t kRemapAcquirePage = -1;
                                                        std::uint32_t prefix_reuse_tokens,
                                                        std::uint32_t prompt_tokens);
 
+// The pages `PagedKVAllocation::reassign_pages` would have to take from the pool rather than from
+// the mapping's own dropped pages, for a mapping `plan_page_remap` built over `current_pages`.
+//
+// The allocation's documented arithmetic: an acquire slot is filled from a page the mapping drops
+// before the pool is asked for anything, so `from_pool = acquires - min(acquires, surplus)`, with
+// the surplus the currently owned pages the mapping does not name. Re-deriving it here is what lets
+// a caller price *both* allocations of a paired relocation before publishing either: the Text
+// reassign would otherwise succeed and the second one fail with std::bad_alloc after it, which
+// leaves the two caches disagreeing about which physical page holds a logical one -- the split the
+// pairing exists to prevent.
+//
+// `current_pages` is the allocation's present mapping, one physical page per logical page it maps
+// now; `mapping` is the proposed one. Both are exactly what `plan_page_remap` takes and returns, so
+// the result is the pool demand of applying that mapping: the free pages the pool must report, or
+// the reassign is refused.
+[[nodiscard]] std::uint32_t remap_pages_from_pool(std::span<const std::int32_t> current_pages,
+                                                  std::span<const std::int32_t> mapping);
+
 // Detect the spans of `previous` that survive in `current`.
 //
 // Blocks are hashed and matched by hash, then confirmed by exact token comparison, so a

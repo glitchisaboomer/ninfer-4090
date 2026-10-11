@@ -275,6 +275,24 @@ std::vector<std::int32_t> plan_page_remap(std::span<const std::int32_t> current_
     return mapping;
 }
 
+std::uint32_t remap_pages_from_pool(std::span<const std::int32_t> current_pages,
+                                    std::span<const std::int32_t> mapping) {
+    // Mirrors PagedKVAllocation::reassign_pages's own arithmetic, which this exists to price before
+    // that call: acquire slots are filled from the pages the mapping drops before the pool is asked
+    // for anything. A page the mapping keeps is consumed once, so an owned page named twice (which
+    // reassign_pages rejects anyway) is not double counted here.
+    std::uint32_t acquires = 0;
+    for (const std::int32_t page : mapping) {
+        if (page == kRemapAcquirePage) { ++acquires; }
+    }
+    const std::uint64_t named = static_cast<std::uint64_t>(mapping.size()) - acquires;
+    const std::uint64_t surplus =
+        static_cast<std::uint64_t>(current_pages.size()) > named
+            ? static_cast<std::uint64_t>(current_pages.size()) - named
+            : 0;
+    return acquires - std::min<std::uint64_t>(acquires, surplus);
+}
+
 PromptEditDiff diff_prompt_edit(std::span<const TokenId> previous, std::span<const TokenId> current,
                                 std::uint32_t block_tokens) {
     if (block_tokens == 0) {

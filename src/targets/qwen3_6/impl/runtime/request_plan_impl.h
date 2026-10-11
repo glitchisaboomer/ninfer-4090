@@ -259,16 +259,22 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     // --- Suffix Cache Reuse -----------------------------------------------------------
     // Reuse resident KV for regions that survived an in-the-middle edit instead of
-    // re-prefilling them. Restricted to the plain decode backend and to text-only prompts: the
-    // MTP/DFlash caches would each need their own relocation, which this change does not
-    // implement, so those keep the existing behaviour.
+    // re-prefilling them. Text-only prompts, because Vision items re-scatter columns and their
+    // consumer spans are not what the page remap assumes. Both speculative backends whose KV is a
+    // second allocation covering the same tokens at the same logical pages -- the plain decode
+    // backend and MTP -- because the runtime relocates them from the same spans in one step (see
+    // `start_prefill_lane`). DFlash still keeps the existing behaviour: its context frontier is
+    // carried separately and its cache is filled through `kv_cache_append_prefix`, so relocating
+    // Text pages out from under it is a different problem than a second page table.
     //
     // A turn-rewrite boundary does not disable relocation. Every chat request carries one, because
     // the chat template always appends a generation prompt, so rejecting prompts that have one would
     // make this path unreachable from the served API. The boundary only bounds how far a span may
     // reach, which `plan_tail_relocation` applies.
     if (base.allow_prefix_reuse && base.enable_suffix_cache_reuse &&
-        base.suffix_reuse_max_spans != 0 && speculative_backend == SpeculativeBackend::None &&
+        base.suffix_reuse_max_spans != 0 &&
+        (speculative_backend == SpeculativeBackend::None ||
+         speculative_backend == SpeculativeBackend::Mtp) &&
         base.vision_control == nullptr && sequence.retained && sequence.kv &&
         prompt.identity.reusable &&
         delta_path_supports_dtype(kv_dtype) &&
@@ -324,6 +330,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
 
         if (!plan_spans.empty()) {
+            // Overwriting `reuse` with SuffixRelocation here is what makes the MTP coupling the final
+            // block's job rather than this block's: that block keys off the reuse path, and
+            // SuffixRelocation is a fifth one it has to know about. Nothing in this block can ask
+            // for the staged MTP prefill itself -- `prepare_mtp` is set further down, after the
+            // turn-checkpoint decision, which may still downgrade this plan to a plain FullReset. The
+            // assertion that the staged MTP prefill exists therefore lives after that block.
             std::uint64_t relocated = 0;
             for (const RelocatedSpan& span : plan_spans) { relocated += span.tokens; }
             plan->reuse                           = ReusePath::SuffixRelocation;
@@ -370,7 +382,34 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                    plan->reuse == ReusePath::RestoreDiskCheckpoint) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
+        } else if (plan->reuse == ReusePath::SuffixRelocation) {
+            // The relocated run's MTP rows are re-pointed alongside Text's, so only the two prefilled
+            // ranges need staging, and the walk's `prepare_mtp` places them on the same pages the
+            // Text remap chose.
+            //
+            // No bridge, deliberately. The bridge writes the MTP row at the frontier from the base
+            // model's hidden state at `base - 1`, and a mid-prompt edit's frontier is a position the
+            // lane never retained: the one hidden state kept per lane, `sequence.tail_hidden`, is
+            // the previous sequence's *last* position, which is `base - 1` only for the
+            // AppendAtFrontier path. The MTP stem pairs row p with token p+1
+            // (`plan_mtp_alignment_window`: `shifted_embedding_begin = chunk_begin + 1`), so the two
+            // rows the edit moves -- the row at `base - 1` and the last row of the relocated run,
+            // each paired with a pre-edit token -- stay as the relocation left them. That costs
+            // draft quality at those positions and nothing else: drafts are verified against the
+            // base model, so a mist-paired row can lose a draft but never become a wrong accepted
+            // token. Recovering the true hidden is the open design question for this path; it is
+            // recorded here so the omission reads as a decision rather than an oversight.
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = MtpBridgeMode::None;
         }
+    }
+    // The coupling, asserted where it can hold: the block above is what stages the MTP prefill, so a
+    // relocated plan under MTP must have come through one of its arms. Without it the staged walk
+    // prefills Text while MTP's rows stay unwritten, and the only thing that notices is the
+    // end-of-prompt check.
+    if (speculative_backend == SpeculativeBackend::Mtp &&
+        plan->reuse == ReusePath::SuffixRelocation && !plan->prepare_mtp) {
+        throw std::logic_error("suffix relocation plan has no staged MTP prefill");
     }
 
     if (base.vision_control != nullptr) {

@@ -830,7 +830,56 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                             rope_delta_for_span(span.source_begin, span.tokens, span.dest_begin, source_page);
                     }
                 }
+                // The speculative backend is a second, independent allocation in its own pool: the MTP
+                // cache holds one KV row per token at the same logical pages as Text, but its physical
+                // pages come from a different pool and are numbered independently. So it is relocated
+                // from the *same spans*, against its own page table, and it carries the *same* delta
+                // plane -- the shift is a property of the token positions, and MTP logical page p
+                // covers exactly the tokens Text logical page p covers. Deriving both mappings before
+                // publishing either keeps the pair from diverging on a refusal: a bundle where Text
+                // moved and MTP did not would have the MTP layer reading pages that hold another
+                // request's KV, and that surfaces as a wrong draft at a plausible rate rather than as
+                // a failure.
+                std::vector<std::int32_t> backend_remap;
+                if (speculative_backend == SpeculativeBackend::Mtp && sequence.kv->backend) {
+                    backend_remap = qwen3_6::detail::plan_page_remap(
+                        sequence.kv->backend->page_ids(), request_plan.relocated_spans, base,
+                        prompt_tokens);
+                    if (backend_remap.size() != remap.size()) {
+                        throw std::logic_error(
+                            "the MTP KV relocation does not cover the Text relocation's pages");
+                    }
+                }
+                // Both mappings are derived from the same spans over the same prompt, so they name
+                // the same acquire slots and drop the same surplus, and the pool demand of each is
+                // therefore identical. A refusal from the backend's reassign would land *after* the
+                // Text publish executes, and that is the split the paired derivation exists to
+                // prevent: Text re-pointed at its new positions while MTP still reads pages holding
+                // another request's KV. So price both pools before publishing either, with the
+                // allocation's own arithmetic (`remap_pages_from_pool`). This narrows the window to
+                // a concurrent pool mutation between the check and the publish; closing it needs one
+                // transaction across both allocations, which core does not offer.
+                const std::uint32_t text_from_pool =
+                    qwen3_6::detail::remap_pages_from_pool(sequence.kv->text.page_ids(), remap);
+                if (text_from_pool > decoder->text_kv.pool().free_pages()) {
+                    throw std::logic_error(
+                        "suffix relocation cannot afford the pages its Text mapping acquires");
+                }
+                if (!backend_remap.empty()) {
+                    const qwen3_6::PagedKVCache* backend_cache = backend_kv_cache();
+                    const std::uint32_t backend_from_pool =
+                        qwen3_6::detail::remap_pages_from_pool(sequence.kv->backend->page_ids(),
+                                                               backend_remap);
+                    if (backend_cache == nullptr ||
+                        backend_from_pool > backend_cache->pool().free_pages()) {
+                        throw std::logic_error(
+                            "suffix relocation cannot afford the pages its MTP mapping acquires");
+                    }
+                }
                 sequence.kv->text.reassign_pages(remap, deltas, device.stream);
+                if (!backend_remap.empty()) {
+                    sequence.kv->backend->reassign_pages(backend_remap, deltas, device.stream);
+                }
                 suffix_prefill_ranges.clear();
                 // Diagnostic only: fingerprint the GDN slot across the invalidation below so the
                 // trace says whether the zero ran, not merely that the code path was reached.
