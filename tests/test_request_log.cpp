@@ -210,6 +210,7 @@ int main() {
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                       = 401;
+    outcome.computed_prefill_tokens             = 300;
     outcome.completion_tokens                   = 1024;
     outcome.finish_reason                       = ninfer::FinishReason::OutputLimit;
     outcome.metrics.prepare_seconds             = 0.1234567890123;
@@ -262,6 +263,28 @@ int main() {
     failures +=
         check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
+
+    // The figure the request log publishes for work actually done. It used to be derived in this
+    // file as `prompt - cache hit`, which ignores relocation: a relocated request reports no exact
+    // prefix match, so that formula printed the whole prompt as prefilled and the console's prefill
+    // rate came out several times the hardware's throughput. The engine now supplies the count from
+    // its own chunk accounting, and this case is deliberately a relocation whose plan claims 200
+    // tokens: the old proxy would have written 401, the engine's count says 201.
+    {
+        GenerationOutcome relocated               = outcome;
+        relocated.prompt_tokens                   = 401;
+        relocated.computed_prefill_tokens         = 201;
+        relocated.metrics.prefix_cache_hit_tokens = 0;
+        relocated.metrics.prefix_relocated_tokens = 200;
+        relocated.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::SuffixRelocation;
+        const Json moved =
+            Json::parse(format_request_done_json("serve-test", 3000, context, relocated));
+        failures += check(moved.at("result").at("computed_prefill_tokens") == 201,
+                          "computed prefill tokens must come from the engine's accounting, not from "
+                          "the prompt minus the cache hit");
+        failures += check(moved.at("result").at("prefix_relocated_tokens") == 200,
+                          "relocated tokens missing beside the computed count");
+    }
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");

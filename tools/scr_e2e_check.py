@@ -14,6 +14,12 @@ per-page RoPE delta instead of re-prefilling it.
 The comparison is worthless unless SCR actually engaged, so this script fails loudly when the
 server does not report reuse=suffix_relocation rather than reporting a vacuous pass.
 
+It also checks that the engagement was real work: the request log's `computed_prefill_tokens` is the
+engine's own count of the prompt tokens its prefill chunks ran, and for a relocated request that must
+be the prompt minus the relocated run. A relocation that is planned but never applied still answers
+correctly -- the re-prefilled pages hold what the relocation would have served -- so the only thing
+that catches it is the work. `--scr-mode tail|segmented` selects which relocation shape to check.
+
 Run it once per supported --kv-dtype (`bf16`, `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`). The relocation
 is a delta on the page, not a rewrite of the codes, so every layout whose attention kernels honour
 that delta has to be checked; BF16 alone no longer exercises the path.
@@ -335,6 +341,42 @@ DONE_RE = re.compile(r"\[req (?P<id>[^\]]+)\] done .*?prompt=(?P<prompt>\d+) gen
                      r"cache=(?P<cache>\d+) reuse=(?P<reuse>\w+)")
 
 
+def read_request_records(path):
+    """Per-request records from a `--request-log-jsonl` file the server wrote.
+
+    The console lines carry the reuse path but not the work, and the work is what the savings
+    assertion needs: `computed_prefill_tokens` is the engine's own count of the prompt tokens its
+    prefill chunks ran, which for a relocated request is the prompt minus the relocated run.
+    """
+    records = []
+    if not os.path.exists(path):
+        return records
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a torn last line from a still-flushing server
+            if record.get("event") != "request_done":
+                continue
+            result = record.get("result", {})
+            records.append(
+                {
+                    "id": record.get("request", {}).get("request_id"),
+                    "prompt_tokens": int(result.get("prompt_tokens", 0)),
+                    "completion_tokens": int(result.get("completion_tokens", 0)),
+                    "computed_prefill_tokens": int(result.get("computed_prefill_tokens", 0)),
+                    "cache_hit": int(result.get("prefix_cache_hit_tokens", 0)),
+                    "relocated": int(result.get("prefix_relocated_tokens", 0)),
+                    "reuse": result.get("prefix_reuse_path"),
+                }
+            )
+    return records
+
+
 def parse_done_lines(text):
     records = []
     for line in text.splitlines():
@@ -356,12 +398,17 @@ def run_config(args, extra_flags, label):
     """Launches the server with `extra_flags`, runs requests A then B, returns B's text and log."""
     port = args.port
     log_path = os.path.join(tempfile.gettempdir(), f"ninfer_scr_{label}.log")
-    if os.path.exists(log_path):
-        os.remove(log_path)
+    requests_path = os.path.join(tempfile.gettempdir(), f"ninfer_scr_{label}_requests.jsonl")
+    for stale in (log_path, requests_path):
+        if os.path.exists(stale):
+            os.remove(stale)
 
     # The caller's own arguments (artifact path, --kv-dtype, --max-context, ...) come first and the
     # flag under test is appended, so the script does not need to know how they normally launch.
-    command = [args.exe] + args.base_args_list + extra_flags + ["--port", str(port)]
+    # The request log is what the savings check reads: the console lines report the reuse path but
+    # not the work, and only the work can distinguish "relocated" from "re-prefilled anyway".
+    command = ([args.exe] + args.base_args_list + extra_flags +
+               ["--port", str(port), "--request-log-jsonl", requests_path])
     print(f"  launching: {' '.join(extra_flags) or '(defaults)'}")
     print(f"  log: {log_path}")
 
@@ -416,6 +463,7 @@ def run_config(args, extra_flags, label):
         "usage": usage_b,
         "usage_a": usage_a,
         "finish": finish_b,
+        "request_records": read_request_records(requests_path),
     }, records
 
 
@@ -454,6 +502,10 @@ def main():
                              "bisecting a mechanical fault, which fails at any size, from an "
                              "approximation that only bites once the run is a large share of the "
                              "prompt. The script prints the resulting token count and share.")
+    parser.add_argument("--scr-mode", choices=("tail", "segmented"), default="tail",
+                        help="relocation shape to pass to --scr (default: tail). 'segmented' "
+                             "exercises the interleaved-survivor path, whose savings differ from "
+                             "the one contiguous run 'tail' uses.")
     parser.add_argument("--scr-diag", action="store_true",
                         help="set NINFER_SCR_DIAG=1 on the server so it dumps the applied relocation "
                              "plan, the page remap, the bound block-table row, and whether the "
@@ -514,9 +566,10 @@ def main():
     # Recorded in the output so a per-dtype sweep is distinguishable after the fact; the dtype itself
     # arrives through --base-args, so what is printed here is what the server was actually given.
     print(f"KV dtype under test: --kv-dtype {kv_dtype}")
+    print(f"Relocation shape under test: --scr-mode {args.scr_mode}")
     print()
-    print("Pass 1: --scr --scr-mode tail")
-    scr_result, scr_records = run_config(args, ["--scr", "--scr-mode", "tail"], "scr")
+    print(f"Pass 1: --scr --scr-mode {args.scr_mode}")
+    scr_result, scr_records = run_config(args, ["--scr", "--scr-mode", args.scr_mode], "scr")
     if scr_result is None:
         return 1
 
@@ -583,6 +636,63 @@ def main():
         second = ref_records[-1]
         if second["reuse"] == "suffix_relocation":
             problems.append("--no-scr still reported suffix_relocation; the flag is not being honoured")
+
+    # --- Savings -------------------------------------------------------------
+    # The reuse path says a run was relocated; this is the check that the work actually happened.
+    # A relocation that is planned but never applied -- the staged walk prefilling the run it was
+    # supposed to skip -- still produces correct output, because the re-prefilled pages hold the
+    # same tokens the relocation would have served. Nothing else in this script would notice: the
+    # engagement check above reads the plan, and the comparison below reads the answer. Only the
+    # engine's own count of prefilled prompt tokens distinguishes the two, and that count is
+    # `computed_prefill_tokens` in the request log, which is the engine's chunk accounting rather
+    # than a figure derived from the plan.
+    #
+    # The invariant is exact, not a tolerance: the planner's ranges tile the prompt with the
+    # relocated runs, so the prefill computes precisely the prompt minus the relocated tokens. A
+    # mismatch in either direction is a finding -- too many means the run was re-prefilled, too few
+    # means the plan claims reuse it did not perform.
+    print()
+    print("Savings (the engine's own count of prefilled prompt tokens)")
+    scr_requests = scr_result.get("request_records", [])
+    ref_requests = ref_result.get("request_records", [])
+    if not scr_requests:
+        problems.append(
+            "the --scr server wrote no request records; enable --request-log-jsonl support and "
+            "check for a permission or path problem")
+    else:
+        for record in scr_requests:
+            prompt = record["prompt_tokens"]
+            relocated = record["relocated"] if record["reuse"] == "suffix_relocation" else 0
+            cache = record["cache_hit"] if record["reuse"] != "suffix_relocation" else 0
+            expected = prompt - relocated - cache
+            computed = record["computed_prefill_tokens"]
+            skipped = prompt - computed
+            print(f"  req {record['id']}: prompt={prompt} reuse={record['reuse']} "
+                  f"relocated={record['relocated']} computed={computed} "
+                  f"({100 * skipped // max(prompt, 1)}% of the prompt not prefilled)")
+            if computed != expected:
+                detail = (f"request {record['id']} ({record['reuse']}): the prefill computed "
+                          f"{computed} prompt tokens, the plan accounts for {expected} "
+                          f"(prompt {prompt}, relocated {record['relocated']}, cache hit "
+                          f"{record['cache_hit']})")
+                if computed > expected:
+                    problems.append(
+                        detail + ". More was prefilled than the plan relocated: the relocated run is "
+                        "being re-prefilled, so the reported reuse saves nothing.")
+                else:
+                    problems.append(
+                        detail + ". Less was prefilled than the plan accounts for: the plan reports "
+                        "reuse it did not perform.")
+    if ref_requests:
+        for record in ref_requests:
+            expected = record["prompt_tokens"] - record["cache_hit"]
+            if record["computed_prefill_tokens"] != expected:
+                problems.append(
+                    f"the --no-scr reference prefilled {record['computed_prefill_tokens']} tokens "
+                    f"for a {record['prompt_tokens']}-token prompt with a "
+                    f"{record['cache_hit']}-token cache hit; expected {expected}")
+    else:
+        problems.append("the --no-scr server wrote no request records")
 
     text_scr = scr_result["content"].strip()
     text_ref = ref_result["content"].strip()

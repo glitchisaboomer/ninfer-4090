@@ -426,6 +426,12 @@ struct GenerationResult {
     // `reused_prompt_tokens`, reported separately so prefix reuse and SCR stay
     // distinguishable in telemetry.
     std::uint32_t relocated_prompt_tokens = 0;
+    // Prompt tokens this request actually prefilled, counted from the prefill chunks that ran
+    // rather than derived from the plan. `reused_prompt_tokens` and `relocated_prompt_tokens` are
+    // the plan's claims; this is the work that happened, and it is the only number that can show a
+    // relocation silently re-prefilling its run -- which yields correct output and no saving, so
+    // nothing else would notice. For a request with no reuse it equals the prompt length.
+    std::uint32_t computed_prefill_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;

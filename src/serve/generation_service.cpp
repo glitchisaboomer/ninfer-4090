@@ -24,7 +24,11 @@ CompletionUsage make_completion_usage(const GenerationOutcome& outcome) {
 CompletionTimings make_completion_timings(const GenerationOutcome& outcome) {
     CompletionTimings timings;
     const int cached = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens);
-    const int prompt_eval = std::max(0, outcome.prompt_tokens - cached);
+    // What the prefill computed, not what the prompt contained. The cache hit covers ordinary
+    // prefix reuse; a relocated run is not prefilled either, so subtracting it here is what keeps
+    // this figure honest for Suffix Cache Reuse instead of reporting a rate no prefill achieved.
+    const int prompt_eval = std::max(
+        0, outcome.prompt_tokens - cached - static_cast<int>(outcome.metrics.prefix_relocated_tokens));
     timings.prompt_n = prompt_eval;
     timings.prompt_ms = outcome.metrics.prefill_seconds * 1000.0;
     timings.prompt_per_second = outcome.metrics.prefill_seconds > 0.0
@@ -467,6 +471,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
+    outcome.computed_prefill_tokens = static_cast<int>(result.computed_prefill_tokens);
     // Retained for the request log rather than the response: the delivered tokens and their
     // logprobs are diagnostic-only, so no protocol translation has to learn about them.
     outcome.generated_token_ids = std::move(result.generated_token_ids);

@@ -347,6 +347,11 @@ private:
         std::uint32_t service_work_reusable_tokens    = 0;
         std::uint32_t service_work_relocated_tokens   = 0;
         std::uint32_t service_work_output_tokens      = 0;
+        // Prompt tokens this request's prefill actually computed, summed over its steps. The plan's
+        // relocated tokens are served from resident KV and contribute nothing here; a relocation
+        // that re-prefilled its run anyway would show up as the full prompt, which is the
+        // observation that makes such a regression visible at all.
+        std::uint32_t computed_prefill_tokens         = 0;
         std::uint64_t backfill_epoch         = 0;
         BackfillClass backfill_class         = BackfillClass::None;
 
@@ -480,6 +485,7 @@ private:
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
+        result.computed_prefill_tokens = request->computed_prefill_tokens;
         if (request->begin) {
             result.reused_prompt_tokens    = request->begin->reused_prompt_tokens;
             result.relocated_prompt_tokens = request->begin->relocated_prompt_tokens;
@@ -710,6 +716,7 @@ private:
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        request->computed_prefill_tokens += step.processed_prompt_tokens;
         consume_service_work(request, 1, ServiceWorkConsumer::Prefill);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (cancel_at_boundary) {
