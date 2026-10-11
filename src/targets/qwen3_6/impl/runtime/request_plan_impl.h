@@ -284,15 +284,17 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
         // Selection rules live with the detector so they stay unit-testable on the host. `reuse_base`
         // is the prefix-reuse frontier, so a destination below it is already covered by ordinary
-        // prefix reuse. In tail mode everything the run does not cover is prefilled from the two
-        // reported ranges; in segmented mode the ranges stay empty and the runtime is expected to
-        // prefill an arbitrary set of ranges instead, which it cannot do yet.
+        // prefix reuse. Both modes produce spans; the prefilled ranges are then derived from the
+        // spans, so the plan always reaches the runtime in the same shape. Tail mode selects one
+        // contiguous run, so the derivation reproduces exactly the head and tail that mode has
+        // always reported; segmented mode may interleave survivors anywhere, which yields one range
+        // per gap and is the only structural difference.
         std::vector<RelocatedSpan> plan_spans;
-        qwen3_6::detail::PrefillRange plan_head;
-        qwen3_6::detail::PrefillRange plan_tail;
         if (base.scr_mode == ninfer::ScrRelocationMode::Segmented) {
             plan_spans = qwen3_6::detail::plan_relocations(
-                diff, sequence.text_kv_valid, plan->reuse_base, base.suffix_reuse_max_spans);
+                diff, sequence.text_kv_valid, plan->reuse_base,
+                static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
+                base.suffix_reuse_max_spans);
         } else {
             qwen3_6::detail::TailRelocationTrace trace;
             const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
@@ -323,12 +325,17 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 std::cerr.flush();
             }
             if (tail.viable) {
-                plan_head  = tail.head;
-                plan_tail  = tail.tail;
                 plan_spans = tail.spans;
             }
         }
 
+        // The prefilled ranges, derived from the spans rather than carried next to them: one source
+        // for both modes, and the tiling with the spans is what makes the accounting below honest.
+        const std::uint32_t prompt_tokens_count =
+            static_cast<std::uint32_t>(prompt.token_ids.size());
+        std::vector<qwen3_6::detail::PrefillRange> plan_ranges =
+            qwen3_6::detail::relocation_prefill_ranges(plan_spans, plan->reuse_base,
+                                                       prompt_tokens_count);
         if (!plan_spans.empty()) {
             // Overwriting `reuse` with SuffixRelocation here is what makes the MTP coupling the final
             // block's job rather than this block's: that block keys off the reuse path, and
@@ -336,11 +343,26 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // for the staged MTP prefill itself -- `prepare_mtp` is set further down, after the
             // turn-checkpoint decision, which may still downgrade this plan to a plain FullReset. The
             // assertion that the staged MTP prefill exists therefore lives after that block.
+            //
+            // A plan that is not expressible is refused rather than half-applied, and the refusal is
+            // printed whether or not diagnostics are enabled: reaching it means a selector produced
+            // spans the runtime cannot execute, which is a programming error rather than a prompt
+            // shape, and a silent fallback would hide it while still reporting cold-prefill reuse.
+            if (!qwen3_6::detail::relocation_is_expressible(
+                    plan_spans, plan_ranges, plan->reuse_base, prompt_tokens_count)) {
+                std::cerr << "[scr] refused an inexpressible relocation plan: spans="
+                          << plan_spans.size() << " ranges=" << plan_ranges.size()
+                          << " reuse_base=" << plan->reuse_base
+                          << " prompt_tokens=" << prompt_tokens_count << '\n';
+                plan_spans.clear();
+                plan_ranges.clear();
+            }
+        }
+        if (!plan_spans.empty()) {
             std::uint64_t relocated = 0;
             for (const RelocatedSpan& span : plan_spans) { relocated += span.tokens; }
             plan->reuse                           = ReusePath::SuffixRelocation;
-            plan->relocated_head                  = plan_head;
-            plan->relocated_tail                  = plan_tail;
+            plan->relocated_prefill_ranges        = std::move(plan_ranges);
             plan->relocated_spans                 = std::move(plan_spans);
             plan->summary.relocated_prompt_tokens = static_cast<std::uint32_t>(relocated);
         }
@@ -363,6 +385,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         if (*desired <= plan->reuse_base) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
+            // The SCR block may have set relocation fields before this downgrade. A cold prefill
+            // executes none of them, so leaving them set would report reused tokens the request
+            // never reuses: `reusable_prompt_tokens` would count them, the service-work projection
+            // would under-state the prefill that follows, and the telemetry would report a
+            // relocation that never ran. Clear them here rather than trusting every consumer to
+            // read `reuse` before the accounting.
+            plan->relocated_prefill_ranges.clear();
+            plan->relocated_spans.clear();
+            plan->summary.relocated_prompt_tokens = 0;
         }
         plan->turn_checkpoint_action           = TurnCheckpointAction::CaptureNew;
         plan->turn_checkpoint_capture_frontier = desired;
@@ -433,18 +464,19 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     // Extra prefill steps that no token count can predict. Vision uses and turn-checkpoint captures
-    // each interrupt the chunk walk; so does a relocation, because it prefills two ranges with the
-    // surviving run skipped between them. The projection counts chunks over one contiguous span, so
-    // `ceil((head+tail)/chunk)` undercounts a two-range prefill by up to one: each range's last
-    // partial chunk is a whole step, and ceil(h/c) + ceil(t/c) exceeds ceil((h+t)/c) by at most one.
-    // Measured on hardware: a 6699-token prompt reusing 3008 relocated tokens prefilled 3691 tokens in
-    // six steps against a projected five, and the request died one quantum short at 68 of 68.
-    const std::size_t relocation_ranges =
-        static_cast<std::size_t>(plan->relocated_head.empty() ? 0 : 1) +
-        static_cast<std::size_t>(plan->relocated_tail.empty() ? 0 : 1);
+    // each interrupt the chunk walk; so does a relocation, because it prefills several ranges with
+    // the relocated runs skipped between them. The projection counts chunks over one contiguous
+    // span, so `ceil((head+tail)/chunk)` undercounts a two-range prefill by up to one: each range's
+    // last partial chunk is a whole step, and ceil(h/c) + ceil(t/c) exceeds ceil((h+t)/c) by at most
+    // one. That generalises to one extra step per further range, which is what the count below says,
+    // and it is not a rounding nicety: a 6699-token prompt reusing 3008 relocated tokens prefilled
+    // 3691 tokens in six steps against a projected five, and the request died one quantum short at
+    // 68 of 68. With interleaved survivors the range count is what the plan actually carries, so the
+    // projection and the staged walk cannot disagree about how many prefills there are.
     const std::size_t prefill_splits =
         (plan->vision ? plan->vision->uses.size() : 0ULL) +
-        (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL) + (relocation_ranges > 1 ? relocation_ranges - 1 : 0ULL);
+        (plan->turn_checkpoint_capture_frontier ? 1ULL : 0ULL) +
+        qwen3_6::detail::relocation_prefill_splits(plan->relocated_prefill_ranges);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->summary.reusable_prompt_tokens, prefill_chunk,
                                prefill_splits);

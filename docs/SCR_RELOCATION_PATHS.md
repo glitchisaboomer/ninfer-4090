@@ -4,15 +4,35 @@ Companion to `docs/SCR_ROADMAP.md`. That document describes the phases; this one
 concrete ways the runtime can apply a relocation plan, exactly where each attaches, and what has to
 be decided before either is written.
 
-Status: **Path A is written but has never been compiled.** `start_prefill_lane` replaces the common
+Status: **Path A is written and verified on hardware.** `start_prefill_lane` replaces the common
 frontier trim with the page remap, re-rotates the relocated run once the block table is published, and
-stages the plan's two prefilled ranges, which the chunk walk skips the relocated run between. The
-whole change set was prepared without a CUDA toolchain, so none of that is verified. Path B is still
-unimplemented, and any plan without ranges falls back to ordinary prefix reuse.
+stages the plan's prefilled ranges, which the chunk walk skips the relocated run between. The
+integration test routes every byte through `gqa_kv_append` and the real attention kernels, and
+`tools/scr_e2e_check.py` confirms relocated and re-prefilled runs produce the same output.
+
+**Path B (segmented) is written too.** It was never a second runtime: the staged walk has always
+been driven by a list of prefilled ranges (`RequestControl::Prefill::prefill_ranges`, with
+`prefill_range_end`/`skip_relocated_runs` scanning it), the remap and the delta plane are span-driven,
+and `text_kv_valid` already advances across the skipped run. What was missing was on the planning
+side, and is now in place:
+
+- `plan_relocations` applies the same destination limits the tail planner applies -- no span reaches
+  `prompt_tokens - 1` (the final token must be prefilled, because prompt logits can only come from a
+  real forward pass) or the turn-rewrite boundary (the first token whose KV is already stale) -- and
+  trims a span back to the last whole block ending before either rather than dropping it;
+- the prefilled ranges are derived from the spans by `relocation_prefill_ranges`, one range per gap,
+  tiling the suffix with the runs exactly, so both modes reach the runtime in the same shape and the
+  summary's relocated-token count is a count of tokens that are genuinely not prefilled;
+- the service-work projection counts one extra step per further range
+  (`relocation_prefill_splits`), where it previously assumed at most two ranges;
+- a plan that is not expressible is refused rather than half-applied (`relocation_is_expressible`),
+  so a summary can never count reuse the runtime will not perform.
+
+What remains is measurement, not wiring: the per-dtype and MTP end-to-end runs, and the Phase 5.5
+quality sweep. See "Verification that is still owed".
 
 The two open design questions are now settled: Path A is the target, and the 27B's linear layers are
-handled by snapshot/restore. What remains is runtime wiring, which needs a machine with `nvcc` - see
-"Verification that is still owed".
+handled by snapshot/restore.
 
 Already built and pushed:
 
@@ -166,56 +186,68 @@ threshold, the fallback is to disable SCR rather than to silently keep an unmeas
 ## Path B - general segmented prefill
 
 Needed when relocated spans are interleaved anywhere in the prompt, i.e. the general CLM context
-edit. The planner already expresses this; only the runtime cannot consume it.
+edit. The planner has always expressed this; the runtime could not consume it, because the plan
+carried spans and no ranges to prefill around them.
 
-What has to change:
+What it took, against the list this section used to carry:
 
-- the staged prefill carries a **list of segments** rather than one contiguous range, where each
-  segment is `[begin, end)` of tokens to prefill and the gaps are relocated;
-- the scheduler's chunking walks segments in order and carries a `(segment_index, offset)` cursor
-  instead of a single token cursor, so a chunk never straddles a segment boundary arbitrarily - it
-  either stops at the boundary or spans it with a known irregularity;
-- `sequence.text_kv_valid` becomes "KV is valid for every position in `[0, prompt_tokens)`"
-  immediately after relocation, which is true, rather than "prefilled prefix length". Several checks
-  compare `text_kv_valid` against the frontier and would otherwise fire spuriously;
-- `sequence.ledger` has to hold the full new prompt from the start, since relocated positions are
-  never re-appended during prefill;
-- the block table must map the whole prompt before any segment runs, for the same reason as step 1
-  of Path A.
+- ~~the staged prefill carries a **list of segments** rather than one contiguous range~~ **already
+  done**: `prefill_ranges` is a vector and both walk helpers scan it, so a plan with any number of
+  ranges is consumed unchanged. The tail mode simply never produced more than two.
+- ~~the scheduler walks segments in order~~ **already done**: `skip_relocated_runs` resumes at the
+  next range and `prefill_range_end` clamps the chunk to a range boundary, so no chunk straddles a
+  gap. It is expressed over token positions rather than a `(segment_index, offset)` pair, which
+  turns out to need no new state.
+- ~~`sequence.text_kv_valid` becomes "valid for every position" immediately after relocation~~
+  **already done**: the walk sets it across the skipped run, so it was never a prefilled-prefix
+  length once Path A shipped.
+- ~~`sequence.ledger` holds the full new prompt from the start, and the block table maps the whole
+  prompt before any segment runs~~ **already done**, both proven by the shipped tail path's
+  ledger-size check and its pre-walk bind.
+- **the work projection** now counts one extra step per further range. This was the one real trap:
+  a request whose real work exceeded its projection died mid-prefill, which is how the two-range
+  case was originally found, and an interleaved plan would have re-introduced it silently.
 
-Anchor points for that work, all in `src/targets/qwen3_6/impl/runtime/`:
+Anchor points, all in `src/targets/qwen3_6/impl/runtime/`:
 
-- `program_impl.h`, `start_prefill_lane` - the reuse branches around the `AppendAtFrontier` case, and
-  the staged `Prefill` construction at the end of the function (`host_input_consumed_pending`,
-  `.reuse`, `.mtp_bridge`);
-- `program.h` - the staged prefill record (`PrefillStepResult`'s cursor fields) and
-  `RequestPlanImpl::relocated_spans`;
-- the chunking walk further down `program_impl.h` that consumes the staged prefill
-  (`host_input_consumed` / cursor bookkeeping around the `PrefillStepResult` staging and the
-  `text_kv_valid` updates);
-- `request_plan_impl.h`, `projected_service_work` - a segmented prefill changes the quantum
-  accounting because a chunk can now cover less than `prefill_chunk` tokens.
+- `prompt_edit.{h,cpp}` - `plan_relocations` (the selector, now with the same destination limits as
+  the tail planner), `relocation_prefill_ranges`, `relocation_prefill_splits`, and
+  `relocation_is_expressible`. Host-testable, and tested: `tests/targets/qwen3_6/test_prompt_edit.cpp`
+  covers the limits, the range derivation, the split count, and the expressibility check.
+- `request_plan_impl.h`, `plan_request_for_lane` - both modes now end at the same place: spans from
+  the selector, ranges derived from the spans, refusal if the pair is not expressible.
+- `program.h` - `RequestPlanImpl::relocated_prefill_ranges` replaced the head/tail pair, so the plan
+  has one source for the shape the runtime walks.
+- `program_impl.h`, `start_prefill_lane` - `apply_relocation` gates on spans *and* ranges, the GDN
+  zeroing keys off the first span's destination rather than a head range, and the diagnostics read
+  the range list.
 
-Path B dominates the diff size and cannot be validated by reading; it should be written on a machine
-with `nvcc` available.
+Path B is the same arithmetic as Path A with more ranges, and it is covered by the same tests plus
+the new host tests above; what it has not had is a hardware run with interleaved survivors, which
+is part of the verification owed below.
 
 ## Switch for benchmarking
 
 Wired: the choice reaches the plan through `ScrRelocationMode` on `ExecutionOptions`, mirrored into
 `ResolvedExecutionOptions`, `ServeOptions` and `RequestBasePlanImpl`, and surfaced as `--scr-mode
-tail|segmented`. The default is `tail`, and `tail` is the only mode the runtime can act on, so
-`segmented` currently produces a plan the runtime ignores exactly as `tail` does. The remaining items
-below are what still has to happen:
+tail|segmented`. The default is `tail`. Both modes now produce a plan the runtime executes; the
+mode is reported in the server-start record and `prefix_relocated_tokens` in the completion record.
 
-- have the planner reject a plan whose `relocated_spans` do not satisfy the selected mode's
-  condition, falling back to `AppendAtFrontier` rather than relocating partially. `tail` already gets
-  this from `plan_tail_relocation`; `segmented` has no such check yet;
-- report the mode in the server-start record and `prefix_relocated_tokens` in the completion record,
-  which is already wired.
+What still holds the two apart, deliberately:
 
-The planner-side mode check is host-testable (`tests/targets/qwen3_6/test_prompt_edit.cpp` already
-covers `plan_relocations`), so the mode split can be verified without CUDA even though the two
-runtimes cannot.
+- `tail` selects one contiguous run and trims spans back to the turn-rewrite boundary, because a
+  single run is the shape whose approximation is bounded and measurable. It is the default for that
+  reason, not because `segmented` is broken.
+- `segmented` may relocate any interleaved survivor, so one edit can introduce several disjoint
+  approximations at once. Its spans satisfy the same destination limits as the tail planner's, so
+  neither mode can reuse KV that is stale or un-prefillable, but the quality consequence of many
+  small relocations has not been measured -- which is what the Phase 5.5 sweep is for.
+
+A plan that is not expressible -- spans the runtime cannot lay out against the reported ranges --
+is refused with a printed reason rather than applied partially, so a summary never counts reuse the
+runtime will not perform. That check is host-testable
+(`relocation_is_expressible` in `tests/targets/qwen3_6/test_prompt_edit.cpp`), so the mode split is
+verified without CUDA even though the two runtimes' behaviour on hardware is not.
 
 ## SCR produces garbage on both supported models: the GDN layers make it unworkable
 

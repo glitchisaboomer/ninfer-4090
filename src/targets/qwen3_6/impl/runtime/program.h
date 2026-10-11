@@ -79,11 +79,14 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     // Populated only when `reuse == SuffixRelocation`. Empty means every token after
     // `reuse_base` is prefilled, which is the assumption every other reuse path relies on.
     std::vector<NINFER_QWEN36_RUNTIME_NS::RelocatedSpan> relocated_spans;
-    // The two ranges prefilled around `relocated_spans`, both relative to the prompt. The runtime
-    // prefills these and serves everything between them from resident KV, so the ranges must tile
-    // `[reuse_base, prompt_tokens)` minus the relocated run.
-    NINFER_QWEN36_RUNTIME_NS::PrefillRange relocated_head;
-    NINFER_QWEN36_RUNTIME_NS::PrefillRange relocated_tail;
+    // Every range the runtime prefills, in prompt order, with `relocated_spans` as the gaps between
+    // them. Together they tile `[reuse_base, prompt_tokens)` exactly -- a token is prefilled or
+    // relocated but never unaccounted -- which is what keeps `summary.relocated_prompt_tokens` and
+    // the service-work projection honest, and why the runtime can serve the gaps from resident KV
+    // without a second accounting pass. One range is the ordinary "prefill everything after the
+    // frontier" shape and the two around a contiguous run; more than one is what interleaved
+    // survivors need. Derived from the spans by `relocation_prefill_ranges`, so there is one source.
+    std::vector<NINFER_QWEN36_RUNTIME_NS::PrefillRange> relocated_prefill_ranges;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;

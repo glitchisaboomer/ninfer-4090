@@ -277,7 +277,9 @@ void test_plan_relocations() {
     using ninfer::targets::qwen3_6::detail::RelocatedSpan;
 
     // Scope A shape: [P R S] -> [P S]. The prefix span is ordinary prefix reuse, so only the
-    // surviving suffix should be reported as a relocation.
+    // surviving suffix should be reported as a relocation. The trailing block is new content, so
+    // the suffix does not run to the prompt end and the final-token limit does not trim it; that
+    // rule is `test_plan_relocations_respects_limits`'s subject.
     Tokens previous;
     append(previous, segment(1, 2));
     append(previous, segment(2, 2));
@@ -285,10 +287,12 @@ void test_plan_relocations() {
     Tokens current;
     append(current, segment(1, 2));
     append(current, segment(3, 2));
+    append(current, segment(4, 1));
 
     const PromptEditDiff diff = diff_prompt_edit(previous, current);
     const auto resident        = static_cast<std::uint32_t>(previous.size());
-    const auto relocations     = plan_relocations(diff, resident, 0, 6);
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+    const auto relocations     = plan_relocations(diff, resident, 0, prompt, std::nullopt, 6);
 
     expect(relocations.size() == 1, "only the surviving suffix is relocated");
     if (relocations.size() == 1) {
@@ -298,22 +302,23 @@ void test_plan_relocations() {
     }
 
     // Zero cap means reuse nothing, which is how SCR is disabled per request.
-    expect(plan_relocations(diff, resident, 0, 0).empty(), "a zero span cap relocates nothing");
+    expect(plan_relocations(diff, resident, 0, prompt, std::nullopt, 0).empty(),
+           "a zero span cap relocates nothing");
 
     // A span without resident KV cannot be relocated.
-    expect(plan_relocations(diff, block_tokens(5), 0, 6).empty(),
+    expect(plan_relocations(diff, block_tokens(5), 0, prompt, std::nullopt, 6).empty(),
            "a span outside resident KV is not relocated");
 
     // The surviving suffix moves from block 4 to block 2. When ordinary prefix reuse already
     // covers the first four blocks, the suffix starts at the frontier and is still relocated.
-    expect(plan_relocations(diff, resident, block_tokens(2), 6).size() == 1,
+    expect(plan_relocations(diff, resident, block_tokens(2), prompt, std::nullopt, 6).size() == 1,
            "a survivor exactly at the prefix frontier is relocated");
 
     // Once prefix reuse reaches into the survivor's destination, that region is already covered
     // and must not be claimed a second time.
-    expect(plan_relocations(diff, resident, block_tokens(3), 6).empty(),
+    expect(plan_relocations(diff, resident, block_tokens(3), prompt, std::nullopt, 6).empty(),
            "a survivor inside the prefix-reuse region is not relocated");
-    expect(plan_relocations(diff, resident, block_tokens(4), 6).empty(),
+    expect(plan_relocations(diff, resident, block_tokens(4), prompt, std::nullopt, 6).empty(),
            "prefix reuse covering the whole survivor leaves nothing to relocate");
 }
 
@@ -342,9 +347,13 @@ void test_plan_relocations_keeps_longest() {
     append(current, segment(5, 2));
     append(current, segment(8, 2));
     append(current, segment(3, 3));
+    // New trailing content, so the longest survivor does not run to the prompt end and the
+    // final-token limit does not shorten it into a tie with the middle one.
+    append(current, segment(10, 1));
 
     const PromptEditDiff diff = diff_prompt_edit(previous, current);
     const auto resident = static_cast<std::uint32_t>(previous.size());
+    const auto prompt   = static_cast<std::uint32_t>(current.size());
 
     // All three survivors plus the prefix are detected before capping.
     expect(diff.spans.size() == 4, "the fixture keeps its three survivors separate");
@@ -353,7 +362,7 @@ void test_plan_relocations_keeps_longest() {
 
     // The cap is smaller than the number of candidates; the dropped span is the one-block
     // survivor, not the earliest candidate.
-    const auto capped = plan_relocations(diff, resident, 0, 2);
+    const auto capped = plan_relocations(diff, resident, 0, prompt, std::nullopt, 2);
     expect(capped.size() == 2, "the span cap is honored");
     if (capped.size() == 2) {
         expect(capped[0].tokens == block_tokens(2) && capped[1].tokens == block_tokens(3),
@@ -363,7 +372,7 @@ void test_plan_relocations_keeps_longest() {
                "a capped survivor reports its own source and destination");
     }
 
-    const auto all = plan_relocations(diff, resident, 0, 6);
+    const auto all = plan_relocations(diff, resident, 0, prompt, std::nullopt, 6);
     expect(all.size() == 3, "every surviving region is relocated when the cap allows");
     if (all.size() == 3) {
         expect(all[0].dest_begin < all[1].dest_begin && all[1].dest_begin < all[2].dest_begin,
@@ -376,6 +385,193 @@ void test_plan_relocations_keeps_longest() {
         expect(all[2].source_begin == block_tokens(8) && all[2].dest_begin == block_tokens(10),
                "the longest survivor moves forward");
     }
+}
+
+void test_plan_relocations_respects_limits() {
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    // Scope A shape: [P R S] -> [P S], with S three blocks long and ending at the prompt end.
+    // previous is one block of P, one of R and three of S; current is P followed by S.
+    Tokens previous;
+    append(previous, segment(1, 1)); // P
+    append(previous, segment(2, 1)); // R, replaced
+    append(previous, segment(3, 3)); // S, survives and moves left, reaching the prompt end
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(3, 3));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+    const auto unlimited       = plan_relocations(diff, resident, 0, prompt, std::nullopt, 6);
+    expect(unlimited.size() == 1, "the survivor is selected without a boundary");
+    if (unlimited.size() == 1) {
+        // The final prompt token must be prefilled, so a run reaching the prompt end keeps only
+        // the blocks that end before it. The tail planner trims the same shape the same way; the
+        // two selectors must not disagree about which blocks are relocatable.
+        expect(unlimited.front().tokens == block_tokens(2),
+               "a run reaching the prompt end loses its final block to the sampler");
+        expect(unlimited.front().dest_begin == block_tokens(1),
+               "the trimmed run still starts at the frontier");
+    }
+
+    // A boundary inside the survivor trims it back to the last whole block ending before the
+    // boundary, exactly as it does for the final prompt token.
+    const auto inside = plan_relocations(diff, resident, 0, prompt, block_tokens(1), 6);
+    expect(inside.empty(), "a boundary at the survivor's start leaves no whole block to relocate");
+    const auto mid = plan_relocations(diff, resident, 0, prompt, block_tokens(2), 6);
+    expect(mid.size() == 1 && mid.front().tokens == block_tokens(1),
+           "a boundary after one block trims the run to that block");
+    const auto off_edge =
+        plan_relocations(diff, resident, 0, prompt, block_tokens(2) + 7, 6);
+    expect(off_edge.size() == 1 && off_edge.front().tokens == block_tokens(1),
+           "a boundary mid-block trims to that block's edge, not past it");
+    const auto past_two = plan_relocations(diff, resident, 0, prompt, block_tokens(3), 6);
+    expect(past_two.size() == 1 && past_two.front().tokens == block_tokens(2),
+           "a boundary past two blocks trims the run to those two");
+
+    // A boundary at or beyond the final prompt token is the same limit as no boundary at all, and
+    // the plan must not change because the chat template happened to supply one.
+    const auto at_end = plan_relocations(diff, resident, 0, prompt, prompt - 1, 6);
+    expect(at_end.size() == 1 && at_end.front().tokens == block_tokens(2),
+           "a boundary at the final token matches no boundary");
+    const auto beyond_end = plan_relocations(diff, resident, 0, prompt, prompt, 6);
+    expect(beyond_end.size() == 1 && beyond_end.front().tokens == block_tokens(2),
+           "a boundary past the final token matches no boundary");
+}
+
+void test_relocation_prefill_ranges() {
+    using ninfer::targets::qwen3_6::detail::PrefillRange;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    const auto span = [](std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = 0, .dest_begin = dest, .tokens = tokens};
+    };
+    const auto same = [](const std::vector<PrefillRange>& ranges, std::uint32_t count) {
+        return ranges.size() == count;
+    };
+
+    // No spans: the whole suffix is prefilled, which is the ordinary no-relocation shape.
+    const std::vector<RelocatedSpan> none;
+    const auto single = relocation_prefill_ranges(none, block_tokens(1), block_tokens(4));
+    expect(single.size() == 1 && single[0].begin == block_tokens(1) && single[0].end == block_tokens(4),
+           "no spans prefills the whole suffix as one range");
+
+    // One run in the middle: a head and a tail, which is what the tail planner reports.
+    const std::vector<RelocatedSpan> middle{span(block_tokens(2), block_tokens(2))};
+    const auto around = relocation_prefill_ranges(middle, block_tokens(1), block_tokens(5));
+    expect(same(around, 2), "a middle run yields a head and a tail");
+    if (same(around, 2)) {
+        expect(around[0].begin == block_tokens(1) && around[0].end == block_tokens(2),
+               "the head runs from the frontier to the run");
+        expect(around[1].begin == block_tokens(4) && around[1].end == block_tokens(5),
+               "the tail runs from the run to the prompt end");
+    }
+
+    // A run starting at the frontier has no head, which is the empty-head case the tail planner
+    // produces and the runtime treats as "nothing deleted ahead of the run".
+    const std::vector<RelocatedSpan> at_frontier{span(block_tokens(1), block_tokens(2))};
+    const auto no_head = relocation_prefill_ranges(at_frontier, block_tokens(1), block_tokens(5));
+    expect(same(no_head, 1) && no_head[0].begin == block_tokens(3),
+           "a run at the frontier leaves no head range");
+
+    // Two adjacent spans, which is one tail run expressed as several blocks: the gaps between them
+    // must collapse, so the ranges stay head and tail rather than gaining an empty middle.
+    const std::vector<RelocatedSpan> adjacent{span(block_tokens(2), block_tokens(1)),
+                                              span(block_tokens(3), block_tokens(1))};
+    const auto merged = relocation_prefill_ranges(adjacent, block_tokens(1), block_tokens(5));
+    expect(same(merged, 2) && merged[1].begin == block_tokens(4),
+           "adjacent runs collapse into the tail range");
+
+    // Interleaved survivors: one range per gap, in prompt order. This is the shape only the
+    // segmented planner produces, and the reason the range list exists.
+    const std::vector<RelocatedSpan> interleaved{span(block_tokens(2), block_tokens(1)),
+                                                 span(block_tokens(4), block_tokens(1))};
+    const auto gaps = relocation_prefill_ranges(interleaved, block_tokens(1), block_tokens(6));
+    expect(same(gaps, 3), "interleaved survivors leave one range per gap");
+    if (same(gaps, 3)) {
+        expect(gaps[0].end == block_tokens(2) && gaps[1].begin == block_tokens(3) &&
+                   gaps[1].end == block_tokens(4) && gaps[2].begin == block_tokens(5),
+               "the gaps sit between the survivors in prompt order");
+    }
+
+    // A frontier at the prompt end leaves nothing to prefill.
+    expect(relocation_prefill_ranges(none, block_tokens(3), block_tokens(3)).empty(),
+           "a frontier at the prompt end prefills nothing");
+}
+
+void test_relocation_prefill_splits() {
+    using ninfer::targets::qwen3_6::detail::PrefillRange;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_splits;
+
+    const std::vector<PrefillRange> none;
+    const std::vector<PrefillRange> one{PrefillRange{0, 64}};
+    const std::vector<PrefillRange> two{PrefillRange{0, 64}, PrefillRange{128, 192}};
+    const std::vector<PrefillRange> four{PrefillRange{0, 64},   PrefillRange{128, 192},
+                                        PrefillRange{256, 320}, PrefillRange{384, 448}};
+
+    // The projection already accounts for one range's partial chunks; every further range is a
+    // whole extra step, and leaving one out is how a request dies one quantum short mid-prefill.
+    expect(relocation_prefill_splits(none) == 0, "no ranges cost no extra split");
+    expect(relocation_prefill_splits(one) == 0, "one range is already projected");
+    expect(relocation_prefill_splits(two) == 1, "two ranges cost one extra split");
+    expect(relocation_prefill_splits(four) == 3, "four ranges cost three extra splits");
+}
+
+void test_relocation_is_expressible() {
+    using ninfer::targets::qwen3_6::detail::PrefillRange;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    const auto span = [](std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = block_tokens(2), .dest_begin = dest, .tokens = tokens};
+    };
+    const auto check = [](const std::vector<RelocatedSpan>& spans, std::uint32_t base,
+                          std::uint32_t prompt) {
+        return relocation_is_expressible(spans,
+                                         relocation_prefill_ranges(spans, base, prompt), base,
+                                         prompt);
+    };
+
+    // The shapes the planners produce: a contiguous run, a run at the frontier, interleaved runs.
+    expect(check({span(block_tokens(2), block_tokens(2))}, block_tokens(1), block_tokens(5)),
+           "a contiguous run with a head and a tail is expressible");
+    expect(check({span(block_tokens(1), block_tokens(2))}, block_tokens(1), block_tokens(5)),
+           "a run at the frontier with only a tail is expressible");
+    expect(check({span(block_tokens(2), block_tokens(1)), span(block_tokens(4), block_tokens(1))},
+                 block_tokens(1), block_tokens(6)),
+           "interleaved runs with one range per gap are expressible");
+
+    // A span the plan does not cover: below the frontier, reaching the final token, misaligned, or
+    // overlapping a neighbour. Each is a plan the runtime cannot execute, and the point of the
+    // check is that it says so before the summary counts the tokens as reused.
+    expect(!check({span(0, block_tokens(1))}, block_tokens(2), block_tokens(5)),
+           "a span below the frontier is not expressible");
+    expect(!check({span(block_tokens(4), block_tokens(1))}, block_tokens(1), block_tokens(5)),
+           "a span reaching the final prompt token is not expressible");
+    expect(!check({RelocatedSpan{.source_begin = 7, .dest_begin = block_tokens(2), .tokens = 64}},
+                  block_tokens(1), block_tokens(5)),
+           "a span that is not block aligned is not expressible");
+    expect(!check({span(block_tokens(2), block_tokens(3))}, block_tokens(1), block_tokens(5)),
+           "a span running into the next range is not expressible");
+    expect(!check({span(block_tokens(2), block_tokens(1)), span(block_tokens(2), block_tokens(1))},
+                  block_tokens(1), block_tokens(5)),
+           "two spans claiming the same destination are not expressible");
+
+    // Ranges that do not tile the suffix, whether by a gap or past its end.
+    const std::vector<RelocatedSpan> run{span(block_tokens(2), block_tokens(2))};
+    const std::vector<PrefillRange> gapped{PrefillRange{block_tokens(1), block_tokens(2)}};
+    expect(!relocation_is_expressible(run, gapped, block_tokens(1), block_tokens(5)),
+           "ranges that miss the tail are not expressible");
+    const std::vector<PrefillRange> overrun{PrefillRange{block_tokens(1), block_tokens(2)},
+                                            PrefillRange{block_tokens(4), block_tokens(9)}};
+    expect(!relocation_is_expressible(run, overrun, block_tokens(1), block_tokens(5)),
+           "ranges that run past the prompt are not expressible");
+    expect(!relocation_is_expressible(run, {}, block_tokens(1), block_tokens(5)),
+           "a relocation with no prefilled range is not expressible");
 }
 
 void test_plan_tail_relocation() {
@@ -797,6 +993,10 @@ int main() {
     test_empty_and_degenerate_inputs();
     test_plan_relocations();
     test_plan_relocations_keeps_longest();
+    test_plan_relocations_respects_limits();
+    test_relocation_prefill_ranges();
+    test_relocation_prefill_splits();
+    test_relocation_is_expressible();
     test_plan_tail_relocation();
     test_plan_tail_relocation_respects_turn_rewrite_boundary();
     test_plan_tail_relocation_picks_one_run();

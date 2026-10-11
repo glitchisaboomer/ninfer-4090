@@ -58,9 +58,20 @@ constexpr std::size_t kMaxCandidateProbes = 8;
 std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
                                            std::uint32_t resident_kv_tokens,
                                            std::uint32_t prefix_reuse_tokens,
+                                           std::uint32_t prompt_tokens,
+                                           std::optional<std::uint32_t> turn_rewrite_boundary,
                                            std::uint32_t max_spans) {
     std::vector<RelocatedSpan> candidates;
-    if (max_spans == 0) { return candidates; }
+    if (max_spans == 0 || prompt_tokens == 0 || prompt_tokens <= prefix_reuse_tokens) {
+        return candidates;
+    }
+
+    // The last token a span may reach. The final prompt token is always prefilled, because prompt
+    // logits can only come from a real forward pass; the turn-rewrite boundary, when supplied, is
+    // earlier still, because it is the first token whose KV is already stale. The same limit the
+    // tail planner applies, for the same two reasons.
+    std::uint32_t limit = prompt_tokens - 1;
+    if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
 
     for (const SurvivingSpan& span : diff.spans) {
         // The leading span is ordinary prefix reuse, already expressed by the planner's
@@ -72,12 +83,20 @@ std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
         // prefix reuse. A span that starts below it and ends above it is dropped whole, because
         // splitting it would leave the reused part of the destination claimed by two paths.
         if (span.new_begin < prefix_reuse_tokens) { continue; }
+        if (span.tokens == 0 || span.new_begin >= limit) { continue; }
+        // Trimmed back to the last whole block ending before the limit. Trimming keeps the span
+        // block aligned, and surviving spans are disjoint, so it cannot break a run's adjacency.
+        const std::uint32_t room   = limit - span.new_begin;
+        const std::uint32_t fit    = (room / kPromptEditBlockTokens) * kPromptEditBlockTokens;
+        const std::uint32_t tokens = std::min(span.tokens, fit);
+        if (tokens == 0) { continue; }
         candidates.push_back(RelocatedSpan{.source_begin = span.old_begin,
                                            .dest_begin   = span.new_begin,
-                                           .tokens       = span.tokens});
+                                           .tokens       = tokens});
     }
 
-    // Longest survivors first so the cap discards the least useful reuse.
+    // Longest survivors first so the cap discards the least useful reuse. Trimming happened above,
+    // so a span shortened by a limit is compared at the length it would actually relocate.
     const std::size_t keep = std::min<std::size_t>(max_spans, candidates.size());
     std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep),
                       candidates.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
@@ -291,6 +310,77 @@ std::uint32_t remap_pages_from_pool(std::span<const std::int32_t> current_pages,
             ? static_cast<std::uint64_t>(current_pages.size()) - named
             : 0;
     return acquires - std::min<std::uint64_t>(acquires, surplus);
+}
+
+std::vector<PrefillRange> relocation_prefill_ranges(std::span<const RelocatedSpan> spans,
+                                                    std::uint32_t prefix_reuse_tokens,
+                                                    std::uint32_t prompt_tokens) {
+    std::vector<PrefillRange> ranges;
+    if (prompt_tokens <= prefix_reuse_tokens) { return ranges; }
+
+    // Walk the spans in prompt order and emit the gaps before, between and after them. The planner
+    // hands them over sorted by destination, but the max() keeps this correct for any order: an
+    // overlapping or out-of-order span cannot manufacture a gap, it can only shrink one.
+    std::uint32_t cursor = prefix_reuse_tokens;
+    for (const RelocatedSpan& span : spans) {
+        if (span.dest_begin > cursor) { ranges.push_back(PrefillRange{cursor, span.dest_begin}); }
+        cursor = std::max(cursor, span.dest_end());
+    }
+    if (prompt_tokens > cursor) { ranges.push_back(PrefillRange{cursor, prompt_tokens}); }
+    return ranges;
+}
+
+std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges) {
+    // One range's partial chunk is already in the projection; every further range is a step the
+    // single-span formula does not count.
+    return ranges.size() > 1 ? static_cast<std::uint64_t>(ranges.size() - 1) : 0ULL;
+}
+
+bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
+                              std::span<const PrefillRange> ranges,
+                              std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens) {
+    if (prompt_tokens <= prefix_reuse_tokens || ranges.empty()) { return false; }
+
+    std::vector<RelocatedSpan> sorted(spans.begin(), spans.end());
+    std::sort(sorted.begin(), sorted.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
+        return a.dest_begin < b.dest_begin;
+    });
+    for (std::size_t i = 0; i < sorted.size(); ++i) {
+        const RelocatedSpan& span = sorted[i];
+        if (span.tokens == 0 || span.tokens % kPromptEditBlockTokens != 0 ||
+            span.source_begin % kPromptEditBlockTokens != 0 ||
+            span.dest_begin % kPromptEditBlockTokens != 0) {
+            return false;
+        }
+        if (span.dest_begin < prefix_reuse_tokens || span.dest_end() > prompt_tokens - 1) {
+            return false;
+        }
+        if (i != 0 && span.dest_begin < sorted[i - 1].dest_end()) { return false; }
+    }
+
+    // Ranges and spans have to tile the suffix exactly: every token prefilled or relocated, none
+    // twice, none missed. The walk takes whichever of the next range and the next span begins at the
+    // cursor, so an interleaved plan -- range, run, gap, run, range -- tiles the same way a
+    // contiguous one does.
+    std::uint32_t cursor = prefix_reuse_tokens;
+    std::size_t next_range = 0;
+    std::size_t next_span  = 0;
+    while (next_range < ranges.size() || next_span < sorted.size()) {
+        const bool take_range =
+            next_span >= sorted.size() ||
+            (next_range < ranges.size() && ranges[next_range].begin <= sorted[next_span].dest_begin);
+        if (take_range) {
+            if (next_range >= ranges.size() || ranges[next_range].empty() ||
+                ranges[next_range].begin != cursor) {
+                return false;
+            }
+            cursor = ranges[next_range++].end;
+        } else {
+            if (sorted[next_span].dest_begin != cursor) { return false; }
+            cursor = sorted[next_span++].dest_end();
+        }
+    }
+    return cursor == prompt_tokens;
 }
 
 PromptEditDiff diff_prompt_edit(std::span<const TokenId> previous, std::span<const TokenId> current,

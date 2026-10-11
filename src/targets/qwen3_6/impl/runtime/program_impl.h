@@ -491,9 +491,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     // supply one, so a plan without it falls back to ordinary prefix reuse. That keeps generated
     // output identical to the pre-SCR path and lets telemetry report the path actually taken rather
     // than the path the plan requested.
+    // A relocation is expressible when the plan carries spans and the ranges that tile the rest of
+    // the prompt with them; the planner refuses anything else, and this is the last line of defence
+    // that keeps a plan the runtime cannot execute from reaching the staged walk -- or from being
+    // reported as reuse in the summary. Tail mode's ranges are never empty because the tail planner
+    // always prefills the final token; a segmented plan is refused the same way.
     const bool apply_relocation =
         request_plan.reuse == ReusePath::SuffixRelocation &&
-        !request_plan.relocated_spans.empty() && !request_plan.relocated_tail.empty();
+        !request_plan.relocated_spans.empty() && !request_plan.relocated_prefill_ranges.empty();
     const ReusePath applied_reuse =
         request_plan.reuse == ReusePath::SuffixRelocation
             ? (apply_relocation ? ReusePath::SuffixRelocation : ReusePath::AppendAtFrontier)
@@ -889,40 +894,50 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                         device.stream);
                 }
-                if (!request_plan.relocated_head.empty()) {
-                    suffix_prefill_ranges.push_back(request_plan.relocated_head);
-                    // The linear-attention layers keep one fixed-size recurrent state for the whole
-                    // sequence rather than a per-token cache, so there is nothing to relocate and
-                    // nothing to re-rotate. The state left over from the previous prompt was
-                    // summarised over the *old* token sequence, including the region this edit just
-                    // deleted, so leaving it in place has 48 of 64 layers asserting that content the
-                    // prompt no longer contains. That is a contradiction rather than an
-                    // approximation, and it is what made the relocated run emit degenerate output.
-                    //
-                    // Zeroing is sufficient and needs no snapshot. The head range pushed just above
-                    // is prefilled from this point on, and feeding the new prefix into a zeroed
-                    // recurrence yields exactly the state a cold prefill of that prefix would
-                    // produce, which is what the paper's "snapshot the recurrent state before the
-                    // edit" recovers. The relocated run then contributes nothing to these layers,
-                    // which is the approximation the paper describes and measures as robust.
-                    //
-                    // Only when a head range exists to rebuild from. With an empty head the resident
-                    // prompt is a strict prefix of the new one, nothing was deleted, and the existing
-                    // state is already a valid state for the reused prefix.
+                // Every range the plan reports, in prompt order, with the relocated runs as the gaps
+                // between them. One range is the ordinary contiguous shape; more than one is what
+                // interleaved survivors produce, and the staged walk consumes either without change
+                // because it is driven by this list.
+                for (const qwen3_6::detail::PrefillRange& range :
+                     request_plan.relocated_prefill_ranges) {
+                    suffix_prefill_ranges.push_back(range);
+                }
+                // The linear-attention layers keep one fixed-size recurrent state for the whole
+                // sequence rather than a per-token cache, so there is nothing to relocate and
+                // nothing to re-rotate. The state left over from the previous prompt was
+                // summarised over the *old* token sequence, including the region this edit just
+                // deleted, so leaving it in place has 48 of 64 layers asserting that content the
+                // prompt no longer contains. That is a contradiction rather than an
+                // approximation, and it is what made the relocated run emit degenerate output.
+                //
+                // Zeroing is sufficient and needs no snapshot. The ranges pushed just above are
+                // prefilled from this point on, and feeding the new content into a zeroed
+                // recurrence yields exactly the state a cold prefill of it would produce, which is
+                // what the paper's "snapshot the recurrent state before the edit" recovers. The
+                // relocated run then contributes nothing to these layers, which is the
+                // approximation the paper describes and measures as robust.
+                //
+                // Only when the first relocated destination does not start at the frontier, which
+                // is exactly when a range exists between the frontier and it to rebuild from. When
+                // the first survivor starts at the frontier, the resident prompt is a strict
+                // prefix of the new one, nothing was deleted ahead of the run, and the existing
+                // state is already a valid state for the reused prefix.
+                const bool rebuild_linear_state =
+                    request_plan.relocated_spans.front().dest_begin > base;
+                if (rebuild_linear_state) {
                     decoder->linear_attention.zero_slot(
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                         device.stream);
                 }
                 if (scr_diagnostics_enabled()) {
-                    log_scr_gdn_state("invalidate", !request_plan.relocated_head.empty(),
-                                      request_plan.relocated_head.empty(), gdn_before,
+                    log_scr_gdn_state("invalidate", rebuild_linear_state, !rebuild_linear_state,
+                                      gdn_before,
                                       decoder->linear_attention.fingerprint_slot(
                                           LinearStateSlots::current_state_slot(sequence.lane,
                                                                                max_concurrency),
                                           device.stream),
                                       device.stream);
                 }
-                suffix_prefill_ranges.push_back(request_plan.relocated_tail);
             } else {
                 trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             }
@@ -1606,9 +1621,10 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
             << span.dest_begin / kPagedKVPageSize << ".."
             << (span.dest_end() - 1) / kPagedKVPageSize << "}";
     }
-    out << " head{" << request_plan.relocated_head.begin << "," << request_plan.relocated_head.end
-        << "} tail{" << request_plan.relocated_tail.begin << "," << request_plan.relocated_tail.end
-        << "}";
+    out << " ranges=" << request_plan.relocated_prefill_ranges.size();
+    for (const qwen3_6::detail::PrefillRange& range : request_plan.relocated_prefill_ranges) {
+        out << " [" << range.begin << "," << range.end << ")";
+    }
     out << " remap[";
     for (std::size_t i = 0; i < remap.size(); ++i) { out << (i ? "," : "") << remap[i]; }
     out << "]";
@@ -1688,10 +1704,16 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
                 out << (page == first ? "" : ",") << table[page];
             }
         }
-        const std::size_t tail_first = request_plan.relocated_tail.begin / kPagedKVPageSize;
-        out << " tail_row[" << tail_first << "]=";
-        for (std::size_t page = tail_first; page < rows && page < tail_first + 4; ++page) {
-            out << (page == tail_first ? "" : ",") << table[page];
+        // The last range is the one that ends the prompt, so its first page is where the tail of
+        // the block table starts: the entries a vacuous relocation would leave naming stale pages.
+        if (!request_plan.relocated_prefill_ranges.empty()) {
+            const qwen3_6::detail::PrefillRange& last =
+                request_plan.relocated_prefill_ranges.back();
+            const std::size_t tail_first = last.begin / kPagedKVPageSize;
+            out << " tail_row[" << tail_first << "]=";
+            for (std::size_t page = tail_first; page < rows && page < tail_first + 4; ++page) {
+                out << (page == tail_first ? "" : ",") << table[page];
+            }
         }
     }
     std::cerr << out.str() << '\n';

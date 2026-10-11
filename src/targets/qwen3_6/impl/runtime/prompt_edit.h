@@ -96,8 +96,8 @@ struct RelocatedSpan {
 // Turn a diff into the relocation geometry a runtime can act on.
 //
 // This is the general selector, for the segmented runtime described in
-// `docs/SCR_RELOCATION_PATHS.md` as Path B, which is not implemented. The runtime currently plans
-// with `plan_tail_relocation` instead, because it can only prefill a bounded number of ranges.
+// `docs/SCR_RELOCATION_PATHS.md` as Path B: surviving spans interleaved anywhere in the prompt,
+// rather than the one contiguous run `plan_tail_relocation` selects.
 //
 // A span is only relocatable when all of the following hold:
 //
@@ -108,6 +108,16 @@ struct RelocatedSpan {
 //   * Its destination range begins at or after `prefix_reuse_tokens`. A destination inside that
 //     region is already covered by ordinary prefix reuse, and a span that straddles the boundary
 //     would be claimed twice, so the whole span is dropped rather than split.
+//   * Its destination ends before the last token a span may reach: the smaller of
+//     `prompt_tokens - 1` and `turn_rewrite_boundary`. The final prompt token must always be
+//     prefilled, because prompt logits can only come from a real forward pass. The boundary is the
+//     first token whose KV is already stale, because the assistant's reasoning is about to be
+//     rewritten there, and a span carrying tokens at or after it would reuse KV that is stale by
+//     definition. A span overrunning either limit is trimmed back to the last whole block ending
+//     before it rather than dropped, so a run keeps the part that is still valid.
+//
+// Trimming happens before the cap is applied, so a span shortened by a limit is compared at the
+// length it would actually relocate.
 //
 // Of the survivors the `max_spans` longest are kept and the rest are left to be re-prefilled, which
 // bounds how much approximation one edit introduces. The result is returned in prompt order.
@@ -116,6 +126,8 @@ struct RelocatedSpan {
 [[nodiscard]] std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
                                                          std::uint32_t resident_kv_tokens,
                                                          std::uint32_t prefix_reuse_tokens,
+                                                         std::uint32_t prompt_tokens,
+                                                         std::optional<std::uint32_t> turn_rewrite_boundary,
                                                          std::uint32_t max_spans);
 
 // A range of prompt tokens the runtime prefills, `[begin, end)`.
@@ -272,6 +284,40 @@ inline constexpr std::int32_t kRemapAcquirePage = -1;
 // the reassign is refused.
 [[nodiscard]] std::uint32_t remap_pages_from_pool(std::span<const std::int32_t> current_pages,
                                                   std::span<const std::int32_t> mapping);
+
+// The ranges of the prompt the runtime must prefill for `spans`, in prompt order: every token of
+// `[prefix_reuse_tokens, prompt_tokens)` that no relocated span covers. With one contiguous run this
+// is the head and the tail around it, which is exactly what `plan_tail_relocation` reports; with
+// interleaved survivors it is one range per gap. Empty ranges are never returned, and together
+// with `spans` the result tiles the whole suffix exactly -- so a token is prefilled or relocated
+// but never unaccounted. That tiling is what keeps `summary.relocated_prompt_tokens` and the
+// service-work projection honest, and why the final prompt token always lands inside a range: the
+// planner forbids a span from reaching it.
+//
+// With no spans this is the single range `[prefix_reuse_tokens, prompt_tokens)`, the ordinary
+// "prefill everything after the frontier" shape, so a caller that has one always has a plan.
+[[nodiscard]] std::vector<PrefillRange>
+relocation_prefill_ranges(std::span<const RelocatedSpan> spans, std::uint32_t prefix_reuse_tokens,
+                          std::uint32_t prompt_tokens);
+
+// The extra service-work quanta a multi-range prefill costs. The projection accounts for one
+// range's worth of partial chunks, and every further range adds a whole step of its own, because a
+// range's last partial chunk is a step the single-span formula does not count. Under-projecting is
+// not cosmetic: a request whose real work exceeds its projection dies mid-prefill, which is how
+// the two-range case was found.
+[[nodiscard]] std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges);
+
+// Whether a relocation plan is expressible at all. It is when every span is block aligned in both
+// prompts, starts at or after the prefix frontier, ends before the final prompt token, and the
+// reported ranges tile `[prefix_reuse_tokens, prompt_tokens)` together with the spans. A plan that
+// fails any of this cannot be executed, so the planner must fall back to ordinary prefix reuse
+// rather than report reuse it will not perform -- the failure this guards against is a summary that
+// counts relocated tokens the runtime then re-prefills, which under-projects the work and reports
+// reuse that never happened.
+[[nodiscard]] bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
+                                            std::span<const PrefillRange> ranges,
+                                            std::uint32_t prefix_reuse_tokens,
+                                            std::uint32_t prompt_tokens);
 
 // Detect the spans of `previous` that survive in `current`.
 //
