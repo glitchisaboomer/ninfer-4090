@@ -1,5 +1,7 @@
 #include "serve/anthropic_schema.h"
 
+#include "serve/openai_schema.h"
+
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -509,6 +511,17 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     parse_sampling(body, out);
     parse_thinking(body, out);
     parse_output_config(body, out);
+    // The OpenAI spelling of the same switch, accepted here as an alias for the reason the top-level
+    // `preserve_thinking` alias below is: a client that measures its prompt on one endpoint and
+    // generates on the other must not have the two disagree about which prompt it is. Without this,
+    // `reasoning_effort: "none"` renders with thinking ON on /v1/messages and /v1/messages/
+    // count_tokens while /v1/chat/completions renders it OFF, so a count taken here is the length of
+    // a prompt the completion will never build -- which is exactly how a 40-token gap made the
+    // Suffix Cache Reuse end-to-end check align its surviving tail off the engine's token grid.
+    // A contradictory pair (`thinking.type == "disabled"` plus an effort that enables thinking, or
+    // the reverse) is rejected in resolve_prompt_semantics, which owns that conflict for both
+    // protocols.
+    parse_openai_reasoning_effort(body, out);
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
         if (!body.at("preserve_thinking").is_boolean()) {
             bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");

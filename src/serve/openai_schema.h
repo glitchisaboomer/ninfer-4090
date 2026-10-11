@@ -25,6 +25,13 @@ GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
 
 std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
 
+// Parse the top-level `reasoning_effort` field (base URL spelling: none, minimal, low, medium,
+// high, xhigh, max) into `out.reasoning_effort` / `out.reasoning_effort_param`. Exposed rather
+// than file-local because the Anthropic layer accepts it as an alias: see the call site in
+// `parse_messages_request`. One parser for one field, so the two protocols cannot drift on what
+// the same value means.
+void parse_openai_reasoning_effort(const nlohmann::json& body, GenerationRequest& out);
+
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
 // convention consumed by Chatbox, Open WebUI, etc.), leaving `content` = answer.

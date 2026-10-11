@@ -6,6 +6,7 @@
 // consumed by Claude Code / other Anthropic clients.
 
 #include "serve/anthropic_schema.h"
+#include "serve/openai_schema.h"
 #include "serve/request.h"
 #include "serve/translate.h"
 
@@ -518,6 +519,61 @@ int test_reasoning_effort() {
     invalid["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
                       "unsupported Anthropic output_config option was ignored");
+
+    // The OpenAI spelling of the same switch is accepted as an alias, so a client that measures its
+    // prompt on one endpoint and generates on the other sees one prompt and not two. Without it,
+    // `reasoning_effort: "none"` rendered with thinking ON here while /v1/chat/completions rendered
+    // it OFF, and the two protocols disagreed about the prompt by the length of the reasoning
+    // instruction block -- which is what put the Suffix Cache Reuse end-to-end check's surviving
+    // tail off the engine's 64-token grid.
+    Json off                = base;
+    off["reasoning_effort"] = "none";
+
+    const GenerationRequest anthropic_off = parse_messages_request(off, default_limits());
+    failures += check(anthropic_off.reasoning_effort == RequestedReasoningEffort::None,
+                      "Anthropic did not accept the reasoning_effort alias");
+    failures += check(!resolve_prompt_semantics(anthropic_off, default_server(),
+                                                effort_capabilities())
+                           .enable_thinking,
+                      "reasoning_effort=none did not disable thinking on the Anthropic path");
+
+    Json on                = base;
+    on["reasoning_effort"] = "low";
+
+    const GenerationRequest anthropic_low = parse_messages_request(on, default_limits());
+    failures += check(resolve_prompt_semantics(anthropic_low, default_server(),
+                                               effort_capabilities())
+                              .enable_thinking &&
+                          anthropic_low.reasoning_effort == RequestedReasoningEffort::Low,
+                      "the reasoning_effort alias did not map an enabling value");
+
+    // Parity is the property that matters, so it is asserted directly against the OpenAI parser
+    // rather than against a table of expected values that could drift from it.
+    const GenerationRequest openai_off = parse_chat_completion_request(off, default_limits());
+    const ResolvedPromptSemantics openai_parity =
+        resolve_prompt_semantics(openai_off, default_server(), effort_capabilities());
+    const ResolvedPromptSemantics anthropic_parity =
+        resolve_prompt_semantics(anthropic_off, default_server(), effort_capabilities());
+    failures += check(openai_parity.enable_thinking == anthropic_parity.enable_thinking &&
+                          openai_parity.reasoning_effort == anthropic_parity.reasoning_effort,
+                      "the same body resolved differently on /v1/messages and "
+                      "/v1/chat/completions");
+
+    Json bogus                = base;
+    bogus["reasoning_effort"] = "bogus";
+    failures += check(throws_api([&] { (void)parse_messages_request(bogus, default_limits()); }),
+                      "Anthropic accepted an unknown reasoning_effort value");
+
+    Json mixed                = base;
+    mixed["reasoning_effort"] = "low";
+    mixed["thinking"]         = Json{{"type", "disabled"}};
+
+    const GenerationRequest alias_conflicting = parse_messages_request(mixed, default_limits());
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(alias_conflicting, default_server(),
+                                                         effort_capabilities());
+                      }) == "conflicting_template_option",
+                      "the reasoning_effort alias silently overrode thinking.type=disabled");
     return failures;
 }
 
