@@ -1143,9 +1143,15 @@ private:
             throw std::logic_error("decode batch returned an invalid ragged layout");
         }
         // Logprobs are optional, but when present they must cover exactly the licensed tokens, or
-        // the two delivered vectors would describe different tokens.
+        // the two delivered vectors would describe different tokens. Margins are checked the same
+        // way: a margins array of a different length would desynchronise the per-token record from
+        // its tokens, and the only place that mismatch was ever caught was the log parser, four
+        // phases into a quality run.
         if (!round.logprobs.empty() && round.logprobs.size() != round.tokens.size()) {
             throw std::logic_error("decode batch logprobs do not match its licensed tokens");
+        }
+        if (!round.margins.empty() && round.margins.size() != round.tokens.size()) {
+            throw std::logic_error("decode batch margins do not match its licensed tokens");
         }
 
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
@@ -1195,9 +1201,6 @@ private:
                     request->generated_logprobs.insert(
                         request->generated_logprobs.end(), accepted[row],
                         std::numeric_limits<float>::quiet_NaN());
-                    request->generated_margins.insert(
-                        request->generated_margins.end(), accepted[row],
-                        std::numeric_limits<float>::quiet_NaN());
                 } else {
                     const auto row_logprobs =
                         round.logprobs.subspan(row * round.row_stride,
@@ -1205,6 +1208,13 @@ private:
                     request->generated_logprobs.insert(request->generated_logprobs.end(),
                                                        row_logprobs.begin(), row_logprobs.end());
                 }
+                // Margins are appended here and only here. An earlier revision also appended them
+                // inside the logprobs-empty branch above, which doubled the array whenever a round
+                // carried no logprobs -- exactly the MTP/DFlash shape, whose licensed tokens emit no
+                // logprob. The request log then held 2N-1 margins for N tokens, the quality harness
+                // refused to parse it, and an MTP quality run died after all its phases on a length
+                // mismatch that read like a crash. The two blocks stay separate on purpose: a round
+                // may measure a logprob and no margin, or the reverse.
                 if (round.margins.empty()) {
                     request->generated_margins.insert(request->generated_margins.end(), accepted[row],
                                                       std::numeric_limits<float>::quiet_NaN());
