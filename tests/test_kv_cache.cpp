@@ -8,6 +8,7 @@
 #include <iostream>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -598,6 +599,37 @@ int main() {
     failures += expect_size(bundle[0].page_entitlement(), 2, "failed resize main entitlement");
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");
     failures += expect_size(bundle[1].page_entitlement(), 2, "failed resize backend entitlement");
+
+    // A Suffix Cache Reuse plan asks for an entitlement below the lane's current mapping, because a
+    // shrinking edit makes the new prompt smaller while the resident pages above the frontier stay
+    // mapped until the page remap publishes. The runtime does not pass that figure through: it asks
+    // for `max(requested, mapped)`. That substitution is only sound if the unclamped request is
+    // refused *before* anything mutates, so this pins both halves -- the refusal and its atomicity,
+    // then the acceptance of the clamped form.
+    const ninfer::PagedKVResize shrink_below_mapping[] = {
+        {.allocation       = &bundle[0],
+         .mapped_pages     = bundle[0].mapped_page_count(),
+         .page_entitlement = 1},
+    };
+    bool shrink_refused = false;
+    try {
+        ninfer::resize_paged_kv_bundle(shrink_below_mapping);
+    } catch (const std::invalid_argument&) { shrink_refused = true; }
+    if (!shrink_refused) {
+        ++failures;
+        std::cerr << "A resize to an entitlement below the mapping was accepted\n";
+    }
+    failures += expect_size(bundle[0].mapped_page_count(), 2, "refused shrink left the mapping");
+    failures += expect_size(bundle[0].page_entitlement(), 2, "refused shrink left the entitlement");
+
+    const ninfer::PagedKVResize clamped_shrink[] = {
+        {.allocation       = &bundle[0],
+         .mapped_pages     = bundle[0].mapped_page_count(),
+         .page_entitlement = std::max<std::uint32_t>(1, bundle[0].mapped_page_count())},
+    };
+    ninfer::resize_paged_kv_bundle(clamped_shrink);
+    failures += expect_size(bundle[0].mapped_page_count(), 2, "clamped shrink mapping");
+    failures += expect_size(bundle[0].page_entitlement(), 2, "clamped shrink entitlement");
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

@@ -1455,16 +1455,26 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
     }
     std::array<PagedKVResize, 2> changes{};
     std::size_t count = 0;
-    changes[count++]  = PagedKVResize{
-         .allocation       = &sequence.kv->text,
-         .mapped_pages     = sequence.kv->text.mapped_page_count(),
-         .page_entitlement = text_pages,
+    // An entitlement is a ceiling, and `resize_paged_kv_bundle` refuses to put one below what the
+    // allocation already has mapped. A Suffix Cache Reuse plan legitimately asks for less than the
+    // lane currently holds: the edit *deleted* a region, so the new prompt's entitlement is smaller,
+    // while the pages above the frontier are deliberately left mapped because the surviving run is
+    // remapped out of them. Passing the requested figure straight through made every shrinking edit
+    // fail with "Paged KV resize extents are inconsistent" (a 500) before the remap could run, which
+    // is the one prompt shape the feature exists for. Raising the ceiling to cover what is mapped is
+    // the honest encoding of that state: the relocation returns the surplus through its `reassign`,
+    // and `release_sequence_growth_entitlement` collapses the entitlement onto the mapping at the
+    // end of the request, so nothing is retained past its use.
+    changes[count++] = PagedKVResize{
+        .allocation       = &sequence.kv->text,
+        .mapped_pages     = sequence.kv->text.mapped_page_count(),
+        .page_entitlement = std::max(text_pages, sequence.kv->text.mapped_page_count()),
     };
     if (sequence.kv->backend) {
         changes[count++] = PagedKVResize{
             .allocation       = &*sequence.kv->backend,
             .mapped_pages     = sequence.kv->backend->mapped_page_count(),
-            .page_entitlement = backend_pages,
+            .page_entitlement = std::max(backend_pages, sequence.kv->backend->mapped_page_count()),
         };
     }
     resize_paged_kv_bundle(std::span<PagedKVResize>(changes.data(), count));
