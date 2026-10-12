@@ -289,6 +289,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // contiguous run, so the derivation reproduces exactly the head and tail that mode has
         // always reported; segmented mode may interleave survivors anywhere, which yields one range
         // per gap and is the only structural difference.
+        // A relocation whose source is off the page grid cannot be re-pointed at all, only copied, so
+        // both the selector below and the expressibility rule it is judged by have to know which grid
+        // they are planning against. Off by default: with the flag unset this block is the code it was
+        // before the copying path existed, and the runtime's copied branch stays unreachable.
+        const bool source_may_shift = qwen3_6::detail::scr_source_shift_enabled();
         std::vector<RelocatedSpan> plan_spans;
         if (base.scr_mode == ninfer::ScrRelocationMode::Segmented) {
             plan_spans = qwen3_6::detail::plan_relocations(
@@ -326,6 +331,16 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             }
             if (tail.viable) {
                 plan_spans = tail.spans;
+            } else if (source_may_shift) {
+                // The re-pointing selector declined, and with the copied path enabled that is not the
+                // end of the story: the survivors it dropped for being off the page grid are exactly
+                // what the source-shifting selector keeps, quantizing only their destinations. Asking
+                // it here rather than replacing the call above keeps the aligned plan -- and the
+                // hardware-verified re-pointing path behind it -- byte-identical when it exists.
+                plan_spans = qwen3_6::detail::plan_shifted_relocations(
+                    diff, sequence.text_kv_valid, plan->reuse_base,
+                    static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
+                    base.suffix_reuse_max_spans);
             }
         }
 
@@ -348,8 +363,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // printed whether or not diagnostics are enabled: reaching it means a selector produced
             // spans the runtime cannot execute, which is a programming error rather than a prompt
             // shape, and a silent fallback would hide it while still reporting cold-prefill reuse.
-            if (!qwen3_6::detail::relocation_is_expressible(
-                    plan_spans, plan_ranges, plan->reuse_base, prompt_tokens_count)) {
+            if (!qwen3_6::detail::relocation_is_expressible(plan_spans, plan_ranges, plan->reuse_base,
+                                                            prompt_tokens_count, source_may_shift)) {
                 std::cerr << "[scr] refused an inexpressible relocation plan: spans="
                           << plan_spans.size() << " ranges=" << plan_ranges.size()
                           << " reuse_base=" << plan->reuse_base

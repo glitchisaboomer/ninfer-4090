@@ -749,6 +749,126 @@ void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping,
     if (bound_row_ >= 0) { publish_mapping(stream); }
 }
 
+void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapping,
+                                              std::span<const std::int32_t> deltas,
+                                              std::span<const RelocatedCopySpan> spans,
+                                              cudaStream_t stream) {
+    if (!valid()) { throw std::logic_error("Cannot relocate into an empty Paged KV allocation"); }
+    if (mapping.empty()) {
+        throw std::invalid_argument("Paged KV relocation must map at least one page");
+    }
+    if (mapping.size() > page_entitlement_) {
+        throw std::invalid_argument("Paged KV relocation exceeds the page entitlement");
+    }
+    if (deltas.size() != mapping.size()) {
+        throw std::invalid_argument("Paged KV relocation delta plane does not parallel its mapping");
+    }
+    if (spans.empty()) {
+        throw std::invalid_argument("Paged KV relocation carries no spans to copy");
+    }
+
+    // The mapping as it stands is the copy's source, and it stays valid until the copies have run.
+    const std::vector<std::int32_t> sources(page_ids_.begin(), page_ids_.end());
+    if (mapping.size() != sources.size()) {
+        throw std::invalid_argument("Paged KV relocation does not resize its mapping");
+    }
+
+    // The moves, then the pages they read. Both are pure arithmetic over page ids -- in
+    // `core/paged_kv_delta_layout.h`, so they are testable without a GPU -- and both refuse a span that
+    // does not fit the mapping, which is what keeps a half-copied relocation from being published.
+    const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(spans, sources.size());
+    std::vector<std::int32_t> protected_pages;
+    protected_pages.reserve(moves.size());
+    for (const RelocatedPageMove& move : moves) {
+        protected_pages.push_back(sources[static_cast<std::size_t>(move.source_page)]);
+    }
+
+    // The substitution `reassign_pages` performs, with the one difference that a page the copies read
+    // is never a destination. That path is hardware-verified and keeps its own copy of the arithmetic;
+    // this is the same transition with the sources held out of the reuse.
+    const RelocatedPageSubstitution substitution =
+        plan_relocated_page_substitution(sources, mapping, protected_pages);
+    if (substitution.from_pool > pool_->free_pages()) { throw std::bad_alloc(); }
+
+    // Acquire before releasing anything, as `reassign_pages` does: once the pool has answered, no later
+    // step can fail, so the pool never observes a page that is both still owned here and already free.
+    std::vector<std::int32_t> acquired;
+    if (substitution.from_pool != 0) {
+        const std::int32_t preferred =
+            page_ids_.empty() ? -1 : static_cast<std::int32_t>(page_ids_.back() + 1);
+        acquired = pool_->take_pages(substitution.from_pool, preferred);
+    }
+
+    std::vector<std::int32_t> final_ids = substitution.final_ids;
+    std::size_t pooled_slot = 0;
+    for (std::int32_t& page : final_ids) {
+        if (page != kPagedKVAquirePage) { continue; }
+        page = acquired[pooled_slot++];
+    }
+    if (pooled_slot != acquired.size()) {
+        // Unreachable: `from_pool` is exactly the number of acquire slots the substitution left, which
+        // is the count this loop filled. Hand the pages back rather than leak them if that stops
+        // holding.
+        if (!acquired.empty()) { pool_->return_pages(acquired); }
+        throw std::logic_error("Paged KV relocation acquired more pages than it mapped");
+    }
+
+    // The copies. A destination page's payload is contiguous per head and the head pitch is the same
+    // on both sides, so the tokens a move carries are one 2-D copy per plane: `width` is the byte span
+    // of those tokens, `height` the head count, and the pitch the head's stride. Two moves per
+    // destination page where the source page boundary falls inside it, one where it does not.
+    const bool page_major = pool_->spec_.plane_order == PagedKVPlaneOrder::PageMajor;
+    for (std::size_t plane_index = 0; plane_index < pool_->plane_count(); ++plane_index) {
+        const Tensor& plane = pool_->plane(plane_index);
+        if (plane.ne[1] != kPagedKVPageSize || plane.ne[0] <= 0) {
+            throw std::logic_error("a KV plane is not paged over its token dimension");
+        }
+        // The strides are read from the plane rather than derived, because the two plane orders put
+        // the page on opposite ends of the shape: `plan_paged_kv_pool` builds
+        // {leading, page, heads, pages} or {leading, page, pages, heads}, and a hand-derived page
+        // stride is right for exactly one of them. A dense leading dimension is required -- without it
+        // a token is not a contiguous run and a move is not a 2-D strided copy.
+        if (plane.nb[0] != static_cast<std::int64_t>(dtype_size(plane.dtype)) || plane.nb[1] <= 0) {
+            throw std::logic_error("a KV plane's leading dimension is not dense");
+        }
+        const std::size_t token_bytes = static_cast<std::size_t>(plane.nb[1]);
+        const std::size_t heads       = static_cast<std::size_t>(page_major ? plane.ne[2] : plane.ne[3]);
+        const std::size_t head_stride = static_cast<std::size_t>(page_major ? plane.nb[2] : plane.nb[3]);
+        const std::size_t page_stride = static_cast<std::size_t>(page_major ? plane.nb[3] : plane.nb[2]);
+        if (heads == 0 || head_stride == 0 || page_stride == 0) {
+            throw std::logic_error("a KV plane's page or head stride is empty");
+        }
+        auto* base = static_cast<std::uint8_t*>(plane.data);
+
+        for (const RelocatedPageMove& move : moves) {
+            const auto* source =
+                base +
+                static_cast<std::size_t>(sources[static_cast<std::size_t>(move.source_page)]) *
+                    page_stride +
+                static_cast<std::size_t>(move.source_token) * token_bytes;
+            auto* dest =
+                base +
+                static_cast<std::size_t>(final_ids[static_cast<std::size_t>(move.dest_page)]) *
+                    page_stride +
+                static_cast<std::size_t>(move.dest_token) * token_bytes;
+            CUDA_CHECK(cudaMemcpy2DAsync(dest, head_stride, source, head_stride,
+                                         static_cast<std::size_t>(move.tokens) * token_bytes, heads,
+                                         cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    // Hold the sources until their content has been read. The pool is shared and another lane takes a
+    // released page on its own stream, with nothing ordering against these copies, so releasing first
+    // would let a prefill overwrite a page mid-copy. The drain costs the copy and nothing else.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (!substitution.held_for_copy.empty()) { pool_->return_pages(substitution.held_for_copy); }
+
+    page_ids_ = std::move(final_ids);
+    rope_deltas_.assign(deltas.begin(), deltas.end());
+    if (bound_row_ >= 0) { publish_mapping(stream); }
+}
+
 void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping,
                                        cudaStream_t stream) {
     // Temporary shim for the pre-Step-3 caller in program_impl.h, which rerotates the K plane

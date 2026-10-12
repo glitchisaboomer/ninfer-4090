@@ -798,11 +798,36 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
                 const std::uint32_t prompt_tokens =
                     static_cast<std::uint32_t>(prompt.token_ids.size());
-                const std::vector<std::int32_t> remap = qwen3_6::detail::plan_page_remap(
+                std::vector<std::int32_t> remap = qwen3_6::detail::plan_page_remap(
                     sequence.kv->text.page_ids(), request_plan.relocated_spans, base, prompt_tokens);
+                // The re-pointing path could not express this plan, which is what an off-grid source
+                // looks like: no destination page boundary lines up with a source page boundary, so
+                // a re-pointed page would hold the wrong tokens and the content has to be written
+                // into a fresh page instead. `plan_copied_page_remap` is the same mapping with every
+                // destination page left to acquire, and `relocate_copied_pages` moves the payload.
+                //
+                // Gated rather than automatic, because the copy has to be paid for out of the pool:
+                // the re-pointing path reuses the pages the prompt drops, while this one needs free
+                // pages for destinations whose sources are still mapped. With the flag unset nothing
+                // here runs and this branch's behaviour is what it was before it existed.
+                std::vector<RelocatedCopySpan> copy_spans;
+                if (remap.empty() && qwen3_6::detail::scr_source_shift_enabled()) {
+                    remap = qwen3_6::detail::plan_copied_page_remap(
+                        sequence.kv->text.page_ids(), request_plan.relocated_spans, base, prompt_tokens);
+                    if (!remap.empty()) {
+                        copy_spans.reserve(request_plan.relocated_spans.size());
+                        for (const qwen3_6::detail::RelocatedSpan& span :
+                             request_plan.relocated_spans) {
+                            copy_spans.push_back(RelocatedCopySpan{.source_begin = span.source_begin,
+                                                                   .dest_begin   = span.dest_begin,
+                                                                   .tokens       = span.tokens});
+                        }
+                    }
+                }
                 if (remap.empty()) {
                     throw std::logic_error("suffix relocation has no expressible page remap");
                 }
+                const bool copying = !copy_spans.empty();
                 scr_remap = remap;
                 // The delta plane is parallel to `remap`: one int32 per logical page of the new
                 // prompt, holding that page's RoPE shift or kRopeDeltaNone. It is published in the
@@ -813,26 +838,50 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // CUDA-free header; re-deriving the same subtraction here would let the two drift,
                 // and the drift would surface as a silently wrong shift rather than as a failure.
                 std::vector<std::int32_t> deltas(remap.size(), kRopeDeltaNone);
-                for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
-                    // Spans are page-aligned by construction: `diff_prompt_edit` hashes whole
-                    // 64-token blocks and `plan_tail_relocation` trims back to whole blocks. Assert
-                    // it rather than trust it, because a misaligned span would produce a page whose
-                    // delta covers half its content, and that would rotate the wrong half silently.
-                    if (!relocated_span_is_page_aligned(span.source_begin, span.tokens) ||
-                        !relocated_span_is_page_aligned(span.dest_begin, span.tokens)) {
-                        throw std::logic_error("relocated span is not page-aligned");
-                    }
-                    for (std::uint32_t offset = 0; offset < span.tokens; offset += kPagedKVPageSize) {
-                        const std::int32_t source_page = static_cast<std::int32_t>(
-                            (span.source_begin + offset) / kPagedKVPageSize);
-                        const std::int32_t dest_page = static_cast<std::int32_t>(
-                            (span.dest_begin + offset) / kPagedKVPageSize);
-                        if (dest_page < 0 || static_cast<std::size_t>(dest_page) >= deltas.size()) {
-                            throw std::logic_error(
-                                "relocated span destination page is outside the mapping");
+                if (copying) {
+                    // Destination coordinates, because the plane is indexed by logical page and a
+                    // copied source may start anywhere inside one: a page is inside the span when its
+                    // *destination* range says so. The shift is the same number either way -- it is
+                    // the span's own move -- but a source page index would name the wrong tokens, and
+                    // `rope_delta_for_dest_page` is the containment test on the grid that exists.
+                    for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
+                        for (std::uint32_t offset = 0; offset < span.tokens;
+                             offset += kPagedKVPageSize) {
+                            const std::int32_t dest_page = static_cast<std::int32_t>(
+                                (span.dest_begin + offset) / kPagedKVPageSize);
+                            if (dest_page < 0 ||
+                                static_cast<std::size_t>(dest_page) >= deltas.size()) {
+                                throw std::logic_error(
+                                    "relocated span destination page is outside the mapping");
+                            }
+                            deltas[static_cast<std::size_t>(dest_page)] = rope_delta_for_dest_page(
+                                span.source_begin, span.dest_begin, span.tokens, dest_page);
                         }
-                        deltas[static_cast<std::size_t>(dest_page)] =
-                            rope_delta_for_span(span.source_begin, span.tokens, span.dest_begin, source_page);
+                    }
+                } else {
+                    for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
+                        // Spans are page-aligned by construction: `diff_prompt_edit` hashes whole
+                        // 64-token blocks and `plan_tail_relocation` trims back to whole blocks. Assert
+                        // it rather than trust it, because a misaligned span would produce a page whose
+                        // delta covers half its content, and that would rotate the wrong half silently.
+                        if (!relocated_span_is_page_aligned(span.source_begin, span.tokens) ||
+                            !relocated_span_is_page_aligned(span.dest_begin, span.tokens)) {
+                            throw std::logic_error("relocated span is not page-aligned");
+                        }
+                        for (std::uint32_t offset = 0; offset < span.tokens;
+                             offset += kPagedKVPageSize) {
+                            const std::int32_t source_page = static_cast<std::int32_t>(
+                                (span.source_begin + offset) / kPagedKVPageSize);
+                            const std::int32_t dest_page = static_cast<std::int32_t>(
+                                (span.dest_begin + offset) / kPagedKVPageSize);
+                            if (dest_page < 0 ||
+                                static_cast<std::size_t>(dest_page) >= deltas.size()) {
+                                throw std::logic_error(
+                                    "relocated span destination page is outside the mapping");
+                            }
+                            deltas[static_cast<std::size_t>(dest_page)] = rope_delta_for_span(
+                                span.source_begin, span.tokens, span.dest_begin, source_page);
+                        }
                     }
                 }
                 // The speculative backend is a second, independent allocation in its own pool: the MTP
@@ -847,9 +896,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // a failure.
                 std::vector<std::int32_t> backend_remap;
                 if (speculative_backend == SpeculativeBackend::Mtp && sequence.kv->backend) {
-                    backend_remap = qwen3_6::detail::plan_page_remap(
-                        sequence.kv->backend->page_ids(), request_plan.relocated_spans, base,
-                        prompt_tokens);
+                    backend_remap = copying
+                                        ? qwen3_6::detail::plan_copied_page_remap(
+                                              sequence.kv->backend->page_ids(),
+                                              request_plan.relocated_spans, base, prompt_tokens)
+                                        : qwen3_6::detail::plan_page_remap(
+                                              sequence.kv->backend->page_ids(),
+                                              request_plan.relocated_spans, base, prompt_tokens);
                     if (backend_remap.size() != remap.size()) {
                         throw std::logic_error(
                             "the MTP KV relocation does not cover the Text relocation's pages");
@@ -864,8 +917,35 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // allocation's own arithmetic (`remap_pages_from_pool`). This narrows the window to
                 // a concurrent pool mutation between the check and the publish; closing it needs one
                 // transaction across both allocations, which core does not offer.
+                // The logical pages of the *current* mapping the copies read, which is what the price
+                // has to keep out of the destination slots. Built once so both pools are priced
+                // against the same set: the Text and MTP pools number their pages independently, and
+                // a price computed from one allocation's table would be wrong for the other.
+                //
+                // Derived from the moves the copier will issue rather than re-derived from the
+                // spans. A span reaching `source_begin + tokens` touches the page that holds its last
+                // token, which a loop stepping by whole pages from the source's first page does not
+                // visit when the span does not end on a page boundary -- and an off-grid span never
+                // does. That is a price one page short of the copy's demand, which the allocation's
+                // own check then refuses after the plan was reported as reuse.
+                std::vector<std::uint32_t> relocation_source_pages;
+                if (copying) {
+                    const std::vector<RelocatedPageMove> moves =
+                        plan_relocated_page_moves(copy_spans, remap.size());
+                    relocation_source_pages.reserve(moves.size());
+                    for (const RelocatedPageMove& move : moves) {
+                        relocation_source_pages.push_back(
+                            static_cast<std::uint32_t>(move.source_page));
+                    }
+                    std::sort(relocation_source_pages.begin(), relocation_source_pages.end());
+                    relocation_source_pages.erase(
+                        std::unique(relocation_source_pages.begin(), relocation_source_pages.end()),
+                        relocation_source_pages.end());
+                }
                 const std::uint32_t text_from_pool =
-                    qwen3_6::detail::remap_pages_from_pool(sequence.kv->text.page_ids(), remap);
+                    copying ? qwen3_6::detail::shifted_relocation_pages_from_pool(
+                                  sequence.kv->text.page_ids(), remap, relocation_source_pages)
+                            : qwen3_6::detail::remap_pages_from_pool(sequence.kv->text.page_ids(), remap);
                 if (text_from_pool > decoder->text_kv.pool().free_pages()) {
                     throw std::logic_error(
                         "suffix relocation cannot afford the pages its Text mapping acquires");
@@ -873,17 +953,32 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 if (!backend_remap.empty()) {
                     const qwen3_6::PagedKVCache* backend_cache = backend_kv_cache();
                     const std::uint32_t backend_from_pool =
-                        qwen3_6::detail::remap_pages_from_pool(sequence.kv->backend->page_ids(),
-                                                               backend_remap);
+                        copying ? qwen3_6::detail::shifted_relocation_pages_from_pool(
+                                      sequence.kv->backend->page_ids(), backend_remap,
+                                      relocation_source_pages)
+                                : qwen3_6::detail::remap_pages_from_pool(
+                                      sequence.kv->backend->page_ids(), backend_remap);
                     if (backend_cache == nullptr ||
                         backend_from_pool > backend_cache->pool().free_pages()) {
                         throw std::logic_error(
                             "suffix relocation cannot afford the pages its MTP mapping acquires");
                     }
                 }
-                sequence.kv->text.reassign_pages(remap, deltas, device.stream);
-                if (!backend_remap.empty()) {
-                    sequence.kv->backend->reassign_pages(backend_remap, deltas, device.stream);
+                if (copying) {
+                    // The copies run here, before either mapping is published, and both are published
+                    // in the same pass as before. `relocate_copied_pages` drains the stream before it
+                    // releases the pages it read, so a page handed to the pool is not still being
+                    // copied from when another lane's prefill takes it.
+                    sequence.kv->text.relocate_copied_pages(remap, deltas, copy_spans, device.stream);
+                    if (!backend_remap.empty()) {
+                        sequence.kv->backend->relocate_copied_pages(backend_remap, deltas, copy_spans,
+                                                                    device.stream);
+                    }
+                } else {
+                    sequence.kv->text.reassign_pages(remap, deltas, device.stream);
+                    if (!backend_remap.empty()) {
+                        sequence.kv->backend->reassign_pages(backend_remap, deltas, device.stream);
+                    }
                 }
                 suffix_prefill_ranges.clear();
                 // Diagnostic only: fingerprint the GDN slot across the invalidation below so the
