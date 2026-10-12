@@ -444,3 +444,234 @@ def test_scr_flags_append_the_cap_after_the_mode() -> None:
 
     Args.scr_max_spans = None
     assert scr_e2e_check.scr_flags(Args()) == ["--scr", "--scr-mode", "segmented"]
+
+
+# ---------------------------------------------------------------------------------------------
+# What it would take to stop requiring the *source* to be page aligned
+#
+# Shipped relocation re-points a destination page at the source page that already holds its content,
+# so both ends have to sit on the 64-token grid -- and `diff_prompt_edit` can only match whole
+# blocks, so an edit whose token delta is not a multiple of 64 leaves the detector *nothing* to
+# match after the edit. The pair below is a port of a proposed design: a token-level detector, and a
+# selector that quantizes only the destination. Everything in this section is a port, held beside
+# the shipped ports above so the difference between the two is one screen apart.
+# ---------------------------------------------------------------------------------------------
+ANCHOR_TOKENS = 16
+PROBE_CAP = 8  # detail::kMaxCandidateProbes
+
+
+def survivor_runs(previous_tokens, current_tokens, anchor=ANCHOR_TOKENS, probes=PROBE_CAP):
+    """Find maximal identical runs at *any* offset, not only on the 64-token grid.
+
+    A whole-block index can only match content that sits on the same grid in both prompts, which is
+    why a shift that is not a multiple of the block size leaves nothing to match. Anchoring on a
+    short n-gram taken at every offset removes that requirement; each run is then grown to its true
+    boundaries and confirmed by exact comparison, so a hash collision can only lose a match, never
+    invent one. Monotone and disjoint in both prompts, like the shipped walk.
+    """
+    if anchor <= 0 or len(previous_tokens) < anchor:
+        return []
+    index = {}
+    for offset in range(len(previous_tokens) - anchor + 1):
+        index.setdefault(tuple(previous_tokens[offset:offset + anchor]), []).append(offset)
+
+    runs = []
+    old_cursor = 0  # no run reuses an earlier token, which keeps the runs disjoint
+    new_cursor = 0
+    index_new = 0
+    while index_new <= len(current_tokens) - anchor:
+        found = index.get(tuple(current_tokens[index_new:index_new + anchor]))
+        if found is None:
+            index_new += 1
+            continue
+        matched = False
+        for probed, old_begin in enumerate(found):
+            if probed == probes:
+                break
+            if old_begin < old_cursor:
+                continue
+            right = anchor
+            while (old_begin + right < len(previous_tokens) and
+                   index_new + right < len(current_tokens) and
+                   previous_tokens[old_begin + right] == current_tokens[index_new + right]):
+                right += 1
+            left = 0
+            while (index_new - left - 1 >= new_cursor and old_begin - left - 1 >= old_cursor and
+                   previous_tokens[old_begin - left - 1] == current_tokens[index_new - left - 1]):
+                left += 1
+            begin_old, begin_new = old_begin - left, index_new - left
+            length = left + right
+            runs.append((begin_old, begin_new, length))
+            old_cursor = begin_old + length
+            new_cursor = begin_new + length
+            index_new = new_cursor
+            matched = True
+            break
+        if not matched:
+            index_new += 1
+    return runs
+
+
+def relocate_whole_pages(runs, resident_tokens, limit, page=BLOCK):
+    """Quantize each run's *destination* to whole pages, and leave the source where it is.
+
+    Only the destination has to be page granular: a page is what the allocation, the accounting and
+    the per-page RoPE delta are expressed in, and a page holding both relocated and prefilled
+    tokens could carry no single delta. The source is free to start mid-page, which is exactly the
+    freedom a shifted edit needs; the price is that its payload has to be copied rather than
+    re-pointed. Returns `(source_begin, dest_begin, tokens)` -- `dest_begin` and `tokens` are whole
+    pages, `source_begin` deliberately is not.
+    """
+    out = []
+    for old_begin, new_begin, tokens in runs:
+        if old_begin == 0 and new_begin == 0:
+            continue  # the leading run is ordinary prefix reuse
+        if old_begin + tokens > resident_tokens or tokens == 0:
+            continue
+        dest_begin = -(-new_begin // page) * page  # the first whole destination page in the run
+        room = min(new_begin + tokens, limit) - dest_begin
+        if room < page:
+            continue  # no whole page survives: nothing this run can relocate
+        dest_end = dest_begin + (room // page) * page
+        out.append((old_begin + (dest_begin - new_begin), dest_begin, dest_end - dest_begin))
+    return sorted(out, key=lambda span: span[1])
+
+
+def shift_scenario(delta, head=200, run_tokens=320, tail=64):
+    """`delta` tokens inserted above an otherwise identical run: the shape every real edit has."""
+    head_tokens = list(range(head))
+    survivors = list(range(1000, 1000 + run_tokens))
+    previous = head_tokens + survivors + list(range(2000, 2000 + tail))
+    current = (head_tokens + [77770 + i for i in range(delta)] + survivors +
+               list(range(3000, 3000 + tail)))
+    return previous, current
+
+
+def relocated_tokens(selected):
+    return sum(span[-1] for span in selected)
+
+
+def test_a_three_token_edit_leaves_the_shipped_detector_nothing_to_match() -> None:
+    """The cliff the alignment requirement puts under every realistically typed edit."""
+    previous, current = shift_scenario(5)
+    shipped = select_segmented(surviving_spans(previous, current), len(previous),
+                               len(current) - 1, 6)
+    assert shipped == [], \
+        "nothing on the 64-grid survives a 5-token edit, so there is nothing to re-point"
+
+    proposed = relocate_whole_pages(survivor_runs(previous, current), len(previous),
+                                    len(current) - 1)
+    assert len(proposed) == 1, f"the token-level detector finds the run: {proposed}"
+    source, dest, tokens = proposed[0]
+    assert source % BLOCK != 0, "the source is deliberately off-grid; that is the whole point"
+    assert dest % BLOCK == 0 and tokens % BLOCK == 0 and tokens >= BLOCK
+    assert tokens >= 320 - (BLOCK - 1) - (BLOCK - 1), \
+        f"only the two edge pages are lost, got {tokens}"
+
+
+def test_the_aligned_case_still_re_points_the_page_and_copies_nothing() -> None:
+    """A delta that is a multiple of the page size must stay on the existing fast path: the
+    destination already names a page that holds the content, so the new scheme is a superset."""
+    previous, current = shift_scenario(128, head=192)
+    shipped = select_segmented(surviving_spans(previous, current), len(previous),
+                               len(current) - 1, 6)
+    proposed = relocate_whole_pages(survivor_runs(previous, current), len(previous),
+                                    len(current) - 1)
+    assert [(dest, tokens) for _source, dest, tokens in proposed] == shipped
+    assert proposed[0][0] % BLOCK == 0, "an aligned edit needs no copy: source is on the grid too"
+    assert relocated_tokens(shipped) == 320
+
+
+def test_every_shift_relocates_all_but_the_two_edge_pages() -> None:
+    """The measurement the change is for: coverage over the whole shift space, shipped vs proposed."""
+    shipped_total = 0
+    proposed_totals = []
+    for delta in range(1, BLOCK):
+        previous, current = shift_scenario(delta)
+        shipped = select_segmented(surviving_spans(previous, current), len(previous),
+                                   len(current) - 1, 6)
+        proposed = relocate_whole_pages(survivor_runs(previous, current), len(previous),
+                                        len(current) - 1)
+        shipped_total += relocated_tokens(shipped)
+        proposed_totals.append(relocated_tokens(proposed))
+        # One span either way, and the token-level detector is the only one that finds it.
+        assert len(proposed) == 1, f"delta={delta}: {proposed}"
+        assert min(proposed_totals) >= 320 - 126, f"delta={delta} lost more than the edge pages"
+        assert max(proposed_totals) <= 320
+    assert shipped_total == 0, "the shipped detector relocates nothing for any of these edits"
+    mean = sum(proposed_totals) / len(proposed_totals)
+    print(f"shift 1..{BLOCK - 1}: shipped relocates 0 tokens; proposed mean {mean:.1f} of 320")
+    assert mean >= 250, f"a mean of {mean:.1f} of 320 is not the edge-page-only loss"
+
+
+def test_the_proposed_spans_still_tile_the_suffix() -> None:
+    """The planner's contract has to survive the change: prefilled or relocated, never both."""
+    previous, current = shift_scenario(5)
+    proposed = relocate_whole_pages(survivor_runs(previous, current), len(previous),
+                                    len(current) - 1)
+    ranges = prefilled_ranges([(dest, tokens) for _s, dest, tokens in proposed], len(current))
+    tiled = sum(end - begin for begin, end in ranges) + relocated_tokens(proposed)
+    assert tiled == len(current), f"{tiled} != {len(current)}: {ranges} + {proposed}"
+    assert ranges[0][0] == 0, "an in-the-middle edit reuses no prefix, so the head is prefilled"
+
+
+def test_destination_quantization_costs_only_the_two_edge_pages() -> None:
+    """The residual cost of keeping the *destination* on the page grid, over every shift.
+
+    A copy can write anywhere, so the destination is the only end that has to stay aligned -- and it
+    is not a copy constraint: a page carries exactly one RoPE delta, so a page holding both relocated
+    and prefilled tokens could carry no single shift. The price is a page at each end of a run, which
+    is the same fringe the shipped path already trims on an *aligned* edit: the source-side
+    relaxation neither adds nor removes it. Measuring it says where the remaining loss sits: for the
+    runs that matter it is a few percent, and only a run shorter than about two pages can still
+    relocate nothing.
+    """
+    def mean_fraction(run_tokens):
+        totals = []
+        for delta in range(BLOCK):
+            previous, current = shift_scenario(delta, run_tokens=run_tokens)
+            spans = relocate_whole_pages(survivor_runs(previous, current), len(previous),
+                                         len(current) - 1)
+            totals.append(relocated_tokens(spans))
+            assert max(totals) <= run_tokens, "a span cannot relocate more than the run holds"
+        return sum(totals) / len(totals) / run_tokens
+
+    one_page = mean_fraction(64)
+    two_pages = mean_fraction(128)
+    long_run = mean_fraction(4096)
+    print(f"mean relocated fraction over every shift: 64->{one_page:.2f} 128->{two_pages:.2f} "
+          f"4096->{long_run:.2f}")
+    assert one_page < 0.1, "a one-page run has almost nowhere to land"
+    assert two_pages >= 0.45, "a two-page run keeps about one page"
+    assert long_run >= 0.95, "a long run loses only its two edge pages"
+
+
+def test_a_page_of_a_relocated_span_needs_at_most_two_copies_and_one_delta() -> None:
+    """Why the source is free: a page's content comes from one contiguous source range, so it is at
+    most two device copies, and every token it holds shares one shift -- which is what lets the
+    per-page RoPE delta plane stay exactly as it is."""
+    previous, current = shift_scenario(5)
+    source, dest, tokens = relocate_whole_pages(survivor_runs(previous, current), len(previous),
+                                                len(current) - 1)[0]
+    shift = dest - source
+    pages = {}
+    for offset in range(0, tokens, BLOCK):
+        src, remaining = source + offset, BLOCK
+        segments = []
+        while remaining:
+            src_page, src_offset = divmod(src, BLOCK)
+            take = min(remaining, BLOCK - src_offset)
+            dst = dest + offset + (BLOCK - remaining)
+            # Every segment shifts by the span's own shift: one delta covers the whole page.
+            assert (dst // BLOCK) * BLOCK + dst % BLOCK - (src_page * BLOCK + src_offset) == shift
+            segments.append((src_page, src_offset, (dst - shift) % BLOCK, take))
+            src += take
+            remaining -= take
+        pages[dest + offset] = segments
+
+    assert set(pages) == set(range(dest, dest + tokens, BLOCK)), "one entry per destination page"
+    for page, segments in pages.items():
+        assert sum(take for _s, _o, _d, take in segments) == BLOCK, f"page {page} is not filled"
+        assert len(segments) <= 2, f"page {page} needs {len(segments)} copies"
+        for _src_page, src_offset, _dst_offset, take in segments:
+            assert 0 < take <= BLOCK - src_offset, "a segment stays inside its source page"

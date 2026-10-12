@@ -134,6 +134,19 @@ resolve_rope_delta_layout(std::int32_t max_context, std::int32_t table_rows) noe
            tokens % static_cast<std::uint32_t>(kPagedKVPageSize) == 0u;
 }
 
+// Whether a *destination* range is expressible as whole-page deltas. This is the half of the
+// alignment rule that survives when the payload is copied instead of the page table being
+// re-pointed: a page carries exactly one delta, so a page shared by relocated and freshly prefilled
+// tokens could carry none, and the destination has to stay on the grid. The source is deliberately
+// absent from this predicate -- a copied source is a token offset like any other, and its page may
+// hold the head of the run in one physical page and the tail in the next.
+[[nodiscard]] constexpr bool relocated_dest_is_page_aligned(std::uint32_t dest_begin,
+                                                           std::uint32_t tokens) noexcept {
+    if (tokens == 0) { return false; }
+    return dest_begin % static_cast<std::uint32_t>(kPagedKVPageSize) == 0u &&
+           tokens % static_cast<std::uint32_t>(kPagedKVPageSize) == 0u;
+}
+
 // The delta for one logical page of one relocated span, or `kRopeDeltaNone` when the page is not
 // wholly inside the span's source range. Because spans are page-aligned, a page is either entirely
 // inside or entirely outside; the partial case is therefore a boundary error and returns none rather
@@ -152,6 +165,34 @@ resolve_rope_delta_layout(std::int32_t max_context, std::int32_t table_rows) noe
     const std::uint64_t source_first = static_cast<std::uint64_t>(source_begin);
     const std::uint64_t source_last  = source_first + static_cast<std::uint64_t>(source_tokens);
     if (page_first < source_first || page_last > source_last) { return kRopeDeltaNone; }
+
+    const std::int64_t delta =
+        static_cast<std::int64_t>(dest_begin) - static_cast<std::int64_t>(source_begin);
+    if (delta < -0x7fffffffLL || delta > 0x7fffffffLL) { return kRopeDeltaNone; }
+    return static_cast<std::int32_t>(delta);
+}
+
+// The delta for one *destination* logical page of a copied span, or `kRopeDeltaNone` when that page
+// is not wholly inside the span's destination range.
+//
+// The value is the same as `rope_delta_for_span`'s -- the span's own shift, which is uniform over
+// every page it holds, because the destination grid is whole pages and the source is one contiguous
+// run. What changes is the containment test: it has to be in destination coordinates, because that
+// is what the plane is indexed by, and a copied source may start anywhere inside a page (so a
+// source-page test would reject pages that are perfectly expressible).
+[[nodiscard]] constexpr std::int32_t rope_delta_for_dest_page(std::uint32_t source_begin,
+                                                             std::uint32_t dest_begin,
+                                                             std::uint32_t dest_tokens,
+                                                             std::int32_t logical_page) noexcept {
+    if (logical_page < 0) { return kRopeDeltaNone; }
+    const std::uint64_t page_first =
+        static_cast<std::uint64_t>(logical_page) * static_cast<std::uint64_t>(kPagedKVPageSize);
+    const std::uint64_t page_last = page_first + static_cast<std::uint64_t>(kPagedKVPageSize);
+    const std::uint64_t dest_last =
+        static_cast<std::uint64_t>(dest_begin) + static_cast<std::uint64_t>(dest_tokens);
+    if (page_first < static_cast<std::uint64_t>(dest_begin) || page_last > dest_last) {
+        return kRopeDeltaNone;
+    }
 
     const std::int64_t delta =
         static_cast<std::int64_t>(dest_begin) - static_cast<std::int64_t>(source_begin);

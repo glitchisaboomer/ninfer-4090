@@ -980,6 +980,126 @@ void test_determinism() {
     expect(first.reusable_tokens == second.reusable_tokens, "reusable token count is deterministic");
 }
 
+// The source-shifting path. Whole-block detection can only match content that sits on the same
+// 64-token grid in both prompts, so a run shifted by a count the page cannot express is invisible to
+// it -- which is the shape of nearly every edit a user types. These pin the two halves that fix it:
+// a detector that anchors at every offset, and a selector that quantizes only the destination, since
+// a page carries one RoPE delta and the destination is the end that has to stay whole pages.
+Tokens varied(std::int32_t label, std::uint32_t blocks) {
+    // Unique per (block, position), unlike `segment`: a block whose tokens are all equal would still
+    // match after an arbitrary shift, which is exactly the property these tests must not rely on.
+    Tokens out;
+    out.reserve(static_cast<std::size_t>(blocks) * kPromptEditBlockTokens);
+    for (std::uint32_t block = 0; block < blocks; ++block) {
+        for (std::uint32_t i = 0; i < kPromptEditBlockTokens; ++i) {
+            out.push_back(label * 100000 +
+                          static_cast<std::int32_t>(block * kPromptEditBlockTokens + i));
+        }
+    }
+    return out;
+}
+
+Tokens shifted_scenario(Tokens& previous, Tokens& current) {
+    append(previous, varied(1, 3));
+    append(previous, varied(2, 5));
+    append(previous, varied(3, 1));
+    append(current, varied(1, 3));
+    for (std::int32_t junk = 0; junk < 3; ++junk) { current.push_back(-7 - junk); }
+    append(current, varied(2, 5));
+    append(current, varied(4, 1));
+    return previous;
+}
+
+void test_shifted_detector_finds_a_run_off_the_block_grid() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+
+    Tokens previous;
+    Tokens current;
+    shifted_scenario(previous, current);
+
+    const PromptEditDiff aligned = diff_prompt_edit(previous, current);
+    expect(aligned.spans.size() == 1, "a 3-token insert leaves the block-aligned detector one span");
+    if (aligned.spans.size() == 1) {
+        expect(aligned.spans.front().old_begin == 0 && aligned.spans.front().new_begin == 0,
+               "and that span is the leading prefix, which relocation never moves");
+    }
+
+    const PromptEditDiff shifted = diff_prompt_edit_shifted(previous, current);
+    expect(shifted.spans.size() == 2, "the shifted detector finds the prefix and the moved run");
+    if (shifted.spans.size() == 2) {
+        expect(shifted.spans[1].old_begin == block_tokens(3),
+               "the moved run's source is where it was");
+        expect(shifted.spans[1].new_begin == block_tokens(3) + 3,
+               "and its destination moved by the three inserted tokens");
+        expect(shifted.spans[1].tokens == block_tokens(5), "grown to the run's true length");
+    }
+    expect(shifted.reusable_tokens == block_tokens(3) + block_tokens(5),
+           "reuse is counted over both runs");
+}
+
+void test_shifted_selector_quantizes_only_the_destination() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+    using ninfer::targets::qwen3_6::detail::plan_shifted_relocations;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+
+    Tokens previous;
+    Tokens current;
+    shifted_scenario(previous, current);
+
+    const PromptEditDiff diff = diff_prompt_edit_shifted(previous, current);
+    const auto resident = static_cast<std::uint32_t>(previous.size());
+    const auto prompt   = static_cast<std::uint32_t>(current.size());
+
+    const auto spans = plan_shifted_relocations(diff, resident, 0, prompt, std::nullopt, 6);
+    expect(spans.size() == 1, "the moved run is selected");
+    if (spans.size() == 1) {
+        expect(spans.front().dest_begin == block_tokens(4),
+               "the destination is trimmed up to the first whole page in the run");
+        expect(spans.front().tokens == block_tokens(4),
+               "and back to the last whole page before the final token");
+        expect(spans.front().source_begin == block_tokens(3) + 61,
+               "the source keeps the run's own offset, which is what the page grid could not express");
+        expect(spans.front().source_begin % kPromptEditBlockTokens != 0,
+               "so an off-grid source is the normal case here, not an error");
+    }
+
+    const auto ranges = relocation_prefill_ranges(spans, 0, prompt);
+    expect(relocation_is_expressible(spans, ranges, 0, prompt, true),
+           "a whole-page destination with an off-grid source is expressible when the payload is copied");
+    expect(!relocation_is_expressible(spans, ranges, 0, prompt),
+           "and refused by the re-pointing path, whose source has to name a page that holds it");
+}
+
+void test_shifted_pricing_excludes_the_copy_sources() {
+    using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
+    using ninfer::targets::qwen3_6::detail::remap_pages_from_pool;
+    using ninfer::targets::qwen3_6::detail::shifted_relocation_pages_from_pool;
+
+    // Five owned pages, none named by the mapping, so every acquire slot has a dropped page to take
+    // and the re-pointing price is zero pool pages. The copies read logical pages 0 and 1, whose
+    // physical pages have to survive until the copy has moved their bytes, so those two cannot be
+    // destinations and the pool must supply them instead. Without this the substitution hands back
+    // the very pages being read, and a device copy of overlapping ranges is undefined.
+    const std::vector<std::int32_t> owned{10, 11, 12, 13, 14};
+    const std::vector<std::int32_t> all_acquired{
+        kRemapAcquirePage, kRemapAcquirePage, kRemapAcquirePage, kRemapAcquirePage,
+        kRemapAcquirePage};
+    const std::vector<std::uint32_t> sources{0, 1};
+
+    expect(remap_pages_from_pool(owned, all_acquired) == 0,
+           "without copies the surplus pays for every acquire slot");
+    expect(shifted_relocation_pages_from_pool(owned, all_acquired, sources) == 2,
+           "a copy source cannot also be a destination, so the pool pays for those slots");
+
+    const std::vector<std::uint32_t> no_sources;
+    expect(shifted_relocation_pages_from_pool(owned, all_acquired, no_sources) == 0,
+           "no sources means no exclusion");
+    const std::vector<std::uint32_t> unnamed{5, 6};
+    expect(shifted_relocation_pages_from_pool(owned, all_acquired, unnamed) == 0,
+           "a logical page the mapping does not name blocks nothing");
+}
+
 } // namespace
 
 int main() {
@@ -1004,6 +1124,9 @@ int main() {
     test_plan_page_remap();
     test_plan_page_remap_second_allocation();
     test_remap_pages_from_pool();
+    test_shifted_detector_finds_a_run_off_the_block_grid();
+    test_shifted_selector_quantizes_only_the_destination();
+    test_shifted_pricing_excludes_the_copy_sources();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

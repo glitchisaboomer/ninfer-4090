@@ -34,6 +34,27 @@ constexpr std::size_t kMaxCandidateProbes = 8;
     return hash;
 }
 
+// The same fold over an arbitrary window, for the shifted detector: anchoring on a short n-gram
+// taken at every offset is what lets it match a run that is not on the block grid.
+[[nodiscard]] std::uint64_t hash_tokens(std::span<const TokenId> tokens, std::uint32_t offset,
+                                       std::uint32_t count) noexcept {
+    std::uint64_t hash = kHashOffset;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        hash ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(tokens[offset + i]));
+        hash *= kHashPrime;
+    }
+    return hash;
+}
+
+[[nodiscard]] bool tokens_equal(std::span<const TokenId> left, std::uint32_t left_begin,
+                                std::span<const TokenId> right, std::uint32_t right_begin,
+                                std::uint32_t count) noexcept {
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (left[left_begin + i] != right[right_begin + i]) { return false; }
+    }
+    return true;
+}
+
 [[nodiscard]] bool blocks_equal(std::span<const TokenId> left, std::uint32_t left_block,
                                 std::span<const TokenId> right, std::uint32_t right_block,
                                 std::uint32_t block_tokens) noexcept {
@@ -312,6 +333,48 @@ std::uint32_t remap_pages_from_pool(std::span<const std::int32_t> current_pages,
     return acquires - std::min<std::uint64_t>(acquires, surplus);
 }
 
+std::uint32_t shifted_relocation_pages_from_pool(std::span<const std::int32_t> current_pages,
+                                                 std::span<const std::int32_t> mapping,
+                                                 std::span<const std::uint32_t> source_pages) {
+    std::uint32_t acquires = 0;
+    for (const std::int32_t page : mapping) {
+        if (page == kRemapAcquirePage) { ++acquires; }
+    }
+    if (acquires == 0) { return 0; }
+
+    // Occurrences of the pages the mapping keeps; the rest of the ownership is the surplus the
+    // acquire slots are otherwise filled from. Mirrors `reassign_pages`' own bookkeeping, by
+    // occurrence, because a page named twice consumes two slots.
+    std::unordered_map<std::int32_t, std::uint32_t> remaining;
+    remaining.reserve(current_pages.size());
+    for (const std::int32_t page : current_pages) { ++remaining[page]; }
+    for (const std::int32_t page : mapping) {
+        if (page == kRemapAcquirePage) { continue; }
+        const auto found = remaining.find(page);
+        if (found != remaining.end() && found->second != 0) {
+            if (--found->second == 0) { remaining.erase(found); }
+        }
+    }
+
+    // A page a copy reads is spoken for until the copy has moved its bytes, so it cannot serve as a
+    // destination. Count those occurrences per physical page: the same page can back more than one
+    // logical page on the source side of a relocation only if the mapping already named it twice,
+    // which the expressibility rules reject.
+    std::unordered_map<std::int32_t, std::uint32_t> blocked;
+    for (const std::uint32_t logical : source_pages) {
+        if (logical < current_pages.size()) { ++blocked[current_pages[logical]]; }
+    }
+
+    std::uint64_t usable = 0;
+    for (const auto& entry : remaining) {
+        const auto blocked_at = blocked.find(entry.first);
+        const std::uint32_t unusable = blocked_at == blocked.end() ? 0u : blocked_at->second;
+        usable += entry.second > unusable ? entry.second - unusable : 0u;
+    }
+    const std::uint64_t reused = std::min<std::uint64_t>(acquires, usable);
+    return acquires - static_cast<std::uint32_t>(reused);
+}
+
 std::vector<PrefillRange> relocation_prefill_ranges(std::span<const RelocatedSpan> spans,
                                                     std::uint32_t prefix_reuse_tokens,
                                                     std::uint32_t prompt_tokens) {
@@ -334,11 +397,11 @@ std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges) {
     // One range's partial chunk is already in the projection; every further range is a step the
     // single-span formula does not count.
     return ranges.size() > 1 ? static_cast<std::uint64_t>(ranges.size() - 1) : 0ULL;
-}
-
-bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
+}bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
                               std::span<const PrefillRange> ranges,
-                              std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens) {
+                              std::uint32_t prefix_reuse_tokens,
+                              std::uint32_t prompt_tokens,
+                              bool source_may_shift) {
     if (prompt_tokens <= prefix_reuse_tokens || ranges.empty()) { return false; }
 
     std::vector<RelocatedSpan> sorted(spans.begin(), spans.end());
@@ -348,10 +411,13 @@ bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
     for (std::size_t i = 0; i < sorted.size(); ++i) {
         const RelocatedSpan& span = sorted[i];
         if (span.tokens == 0 || span.tokens % kPromptEditBlockTokens != 0 ||
-            span.source_begin % kPromptEditBlockTokens != 0 ||
             span.dest_begin % kPromptEditBlockTokens != 0) {
             return false;
         }
+        // The re-pointing path moves the page table, so the source has to name a page that already
+        // holds the content and must be a whole page. The copying path moves the payload, so its
+        // source is just a token offset -- the freedom a shifted edit needs.
+        if (!source_may_shift && span.source_begin % kPromptEditBlockTokens != 0) { return false; }
         if (span.dest_begin < prefix_reuse_tokens || span.dest_end() > prompt_tokens - 1) {
             return false;
         }
@@ -448,6 +514,134 @@ PromptEditDiff diff_prompt_edit(std::span<const TokenId> previous, std::span<con
     }
     diff.reusable_tokens = static_cast<std::uint32_t>(reusable);
     return diff;
+}
+
+PromptEditDiff diff_prompt_edit_shifted(std::span<const TokenId> previous,
+                                        std::span<const TokenId> current,
+                                        std::uint32_t anchor_tokens) {
+    if (anchor_tokens == 0) {
+        throw std::invalid_argument("prompt edit anchor size must be positive");
+    }
+
+    PromptEditDiff diff;
+    if (previous.size() < anchor_tokens || current.size() < anchor_tokens) { return diff; }
+
+    // Every offset, not every block: the whole point is to match content that moved by a count the
+    // page grid cannot express.
+    const std::uint32_t previous_anchors =
+        static_cast<std::uint32_t>(previous.size()) - anchor_tokens + 1;
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> index;
+    index.reserve(previous_anchors);
+    for (std::uint32_t offset = 0; offset < previous_anchors; ++offset) {
+        index[hash_tokens(previous, offset, anchor_tokens)].push_back(offset);
+    }
+
+    std::uint64_t reusable   = 0;
+    std::uint32_t old_cursor = 0;  // no run reuses a token of the previous prompt twice
+    std::uint32_t new_cursor = 0;
+    std::uint32_t at         = 0;
+    const std::uint32_t current_anchors =
+        static_cast<std::uint32_t>(current.size()) - anchor_tokens + 1;
+    while (at < current_anchors) {
+        const auto found = index.find(hash_tokens(current, at, anchor_tokens));
+        if (found == index.end()) {
+            ++at;
+            continue;
+        }
+
+        bool matched    = false;
+        std::size_t probes = 0;
+        for (const std::uint32_t old_begin : found->second) {
+            if (old_begin < old_cursor) { continue; }
+            if (probes == kMaxCandidateProbes) { break; }
+            ++probes;
+            if (!tokens_equal(previous, old_begin, current, at, anchor_tokens)) { continue; }
+
+            std::uint32_t right = anchor_tokens;
+            while (old_begin + right < previous.size() && at + right < current.size() &&
+                   previous[old_begin + right] == current[at + right]) {
+                ++right;
+            }
+            // Grown left over the run's head, but never into the previous run or past the start of
+            // either prompt: that is what keeps the runs disjoint and the walk monotone.
+            std::uint32_t left = 0;
+            while (old_begin > left && at > left && at - left - 1 >= new_cursor &&
+                   old_begin - left - 1 >= old_cursor &&
+                   previous[old_begin - left - 1] == current[at - left - 1]) {
+                ++left;
+            }
+
+            const std::uint32_t begin_old = old_begin - left;
+            const std::uint32_t begin_new = at - left;
+            const std::uint32_t length    = left + right;
+            diff.spans.push_back(
+                SurvivingSpan{.old_begin = begin_old, .new_begin = begin_new, .tokens = length});
+            reusable += length;
+            old_cursor = begin_old + length;
+            new_cursor = begin_new + length;
+            at         = new_cursor;
+            matched    = true;
+            break;
+        }
+        if (!matched) { ++at; }
+    }
+
+    if (reusable > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("prompt edit reusable token count does not fit uint32");
+    }
+    diff.reusable_tokens = static_cast<std::uint32_t>(reusable);
+    return diff;
+}
+
+std::vector<RelocatedSpan> plan_shifted_relocations(const PromptEditDiff& diff,
+                                                    std::uint32_t resident_kv_tokens,
+                                                    std::uint32_t prefix_reuse_tokens,
+                                                    std::uint32_t prompt_tokens,
+                                                    std::optional<std::uint32_t> turn_rewrite_boundary,
+                                                    std::uint32_t max_spans) {
+    std::vector<RelocatedSpan> candidates;
+    if (max_spans == 0 || prompt_tokens == 0 || prompt_tokens <= prefix_reuse_tokens) {
+        return candidates;
+    }
+
+    std::uint32_t limit = prompt_tokens - 1;
+    if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
+
+    for (const SurvivingSpan& span : diff.spans) {
+        if (span.old_begin == 0 && span.new_begin == 0) { continue; }
+        if (span.old_end() > resident_kv_tokens) { continue; }
+        if (span.new_begin < prefix_reuse_tokens) { continue; }
+        if (span.tokens == 0) { continue; }
+
+        // The first whole destination page inside the run, and the last whole page that ends before
+        // the limit. Quantizing here rather than at the detector is what keeps every destination
+        // page wholly relocated, so it carries exactly one delta and prefill never shares it.
+        const std::uint32_t dest_begin =
+            ((span.new_begin + kPromptEditBlockTokens - 1) / kPromptEditBlockTokens) *
+            kPromptEditBlockTokens;
+        const std::uint32_t reach = std::min(span.new_begin + span.tokens, limit);
+        const std::uint32_t dest_end = (reach / kPromptEditBlockTokens) * kPromptEditBlockTokens;
+        if (dest_begin >= dest_end) { continue; }
+
+        candidates.push_back(
+            RelocatedSpan{.source_begin = span.old_begin + (dest_begin - span.new_begin),
+                          .dest_begin   = dest_begin,
+                          .tokens       = dest_end - dest_begin});
+    }
+
+    // The cap and the order match `plan_relocations`: longest survivors first, so the cap discards
+    // the least useful reuse, then prompt order, which is how the runtime consumes them.
+    const std::size_t keep = std::min<std::size_t>(max_spans, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep),
+                      candidates.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
+                          return a.tokens > b.tokens;
+                      });
+    candidates.resize(keep);
+    std::sort(candidates.begin(), candidates.end(),
+              [](const RelocatedSpan& a, const RelocatedSpan& b) {
+                  return a.dest_begin < b.dest_begin;
+              });
+    return candidates;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail
