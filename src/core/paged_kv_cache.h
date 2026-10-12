@@ -263,6 +263,33 @@ public:
     void reassign_pages(std::span<const std::int32_t> mapping,
                         cudaStream_t stream = nullptr);
 
+    // Relocate runs whose *source* is not page aligned, by copying their payload instead of
+    // re-pointing the destination page at the page that already holds it.
+    //
+    // With an off-grid source no destination page boundary lines up with a source page boundary, so a
+    // re-pointed page would hold the wrong tokens and `plan_page_remap` correctly refuses to build
+    // such a mapping. `mapping` here is the one `plan_copied_page_remap` builds instead: the copied
+    // destinations are acquire slots and the sources are simply not named, which is what drops them.
+    //
+    // Owning the pool is why this lives on the allocation rather than beside the planner:
+    //
+    //   * The pages the copies read must not become destinations. `reassign_pages` fills acquire slots
+    //     from the pages the mapping drops first, so the sources have to be kept out of that
+    //     substitution -- they are copied *from* while they are being handed back otherwise, and a
+    //     device copy of overlapping ranges is undefined. `shifted_relocation_pages_from_pool` is the
+    //     matching price, and the planner refuses a plan the pool cannot afford.
+    //   * The sources stay mapped until the copies have run, and the stream is drained before they are
+    //     released, because the pool is shared: without the drain another lane's prefill can be handed
+    //     a page this allocation is still reading, on its own stream and with no ordering between
+    //     them. The drain costs the copy, which is bandwidth-bound and small next to the prefill it
+    //     replaces; an event handoff would remove it and is the obvious follow-up.
+    //
+    // Throws `std::bad_alloc` when the pool cannot supply the pages the copies need, before anything
+    // is published, so a caller that priced the relocation first can fall back safely.
+    void relocate_copied_pages(std::span<const std::int32_t> mapping,
+                               std::span<const std::int32_t> deltas,
+                               std::span<const RelocatedCopySpan> spans, cudaStream_t stream);
+
     void bind_row(std::int32_t row, cudaStream_t stream = nullptr);
     void publish_mapping(cudaStream_t stream = nullptr) const;
     void unbind_row() noexcept;
@@ -285,10 +312,9 @@ private:
     std::int32_t bound_row_         = -1;
 };
 
-// Sentinel for one logical page in PagedKVAllocation::reassign_pages that must be filled with a
-// physical page acquired from the pool. Every real physical page id is non-negative, so -1 cannot
-// collide with an owned page.
-inline constexpr std::int32_t kPagedKVAquirePage = -1;
+// `kPagedKVAquirePage` and `kPagedKVPageSize`, both named by the page arithmetic in
+// `core/paged_kv_delta_layout.h`, are declared there: the layout header cannot include this one, and
+// the two must not both define them. This header includes it, so every consumer here still sees both.
 
 struct PagedKVReservation {
     PagedKVPool* pool              = nullptr;

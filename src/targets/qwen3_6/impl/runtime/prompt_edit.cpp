@@ -333,6 +333,52 @@ std::uint32_t remap_pages_from_pool(std::span<const std::int32_t> current_pages,
     return acquires - std::min<std::uint64_t>(acquires, surplus);
 }
 
+std::vector<std::int32_t> plan_copied_page_remap(std::span<const std::int32_t> current_pages,
+                                                 std::span<const RelocatedSpan> spans,
+                                                 std::uint32_t prefix_reuse_tokens,
+                                                 std::uint32_t prompt_tokens) {
+    std::vector<std::int32_t> mapping;
+    if (current_pages.empty() || spans.empty() || prompt_tokens == 0) { return mapping; }
+
+    const std::uint32_t logical_pages =
+        (prompt_tokens + kPromptEditBlockTokens - 1) / kPromptEditBlockTokens;
+    mapping.assign(logical_pages, kRemapAcquirePage);
+
+    // Every destination page a span covers is acquired and never carried: its content arrives by a
+    // copy rather than by being pointed at, and the page that holds that content today is one of the
+    // copy's sources, which this mapping deliberately does not name.
+    std::vector<std::uint8_t> copied(logical_pages, 0);
+    for (const RelocatedSpan& span : spans) {
+        if (span.tokens == 0 || span.tokens % kPromptEditBlockTokens != 0 ||
+            span.dest_begin % kPromptEditBlockTokens != 0) {
+            return {};
+        }
+        const std::uint32_t last_page = span.dest_end() / kPromptEditBlockTokens;
+        if (last_page > logical_pages) { return {}; }
+        for (std::uint32_t page = span.dest_begin / kPromptEditBlockTokens; page < last_page; ++page) {
+            copied[page] = 1;
+        }
+    }
+
+    // The reused prefix keeps its own pages, including the one straddling the frontier. A page a span
+    // copies into is never carried back over that: the prefix pass would claim it twice.
+    const std::uint32_t prefix_page = prefix_reuse_tokens / kPromptEditBlockTokens;
+    if (prefix_page >= current_pages.size() || prefix_page >= mapping.size()) { return {}; }
+    for (std::uint32_t page = 0; page <= prefix_page; ++page) {
+        if (copied[page] == 0) { mapping[page] = current_pages[page]; }
+    }
+
+    // One physical page must not be named twice, for the same reason `plan_page_remap` checks it.
+    std::vector<std::int32_t> carried;
+    carried.reserve(mapping.size());
+    for (const std::int32_t page : mapping) {
+        if (page != kRemapAcquirePage) { carried.push_back(page); }
+    }
+    std::sort(carried.begin(), carried.end());
+    if (std::adjacent_find(carried.begin(), carried.end()) != carried.end()) { return {}; }
+    return mapping;
+}
+
 std::uint32_t shifted_relocation_pages_from_pool(std::span<const std::int32_t> current_pages,
                                                  std::span<const std::int32_t> mapping,
                                                  std::span<const std::uint32_t> source_pages) {

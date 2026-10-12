@@ -16,8 +16,15 @@
 // its new position: instead of rewriting the quantized K plane, attention reads this per-logical-page
 // delta and counter-rotates the query tile by it.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 // The namespace is `ninfer`, not `ninfer::core`, because that is where
 // `kPagedKVPageSize` lived before this header was extracted: every consumer
@@ -32,6 +39,30 @@ inline constexpr std::int32_t kPagedKVPageSize = 64;
 
 // A page with a delta of this is an ordinary page and the attention path takes its existing route.
 inline constexpr std::int32_t kRopeDeltaNone = 0;
+
+// Sentinel for one logical page in a relocated or reassigned mapping that must be filled with a
+// physical page acquired from the pool. Every real physical page id is non-negative, so -1 cannot
+// collide with an owned page.
+//
+// Moved here from `core/paged_kv_cache.h` for the same reason `kPagedKVPageSize` was: the arithmetic
+// that plans a relocation's substitution and its copies names it, and that arithmetic has to be
+// buildable and testable without the device-side header. The two must not both define it.
+inline constexpr std::int32_t kPagedKVAquirePage = -1;
+
+// One surviving run as the payload copier needs it: a whole-page destination and an arbitrary source
+// offset. The fields mirror the relocation planner's `RelocatedSpan`, but this type lives here
+// because core cannot include a target runtime's header, and the copier is a core concern -- it owns
+// the page table and the pool the sources have to stay in.
+struct RelocatedCopySpan {
+    std::uint32_t source_begin = 0;
+    std::uint32_t dest_begin   = 0;
+    std::uint32_t tokens       = 0;
+
+    [[nodiscard]] constexpr std::uint32_t source_end() const noexcept {
+        return source_begin + tokens;
+    }
+    [[nodiscard]] constexpr std::uint32_t dest_end() const noexcept { return dest_begin + tokens; }
+};
 
 struct RopeDeltaLayout {
     std::int32_t logical_pages = 0;
@@ -170,6 +201,173 @@ resolve_rope_delta_layout(std::int32_t max_context, std::int32_t table_rows) noe
         static_cast<std::int64_t>(dest_begin) - static_cast<std::int64_t>(source_begin);
     if (delta < -0x7fffffffLL || delta > 0x7fffffffLL) { return kRopeDeltaNone; }
     return static_cast<std::int32_t>(delta);
+}
+
+// One device-to-device move a copied relocation issues: `tokens` tokens of one destination page that
+// come from one source page. `dest_page` and `source_page` are *logical* page indices -- of the
+// mapping being published and of the mapping being replaced, respectively -- because the physical
+// pages behind them are exactly what the substitution below is computing. A destination page whose
+// source token offset is zero is one move; any other is two, because the source page it starts in
+// ends before the destination page does and the remainder comes from the next source page.
+//
+// This is arithmetic, not device code, and it lives here for the reason the rest of this header does:
+// the statement "a destination page needs at most two moves, and here they are" is the part of the
+// copier that must not be wrong, and it is checkable without a GPU.
+struct RelocatedPageMove {
+    std::int32_t dest_page    = -1;
+    std::uint32_t dest_token  = 0;
+    std::int32_t source_page  = -1;
+    std::uint32_t source_token = 0;
+    std::uint32_t tokens      = 0;
+};
+
+// Decomposes copied spans into the moves that carry them, validating against the mapping they are
+// being published into. `mapping_pages` is the page count of *both* mappings: the sources are the
+// current mapping's logical pages, the destinations the published mapping's, and a relocation never
+// changes the logical page count (it re-points and drops, it does not resize).
+//
+// Throws `std::invalid_argument` for a span that is not whole destination pages, for one that reaches
+// past the mapping at either end, and for a relocation with no moves -- which copies nothing, so a
+// caller that accepted it would believe it had relocated something.
+[[nodiscard]] inline std::vector<RelocatedPageMove>
+plan_relocated_page_moves(std::span<const RelocatedCopySpan> spans, std::size_t mapping_pages) {
+    constexpr std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
+    std::vector<RelocatedPageMove> moves;
+    moves.reserve(spans.size() * 2);
+    for (const RelocatedCopySpan& span : spans) {
+        if (!relocated_dest_is_page_aligned(span.dest_begin, span.tokens)) {
+            throw std::invalid_argument(
+                "Paged KV relocation span is not whole destination pages");
+        }
+        if (static_cast<std::size_t>(span.dest_end()) > mapping_pages * page) {
+            throw std::invalid_argument("Paged KV relocation span reaches past its mapping");
+        }
+        for (std::uint32_t dest_token = span.dest_begin; dest_token < span.dest_end();
+             dest_token += page) {
+            const std::uint32_t source_token = span.source_begin + (dest_token - span.dest_begin);
+            const std::uint32_t source_offset = source_token % page;
+            const std::size_t source_page     = source_token / page;
+            if (source_page >= mapping_pages) {
+                throw std::invalid_argument(
+                    "Paged KV relocation span reaches past the current mapping");
+            }
+
+            RelocatedPageMove move;
+            move.dest_page    = static_cast<std::int32_t>(dest_token / page);
+            move.dest_token   = 0;
+            move.source_page  = static_cast<std::int32_t>(source_page);
+            move.source_token = source_offset;
+            move.tokens       = page - source_offset;
+            moves.push_back(move);
+
+            if (move.tokens != page) {
+                if (source_page + 1 >= mapping_pages) {
+                    throw std::invalid_argument(
+                        "Paged KV relocation span's source runs past its mapping");
+                }
+                move.dest_token   = move.tokens;
+                move.source_page  = static_cast<std::int32_t>(source_page + 1);
+                move.source_token = 0;
+                move.tokens       = page - move.dest_token;
+                moves.push_back(move);
+            }
+        }
+    }
+    if (moves.empty()) {
+        throw std::invalid_argument("Paged KV relocation carries no moves");
+    }
+    return moves;
+}
+
+// The page ownership transition a copied relocation performs, as pure arithmetic over page ids.
+struct RelocatedPageSubstitution {
+    // Parallel to `mapping`, with every acquire slot the dropped pages can fill already filled. The
+    // slots still holding `kPagedKVAquirePage` are the ones the caller must fill from the pool, in
+    // order, and there are exactly `from_pool` of them.
+    std::vector<std::int32_t> final_ids;
+    // Dropped pages the caller may return to the pool only *after* the copies have run: the ones the
+    // copies read, plus every dropped page past the slots they could fill.
+    std::vector<std::int32_t> held_for_copy;
+    std::uint32_t from_pool = 0;
+};
+
+// Computes that transition. `current_ids` is the mapping being replaced (its pages, in logical order,
+// with repeats for a page mapped more than once), `mapping` the mapping being published, and
+// `protected_pages` the physical pages the copies will read, by occurrence.
+//
+// The one difference from `PagedKVAllocation::reassign_pages`' substitution is the point of this
+// function: a page the copies read is never a destination, so it is held out of the reuse and handed
+// back afterwards instead. Without that, the substitution prefers to give a dropped page straight back
+// as the new physical page -- which for a copied relocation means the destination *is* the source, an
+// overlapping device copy, whose behaviour the CUDA runtime does not define.
+//
+// Deterministic: pages are considered in ascending id order, so the same inputs always produce the
+// same physical pages, which is what makes the published block table reproducible.
+[[nodiscard]] inline RelocatedPageSubstitution plan_relocated_page_substitution(
+    std::span<const std::int32_t> current_ids, std::span<const std::int32_t> mapping,
+    std::span<const std::int32_t> protected_pages) {
+    std::map<std::int32_t, std::uint32_t> owned;
+    for (const std::int32_t page_id : current_ids) { ++owned[page_id]; }
+
+    std::map<std::int32_t, std::uint32_t> remaining(owned);
+    std::uint32_t acquire_count = 0;
+    for (const std::int32_t page_id : mapping) {
+        if (page_id == kPagedKVAquirePage) {
+            ++acquire_count;
+            continue;
+        }
+        const auto found = remaining.find(page_id);
+        if (found == remaining.end() || found->second == 0) {
+            throw std::invalid_argument(
+                "Paged KV relocation names a page this allocation does not own");
+        }
+        if (--found->second == 0) { remaining.erase(found); }
+    }
+
+    // The copies read these pages, so they are priced against what the allocation owns rather than
+    // against what is left over: a page the mapping still names is read while mapped, and a protected
+    // page the allocation does not own at all is a caller error, not a silent no-op.
+    std::map<std::int32_t, std::uint32_t> protected_left;
+    std::map<std::int32_t, std::uint32_t> protected_all;
+    for (const std::int32_t page_id : protected_pages) {
+        ++protected_left[page_id];
+        ++protected_all[page_id];
+        const auto found = owned.find(page_id);
+        if (found == owned.end() || protected_all[page_id] > found->second) {
+            throw std::invalid_argument(
+                "Paged KV relocation copies from a page this allocation does not own");
+        }
+    }
+
+    std::vector<std::int32_t> free_surplus;
+    std::vector<std::int32_t> held;
+    for (const auto& entry : remaining) {
+        for (std::uint32_t occurrence = 0; occurrence < entry.second; ++occurrence) {
+            const auto blocked = protected_left.find(entry.first);
+            if (blocked != protected_left.end() && blocked->second != 0) {
+                --blocked->second;
+                held.push_back(entry.first);
+                continue;
+            }
+            free_surplus.push_back(entry.first);
+        }
+    }
+
+    const std::uint32_t reused =
+        std::min(acquire_count, static_cast<std::uint32_t>(free_surplus.size()));
+
+    RelocatedPageSubstitution out;
+    out.final_ids.assign(mapping.begin(), mapping.end());
+    std::size_t slot = 0;
+    for (std::int32_t& page_id : out.final_ids) {
+        if (page_id == kPagedKVAquirePage && slot < reused) { page_id = free_surplus[slot++]; }
+    }
+    for (std::size_t index = reused; index < free_surplus.size(); ++index) {
+        held.push_back(free_surplus[index]);
+    }
+    out.held_for_copy = std::move(held);
+    out.from_pool     = acquire_count - reused;
+    return out;
 }
 
 // The delta for one *destination* logical page of a copied span, or `kRopeDeltaNone` when that page

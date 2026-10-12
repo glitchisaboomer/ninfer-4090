@@ -1071,6 +1071,45 @@ void test_shifted_selector_quantizes_only_the_destination() {
            "and refused by the re-pointing path, whose source has to name a page that holds it");
 }
 
+void test_plan_copied_page_remap_acquires_every_relocated_page() {
+    using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
+    using ninfer::targets::qwen3_6::detail::plan_copied_page_remap;
+    using ninfer::targets::qwen3_6::detail::plan_page_remap;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    // The same shift `plan_page_remap` carries by re-pointing a page, but with an off-grid source:
+    // every copied destination page is acquired (the copy writes it) and the source page the
+    // re-pointing version would have named is simply absent, which is what drops it.
+    const std::vector<std::int32_t> resident{10, 11, 12, 13, 14};
+    const std::vector<RelocatedSpan> shift{RelocatedSpan{.source_begin = block_tokens(3) + 61,
+                                                        .dest_begin = block_tokens(4),
+                                                        .tokens = block_tokens(2)}};
+
+    const auto remap = plan_copied_page_remap(resident, shift, 0, block_tokens(6));
+    expect(remap.size() == 6, "the copied mapping covers every logical page of the new prompt");
+    if (remap.size() == 6) {
+        expect(remap[0] == 10, "the reused prefix still keeps its own page");
+        expect(remap[1] == kRemapAcquirePage && remap[2] == kRemapAcquirePage,
+               "a prefilled page is acquired");
+        expect(remap[4] == kRemapAcquirePage && remap[5] == kRemapAcquirePage,
+               "and a copied destination page is acquired too, never pointed at its own source");
+    }
+
+    // The re-pointing mapping refuses this shape outright. That difference is what the copy buys.
+    expect(plan_page_remap(resident, shift, 0, block_tokens(6)).empty(),
+           "the re-pointing mapping cannot express an off-grid source");
+
+    const std::vector<RelocatedSpan> partial{
+        RelocatedSpan{.source_begin = block_tokens(3), .dest_begin = block_tokens(2) + 1,
+                      .tokens = block_tokens(2)}};
+    expect(plan_copied_page_remap(resident, partial, 0, block_tokens(6)).empty(),
+           "a destination that is not whole pages is refused");
+    const std::vector<RelocatedSpan> beyond{
+        RelocatedSpan{.source_begin = 0, .dest_begin = block_tokens(6), .tokens = block_tokens(2)}};
+    expect(plan_copied_page_remap(resident, beyond, 0, block_tokens(6)).empty(),
+           "a destination reaching past the prompt is refused");
+}
+
 void test_shifted_pricing_excludes_the_copy_sources() {
     using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
     using ninfer::targets::qwen3_6::detail::remap_pages_from_pool;
@@ -1126,6 +1165,7 @@ int main() {
     test_remap_pages_from_pool();
     test_shifted_detector_finds_a_run_off_the_block_grid();
     test_shifted_selector_quantizes_only_the_destination();
+    test_plan_copied_page_remap_acquires_every_relocated_page();
     test_shifted_pricing_excludes_the_copy_sources();
     test_determinism();
     if (failures != 0) {

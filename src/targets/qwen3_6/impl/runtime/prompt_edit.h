@@ -304,6 +304,23 @@ inline constexpr std::int32_t kRemapAcquirePage = -1;
                                                        std::uint32_t prefix_reuse_tokens,
                                                        std::uint32_t prompt_tokens);
 
+// Build the page mapping for a *copied* relocation: the same shape as `plan_page_remap`, except that
+// every destination page a span covers is left to acquire rather than pointed at the page holding
+// its content.
+//
+// That is the whole difference, and it follows from the payload moving: with an off-grid source no
+// destination page boundary lines up with a source page boundary, so a re-pointed page would hold
+// the wrong tokens and the content has to be written into a fresh page instead. The sources are not
+// named by the result, which is what drops them -- and why their physical pages must be kept out of
+// the acquire substitution until the copy has run (`shifted_relocation_pages_from_pool` prices that).
+//
+// Returns an empty vector when the relocation cannot be expressed: a destination that is not a whole
+// number of pages, a span reaching outside the prompt, or a prefix reaching past the current
+// mapping. The caller treats that as a fall back to ordinary prefix reuse, as with `plan_page_remap`.
+[[nodiscard]] std::vector<std::int32_t> plan_copied_page_remap(
+    std::span<const std::int32_t> current_pages, std::span<const RelocatedSpan> spans,
+    std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens);
+
 // The pages `PagedKVAllocation::reassign_pages` would have to take from the pool rather than from
 // the mapping's own dropped pages, for a mapping `plan_page_remap` built over `current_pages`.
 //
