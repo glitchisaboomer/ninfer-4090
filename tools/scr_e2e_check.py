@@ -18,7 +18,10 @@ It also checks that the engagement was real work: the request log's `computed_pr
 engine's own count of the prompt tokens its prefill chunks ran, and for a relocated request that must
 be the prompt minus the relocated run. A relocation that is planned but never applied still answers
 correctly -- the re-prefilled pages hold what the relocation would have served -- so the only thing
-that catches it is the work. `--scr-mode tail|segmented` selects which relocation shape to check.
+that catches it is the work. `--scr-mode tail|segmented` selects which relocation shape to check, and
+`--shape scope-a|interleaved` selects the fixture it runs on: the built-in Scope-A prompt has one
+surviving run, which both shapes relocate identically, so `interleaved` supplies a prompt whose edit
+leaves two separated survivors -- the one case that distinguishes them.
 
 Run it once per supported --kv-dtype (`bf16`, `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`). The relocation
 is a delta on the page, not a rewrite of the codes, so every layout whose attention kernels honour
@@ -43,63 +46,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-
-# A KV page is 64 tokens, and the tail has to survive block alignment, so keep it well over
-# one block. ~400 tokens of tail gives the planner several aligned blocks to relocate.
-TAIL_SENTENCES = [
-    "The maintenance log for the deployment records every change in order.",
-    "Each entry lists the operator, the timestamp, and a short justification.",
-    "Rollbacks were performed twice, both times within the same maintenance window.",
-    "The verification suite ran after every rollout without exception.",
-    "Throughput stayed within the agreed band during the whole observation period.",
-    "No customer-visible incidents were attributed to these changes.",
-]
-
-
-def build_text(sentences, repeats):
-    return " ".join(sentences * repeats)
-
-
-def intro_text(repeats):
-    return build_text(
-        [
-            "You are given a long technical briefing and must answer precisely.",
-            "Read every section carefully before producing the final answer.",
-            "The briefing describes an infrastructure migration in detail.",
-            "Pay attention to the ordering of the steps and the stated constraints.",
-            "Do not speculate beyond what the briefing actually says.",
-        ],
-        repeats,
-    )
-
-
-
-MIDDLE_A = (
-    " SECTION ONE. The migration moves the primary datastore from a single node "
-    "cluster to a three node cluster with a consensus protocol. "
-    "All writes are routed through the new leader."
-)
-
-
-def middle_b(padding_words):
-    """The same shape as MIDDLE_A but padded so its token count differs by a multiple of 64."""
-    words = MIDDLE_A.split()
-    # Swap in a different cluster size, then pad deterministically to the requested length.
-    body = " ".join(words[:8] + ["five"] + words[9:12] + ["node"] + words[13:])
-    filler = " ".join(["Additionally the rollout proceeds in careful stages."] * padding_words)
-    return body + " " + filler
-
-
-def request_prompt(variant, padding_words=0):
-    """INTRO + MIDDLE + TAIL, where only the middle differs between variants."""
-    middle = MIDDLE_A if variant == "a" else middle_b(padding_words)
-    return (
-        intro_text(6)
-        + middle
-        + "\n\n"
-        + tail_text()
-        + "\n\nIn one sentence, what number of nodes does the target cluster have?"
-    )
 
 
 def request_body(prompt, max_tokens, think):
@@ -191,6 +137,13 @@ MIDDLE_FILLER = [
 # approximation is too coarse at this relocated fraction".
 FACT_PLACEMENT = "tail"
 
+# Which fixture to run. `scope-a` is the built-in [P R S] -> [P S] prompt, whose edit leaves one
+# surviving run -- the shape tail relocation is built for, and the one that cannot tell the two
+# relocation modes apart. `interleaved` is the two-deletion fixture defined with the interleaved
+# regions below, whose edit leaves two separated survivors, which is the only case where segmented
+# relocation does something tail relocation does not.
+SHAPE = "scope-a"
+
 # The fact the question asks about. At the very end of the prompt when placed in the tail, so it is
 # the surviving region.
 TAIL_SENTENCES = [
@@ -227,13 +180,37 @@ def _pad(sentences, units):
     return _join(sentences, 1) + " " + _join([PREFIX_PAD], units)
 
 
-def prefix_text(units):
+# The alignment shift, and why it exists. A pad is one filler's token count, and a walk over whole
+# pad units can only reach the boundaries that count can reach: an even count per unit shares a
+# factor with the 64-token block, which leaves half of them unreachable however long the search
+# runs, and the fixture would then fail for a reason that has nothing to do with relocation. That
+# was tolerable with two searches and is not with five. Appending a few copies of a one-word
+# filler shifts the total by a small odd amount alongside every unit, so every boundary stays
+# reachable whatever the filler's own count turns out to be. A single common word is one token in
+# any BPE vocabulary, and four of them are far too few tokens to form a block of their own.
+ALIGNMENT_SHIFT_WORD = "the"
+ALIGNMENT_SHIFT_SPAN = 4
+
+def _filler(word, units):
+    """`units` copies of `word`, or nothing at all when `units` is zero."""
+    if units <= 0:
+        return ""
+    return " " + _join([word], units)
+
+
+def prefix_text(pad):
+    """P, the shared prefix, padded by `pad` = (units, shift)."""
+    units, shift = pad
     fact = PREFIX_FACT if FACT_PLACEMENT == "prefix" else ""
-    return QUESTION + fact + _join(PREFIX_FILLER, PREFIX_REPEATS) + _pad(MIDDLE_FILLER, units)
+    return (QUESTION + fact + _join(PREFIX_FILLER, PREFIX_REPEATS) + _pad(MIDDLE_FILLER, units) +
+            _filler(ALIGNMENT_SHIFT_WORD, shift))
 
 
-def middle_text(units):
-    return " " + _join(MIDDLE_FILLER, 1) + " " + _join(MIDDLE_FILLER[1:], 3 + units)
+def middle_text(pad):
+    """Scope A's R1: the region prompt A carries and prompt B deletes, padded by `pad`."""
+    units, shift = pad
+    return (" " + _join(MIDDLE_FILLER, 1) + " " + _join(MIDDLE_FILLER[1:], 3 + units) +
+            _filler(ALIGNMENT_SHIFT_WORD, shift))
 
 
 # Size of the relocated run. TAIL_BLOCKS requests a whole number of 64-token blocks, which is the
@@ -252,62 +229,252 @@ def tail_text():
         per_repeat = max(1, len(sentences) * 11)
         repeats = max(1, -(-TAIL_BLOCKS * 64 // per_repeat))
     return " " + _join(sentences, repeats)
-def request_prompt(variant, prefix_units=0, middle_units=0):
-    """A = PREFIX + MIDDLE + TAIL, B = PREFIX + TAIL. Only A carries the middle."""
-    head = prefix_text(prefix_units)
+
+
+# --- The interleaved fixture ---------------------------------------------------------------
+# Scope A's edit leaves one surviving run, which is exactly the shape `plan_tail_relocation`
+# selects: one contiguous run, prefilled around on both sides. An edit that leaves survivors in
+# two or more separated places is the case segmented mode exists for, and no prompt in this file
+# or in the quality harness produces one -- every fixture has exactly one run after its edit, so
+# both selectors return the same span, the same derived ranges, and the same savings, and no run
+# has ever told the two apart. This shape does.
+#
+#     prompt A:  [P R1 S1 R2 S2]
+#     prompt B:  [P R1' S1 R2' S2]      R1' and R2' are fresh text of comparable length
+#
+# S1 is a middle survivor: it does not run to the prompt end, so it is not the tail. S2 is the
+# tail survivor and carries the fact the question asks about, so the answer is only reachable if
+# the relocated KV is right. Two deletions, two survivors, the second one carries the fact and
+# ends the prompt -- the Scope A discipline, because a prompt that grows or that trails a
+# question after its last survivor exercises different planner branches and can silently decline
+# to engage.
+#
+# Every region gets its own filler. diff_prompt_edit matches whole 64-token blocks by hash, so a
+# sentence that appears in two regions can hand the diff a survivor that is not the one under
+# test, and the plan then relocates the wrong text.
+INNER_SENTENCES = [
+    "The operator roster lists everyone credentialed for the maintenance window.",
+    "Escalation runs through the duty engineer and then the service owner.",
+    "Handovers are recorded together with the outstanding items carried forward.",
+    "Nothing in this roster affects the approved rollback window.",
+]
+
+# R1 and R2 are the regions prompt A carries and prompt B replaces; R1' and R2' are the
+# replacements. Comparable length, deliberately different text, so neither is a survivor.
+FIRST_REMOVED_SENTENCES = [
+    "The datastore migration moves the primary cluster to a three node consensus deployment.",
+    "Leader election settings were reviewed alongside replica placement.",
+    "This region is deleted by the edit the second request applies.",
+]
+
+FIRST_REPLACEMENT_SENTENCES = [
+    "The storage tier migration moves the archive cluster to a five node quorum deployment.",
+    "Replica placement and failure domain spread were reviewed together.",
+    "This region replaces the first deleted region when the edit is applied.",
+]
+
+SECOND_REMOVED_SENTENCES = [
+    "The release train publishes changes on a fixed fortnightly cadence.",
+    "Freeze windows are announced two weeks in advance.",
+    "This region is also removed by the edit.",
+]
+
+SECOND_REPLACEMENT_SENTENCES = [
+    "The deployment pipeline publishes changes on a fixed weekly cadence.",
+    "Change freezes are announced four weeks in advance.",
+    "This region replaces the second deleted region when the edit is applied.",
+]
+
+# One filler per region, appended in whole units to grow that region deterministically. Each is
+# unique to its region, for the block-collision reason above: padding is not allowed to invent a
+# survivor, and no region may share a sentence with another.
+INNER_PAD = "The roster entry is reproduced in full here."
+FIRST_PAD = "The first removed region is padded out in full here."
+FIRST_ALT_PAD = "The first replacement region is padded out in full here."
+SECOND_PAD = "The second removed region is padded out in full here."
+SECOND_ALT_PAD = "The second replacement region is padded out in full here."
+
+# How many times each region's own sentences repeat. Roughly two blocks for the middle survivor
+# and a couple of blocks per gap, so neither survivor dwarfs the other and `--scr-max-spans 1`
+# has a real choice to make between them.
+INNER_REPEATS = 2
+FIRST_REPEATS = 1
+SECOND_REPEATS = 1
+
+
+def _region(sentences, filler, pad, repeats=1):
+    """One region of the interleaved fixture: its sentences, then its padding.
+
+    `pad` is a `(units, shift)` pair -- one unit is one copy of the region's own filler, and the
+    shift appends the alignment words on top. The leading space is the separator from the region
+    before it, the same join discipline `middle_text` and `tail_text` use.
+    """
+    units, shift = pad
+    return " " + _join(sentences, repeats) + " " + _join([filler], units) + _filler(
+        ALIGNMENT_SHIFT_WORD, shift)
+
+
+def inner_text():
+    """S1, the middle survivor: identical in both prompts, so it survives both deletions."""
+    return _region(INNER_SENTENCES, INNER_PAD, (0, 0), INNER_REPEATS)
+
+
+def first_removed_text(pad):
+    """R1: the first removed region, present only in prompt A."""
+    return _region(FIRST_REMOVED_SENTENCES, FIRST_PAD, pad, FIRST_REPEATS)
+
+
+def first_replacement_text(pad):
+    """R1': its replacement, present only in prompt B."""
+    return _region(FIRST_REPLACEMENT_SENTENCES, FIRST_ALT_PAD, pad, FIRST_REPEATS)
+
+
+def second_removed_text(pad):
+    """R2: the second removed region, present only in prompt A."""
+    return _region(SECOND_REMOVED_SENTENCES, SECOND_PAD, pad, SECOND_REPEATS)
+
+
+def second_replacement_text(pad):
+    """R2': its replacement, present only in prompt B."""
+    return _region(SECOND_REPLACEMENT_SENTENCES, SECOND_ALT_PAD, pad, SECOND_REPEATS)
+
+
+# How each shape's two prompts read, shown next to the request that runs them.
+PROMPT_A_SHAPE = {
+    "scope-a": "PREFIX + MIDDLE + TAIL, primes the KV cache",
+    "interleaved": "P + R1 + S1 + R2 + S2, primes the KV cache",
+}
+PROMPT_B_SHAPE = {
+    "scope-a": "PREFIX + TAIL: the middle is deleted, the tail survives",
+    "interleaved": "P + R1' + S1 + R2' + S2: both regions are replaced, both survivors survive",
+}
+
+
+def request_prompt(variant, pads):
+    """The prompt for `variant`, every region padded by `pads`.
+
+    `pads` is five `(units, shift)` pairs in prompt order -- P, R1, R1', R2, R2'. Scope A has no
+    interleaved regions, so it reads only the first two and leaves the rest at zero; the interleaved
+    shape reads all five. One signature for both, so no caller has to know which shape is live.
+    """
+    pads = tuple(pads) + ((0, 0),) * (max(0, 5 - len(pads)))
+    if SHAPE == "interleaved":
+        head = prefix_text(pads[0])
+        if variant == "a":
+            return (head + first_removed_text(pads[1]) + inner_text() +
+                    second_removed_text(pads[3]) + tail_text())
+        return (head + first_replacement_text(pads[2]) + inner_text() +
+                second_replacement_text(pads[4]) + tail_text())
+    # Scope A: A = PREFIX + MIDDLE + TAIL, B = PREFIX + TAIL. R1 is the middle.
+    head = prefix_text(pads[0])
     if variant == "a":
-        return head + middle_text(middle_units) + tail_text()
+        return head + middle_text(pads[1]) + tail_text()
     return head + tail_text()
 
 
-def solve_alignment(port, max_tokens, timeout, think):
-    """Pad PREFIX and MIDDLE so TAIL starts on a 64-token boundary in both prompts.
+# How many pad units one alignment search may try before giving up, and how many shifts it tries
+# inside each. Sixty was enough for the two original searches; the interleaved shape runs five of
+# them and each spends one measurement per shift, so the budget covers a far wider range of
+# reachable boundaries than the bare scan did. Every pad is a deterministic pair of counts, so two
+# runs on the same shape reproduce the same prompts.
+ALIGNMENT_BUDGET = 80
 
-    diff_prompt_edit matches whole 64-token blocks by hash, so TAIL is only recognised as a
-    surviving run if it begins at a block boundary in the previous prompt as well as the current
-    one. That needs len(PREFIX) and len(PREFIX)+len(MIDDLE) both divisible by 64. Token counts
-    cannot be predicted from characters, so measure with the server's own tokenizer and search.
+
+def _search_alignment(port, label, why, build, max_tokens, timeout, think):
+    """Grow one region until the text it builds lands on a 64-token boundary.
+
+    `build` takes a pad pair and returns the whole concatenation that has to be aligned, so what
+    is measured is the real text rather than a sum of per-region estimates. Returns the pad that
+    aligned it, or None when the budget ran out -- which the caller must treat as a failure, because
+    a misaligned edit engages nothing and the run would report full_reset.
+
+    One caveat on what "aligned" means here. `count_tokens` measures the whole rendered prompt,
+    which is the build text *plus* the generation prompt the template appends after it, while the
+    engine's block grid runs over the prompt itself. So a build whose count is a multiple of the
+    block is not necessarily a build whose region boundary sits on the grid: the boundary lands
+    `generation_prompt_tokens % 64` short of one. Both prompts share the offset, so the diff still
+    finds the survivors, but it finds them from the first *whole* block inside each one and drops up
+    to a block of their heads. That is why the fixtures keep their survivors at several blocks
+    rather than one: a survivor barely longer than a block can lose its match entirely to this
+    constant offset, which is exactly what a fixture tuned to the last block looks like when it
+    silently declines to engage.
     """
-    print("  aligning the surviving tail to a 64-token boundary...")
+    for units in range(0, ALIGNMENT_BUDGET):
+        for shift in range(0, ALIGNMENT_SHIFT_SPAN):
+            length = count_tokens(port, build((units, shift)), max_tokens, timeout, think)
+            if length % BLOCK_TOKENS == 0:
+                print(f"    {label} padded with {units} unit(s) + {shift} shift word(s) "
+                      f"-> {length} tokens, block aligned ({why})")
+                return (units, shift)
+    print(f"    WARNING: could not block-align {label} in {ALIGNMENT_BUDGET} attempts "
+          f"x {ALIGNMENT_SHIFT_SPAN} shifts")
+    return None
 
-    prefix_units = 0
-    for units in range(0, 60):
-        # What has to be block-aligned is len(PREFIX) itself: that is where the surviving run
-        # begins in prompt B, and the block grid is anchored at position 0 in both prompts.
-        # Measuring the whole prompt B aligns prompt B, which is a different number, and it only
-        # agrees when TAIL happens to be a whole number of blocks -- which is exactly the `--fact-in
-        # prefix` case that failed to align at all.
-        length = count_tokens(port, prefix_text(units), max_tokens, timeout, think)
-        if length % BLOCK_TOKENS == 0:
-            prefix_units = units
-            print(f"    PREFIX padded with {units} unit(s) -> {length} tokens, block aligned")
-            break
-    else:
-        print("    WARNING: could not block-align PREFIX in 60 attempts")
-        return None, 0
 
-    middle_units = 0
-    for units in range(0, 80):
-        # Same rule on the other side: len(PREFIX)+len(MIDDLE) is where the run begins in prompt A.
-        length = count_tokens(port, prefix_text(prefix_units) + middle_text(units),
-                              max_tokens, timeout, think)
-        if length % BLOCK_TOKENS == 0:
-            middle_units = units
-            print(f"    MIDDLE padded with {units} unit(s) -> {length} tokens, block aligned")
-            break
-    else:
-        print("    WARNING: could not block-align MIDDLE in 80 attempts")
-        return prefix_units, None
+def _alignment_targets(pads):
+    """The boundaries that must each land on a 64-token block, and how to build the text that
+    reaches each one.
 
-    tokens_b = count_tokens(port, request_prompt("b", prefix_units), max_tokens, timeout, think)
-    tokens_a = count_tokens(port, request_prompt("a", prefix_units, middle_units), max_tokens, timeout, think)
+    diff_prompt_edit matches whole blocks by hash on a grid anchored at position 0 in both prompts,
+    so a survivor is only recognised where it *begins* at a block boundary in both. Scope A has one
+    survivor, hence two boundaries. The interleaved shape has two survivors in two prompts, hence
+    five: len(P), len(P)+len(R1), len(P)+len(R1'), and len(P)+len(R1/R1')+len(S1)+len(R2/R2') for
+    where the tail survivor begins in each prompt. P is padded on its own so the two removed-region
+    searches stay independent of each other rather than of the prefix.
+    """
+    if SHAPE == "interleaved":
+        return [
+            ("P", "the leading span begins in both prompts",
+             lambda pad: prefix_text(pad)),
+            ("R1", "S1 begins in prompt A",
+             lambda pad: prefix_text(pads[0]) + first_removed_text(pad)),
+            ("R1'", "S1 begins in prompt B",
+             lambda pad: prefix_text(pads[0]) + first_replacement_text(pad)),
+            ("R2", "S2 begins in prompt A",
+             lambda pad: (prefix_text(pads[0]) + first_removed_text(pads[1]) + inner_text() +
+                          second_removed_text(pad))),
+            ("R2'", "S2 begins in prompt B",
+             lambda pad: (prefix_text(pads[0]) + first_replacement_text(pads[2]) + inner_text() +
+                          second_replacement_text(pad))),
+        ]
+    return [
+        ("PREFIX", "the surviving run begins in both prompts",
+         lambda pad: prefix_text(pad)),
+        ("MIDDLE", "the survivor begins in prompt A",
+         lambda pad: prefix_text(pads[0]) + middle_text(pad)),
+    ]
+
+
+def solve_alignment(port, max_tokens, timeout, think):
+    """Pad the live shape's regions until every survivor starts on a 64-token boundary.
+
+    Returns the five pads in prompt order -- P, R1, R1', R2, R2', each a `(units, shift)` pair --
+    or None when any of them could not be aligned. The searches are printed in full because a
+    misaligned edit is silent: the diff simply finds no surviving block and the run reports
+    full_reset, which the engagement check would then fail on with nothing to say about why.
+    """
+    print("  aligning the surviving spans to 64-token boundaries...")
+
+    pads = [(0, 0)] * 5
+    for index, (label, why, build) in enumerate(_alignment_targets(pads)):
+        pad = _search_alignment(port, label, why, build, max_tokens, timeout, think)
+        if pad is None:
+            return None
+        pads[index] = pad
+
+    tokens_a = count_tokens(port, request_prompt("a", pads), max_tokens, timeout, think)
+    tokens_b = count_tokens(port, request_prompt("b", pads), max_tokens, timeout, think)
+    if SHAPE == "interleaved":
+        _report_interleaved(port, pads, tokens_a, tokens_b, max_tokens, timeout, think)
+        return pads
+
     # The run is everything in prompt B after the shared prefix. Measuring the prefix directly is
     # the only sound way to get this: the sentinel this used to split on ("SECTION ONE") does not
     # occur in these prompts at all, so the split returned the whole string and the estimate was
     # wrong by the size of the prompt (it reported 647 of 856 tokens relocated where the applied
     # plan relocated 128). That error also drove the "harsher regime than the paper" warning below,
     # which then argued against a run that was actually inside the paper's regime.
-    prefix_only = count_tokens(port, prefix_text(prefix_units), max_tokens, timeout, think)
+    prefix_only = count_tokens(port, prefix_text(pads[0]), max_tokens, timeout, think)
     tail_tokens = tokens_b - prefix_only
     share = 100 * tail_tokens // max(tokens_b, 1)
     print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
@@ -317,9 +484,52 @@ def solve_alignment(port, max_tokens, timeout, think):
     # `span{... tok=...}` from the --scr-diag output for the number that was actually relocated.
     print(f"    relocated run is about {tail_tokens} tokens (~{tail_tokens // BLOCK_TOKENS} blocks), "
           f"roughly {share}% of the prompt (estimate; the applied plan is authoritative)")
-    print(f"    (the paper reuses ~8% of prompt tokens beyond prefix-cache hits; a share far above "
-          f"that is a much harsher regime than it measured)")
-    return prefix_units, middle_units
+    print("    (the paper reuses ~8% of prompt tokens beyond prefix-cache hits; a share far above "
+          "that is a much harsher regime than it measured)")
+    return pads
+
+
+def _report_interleaved(port, pads, tokens_a, tokens_b, max_tokens, timeout, think):
+    """Print the interleaved fixture's own arithmetic, so a run can be checked by hand.
+
+    Two survivors means two numbers to reconcile against the plan, and the pass criteria are written
+    in terms of both: segmented relocates S1 in full plus S2 minus its final block, and tail mode
+    relocates the longer of the two only. The measurements are of concatenations, so they carry the
+    usual boundary-merge slack -- the applied plan and the engine's own count stay authoritative.
+    """
+    # Measure each region as the difference of two concatenations, so a boundary merge inside one
+    # region cannot be attributed to another.
+    after_r1 = count_tokens(
+        port, prefix_text(pads[0]) + first_removed_text(pads[1]), max_tokens, timeout, think)
+    after_s1 = count_tokens(
+        port, prefix_text(pads[0]) + first_removed_text(pads[1]) + inner_text(),
+        max_tokens, timeout, think)
+    after_r2 = count_tokens(
+        port, prefix_text(pads[0]) + first_removed_text(pads[1]) + inner_text() +
+        second_removed_text(pads[3]), max_tokens, timeout, think)
+    inner_tokens = after_s1 - after_r1
+    tail_tokens = tokens_a - after_r2
+    inner_blocks = inner_tokens // BLOCK_TOKENS
+    tail_blocks = tail_tokens // BLOCK_TOKENS
+
+    delta = tokens_a - tokens_b
+    print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
+          f"the two edits differ by {delta} tokens ({delta // BLOCK_TOKENS} blocks)")
+    if delta % BLOCK_TOKENS != 0:
+        print(f"    WARNING: prompt A and prompt B differ by {delta} tokens, which is not a whole "
+              f"number of blocks; a per-dtype sweep's alignment guard would reject this fixture")
+    print(f"    S1 is about {inner_tokens} tokens (~{inner_blocks} blocks), S2 about "
+          f"{tail_tokens} tokens (~{tail_blocks} blocks)")
+    # S2 loses its final block to the final-token rule whatever its length: the prompt ends with the
+    # question S2 carries, so the last prompt token must be prefilled. S1 ends mid-prompt, at a
+    # replacement that is itself prefilled, so it is unaffected. The trim only bites when the
+    # rewrite boundary falls inside S2's last whole block -- if it sits past it, add 64 back, which
+    # is why the estimate says "about" and the applied plan decides.
+    segmented = inner_blocks * BLOCK_TOKENS + (tail_blocks - 1) * BLOCK_TOKENS
+    single = max(inner_blocks, tail_blocks - 1) * BLOCK_TOKENS
+    print(f"    segmented should relocate about {segmented} tokens (S1 whole, S2 minus its final "
+          f"block); tail mode about {single} (the longer survivor alone)")
+    print("    (estimates; the applied plan and the engine's own prefill count are authoritative)")
 
 
 def wait_for_health(port, proc, timeout):
@@ -394,6 +604,113 @@ def parse_done_lines(text):
     return records
 
 
+def scr_flags(args):
+    """Pass 1's flags: relocation on, in the mode under test, with the cap when one was asked for.
+
+    The cap goes after `--scr-mode` on purpose. The server parses left to right with last-one-wins,
+    and the caller's own `--base-args` come earlier still, so an explicit flag always wins over
+    whatever the base configuration says.
+    """
+    flags = ["--scr", "--scr-mode", args.scr_mode]
+    if args.scr_max_spans is not None:
+        flags += ["--scr-max-spans", str(args.scr_max_spans)]
+    return flags
+
+
+# `[scr-diag] prompt_tokens=798 base=0 rope_freq[0]=1e-06 rope_freq[17]=1e-05
+#  span{src=896 dst=576 tok=192 delta=-320 src_pages=14..14 dst_pages=9..9}
+#  ranges=2 [0,576) [768,798) remap[...]`
+SPAN_RE = re.compile(r"span\{src=(?P<src>\d+) dst=(?P<dst>\d+) tok=(?P<tok>\d+) "
+                     r"delta=(?P<delta>-?\d+)")
+RANGE_ITEM_RE = re.compile(r"\[(?P<begin>\d+),(?P<end>\d+)\)")
+
+
+def parse_relocation_plans(log_text):
+    """Every applied relocation plan the `--scr-diag` output printed, in the order they ran.
+
+    The runtime prints one line per request that relocated anything, and it is the only place the
+    spans and the derived ranges are visible at all -- the request log carries the token counts but
+    not the geometry. So this is where a plan's *shape* can be checked, as opposed to its
+    accounting, which the savings assertion covers from the request log.
+    """
+    plans = []
+    for line in log_text.splitlines():
+        if not line.lstrip().startswith("[scr-diag]") or "prompt_tokens=" not in line:
+            continue
+        prompt = re.search(r"prompt_tokens=(\d+)", line)
+        base = re.search(r"\bbase=(\d+)", line)
+        ranges_header = re.search(r"\branges=(\d+)", line)
+        if not (prompt and base and ranges_header):
+            continue
+        # Everything before `remap`, so the page mapping's own brackets can never be read as a
+        # prefilled range.
+        ranges_part = line.split("ranges=", 1)[1].split(" remap", 1)[0]
+        spans = [{"src": int(m.group("src")), "dst": int(m.group("dst")),
+                  "tok": int(m.group("tok"))} for m in SPAN_RE.finditer(line)]
+        ranges = [(int(m.group("begin")), int(m.group("end")))
+                  for m in RANGE_ITEM_RE.finditer(ranges_part)]
+        plans.append({
+            "prompt": int(prompt.group(1)),
+            "base": int(base.group(1)),
+            "spans": spans,
+            "ranges": ranges,
+            "ranges_reported": int(ranges_header.group(1)),
+        })
+    return plans
+
+
+def _intervals(pairs):
+    """`[(a, b), ...]` as `[a,b) [c,d)`, or `(none)` when there is nothing to show."""
+    return " ".join(f"[{begin},{end})" for begin, end in pairs) or "(none)"
+
+
+def check_relocation_plan(plan, expected_spans):
+    """Structural checks on one applied plan; returns a list of complaints.
+
+    The planner's own contract is that the prefilled ranges and the relocated spans tile the suffix
+    `[base, prompt)` exactly -- a token is prefilled or relocated but never unaccounted -- and that
+    every span is whole blocks in both prompts. That tiling is what keeps the summary's relocated
+    count honest, so it is checked directly rather than inferred from the savings line, which only
+    sees the totals. `expected_spans` is the count the mode claims: two separated survivors for
+    segmented on the interleaved fixture, one run everywhere else.
+    """
+    problems = []
+    label = f"plan(prompt={plan['prompt']}, base={plan['base']})"
+
+    if len(plan["ranges"]) != plan["ranges_reported"]:
+        problems.append(f"{label}: reported {plan['ranges_reported']} ranges but printed "
+                        f"{len(plan['ranges'])}")
+    if len(plan["spans"]) != expected_spans:
+        problems.append(f"{label}: relocated {len(plan['spans'])} span(s), expected "
+                        f"{expected_spans} -- {'segmented did not separate the two survivors, so ' if expected_spans > 1 else ''}"
+                        f"the plan is not the shape this run claims to measure")
+
+    # Tile the suffix with the ranges and the spans taken together, in prompt order.
+    pieces = sorted([(begin, end, "range") for begin, end in plan["ranges"]] +
+                    [(span["dst"], span["dst"] + span["tok"], "span") for span in plan["spans"]])
+    cursor = plan["base"]
+    for begin, end, kind in pieces:
+        if begin < cursor:
+            problems.append(f"{label}: {kind} [{begin},{end}) overlaps what precedes it at "
+                            f"{cursor}")
+        elif begin > cursor:
+            problems.append(f"{label}: {kind} [{begin},{end}) leaves [{cursor},{begin}) "
+                            f"unaccounted for")
+        cursor = max(cursor, end)
+    if cursor != plan["prompt"]:
+        problems.append(f"{label}: ranges and spans cover up to {cursor}, not the prompt end "
+                        f"{plan['prompt']}")
+
+    for span in plan["spans"]:
+        if span["src"] % BLOCK_TOKENS or span["dst"] % BLOCK_TOKENS or span["tok"] % BLOCK_TOKENS:
+            problems.append(f"{label}: span src={span['src']} dst={span['dst']} "
+                            f"tok={span['tok']} is not whole 64-token blocks")
+        if span["dst"] + span["tok"] >= plan["prompt"]:
+            problems.append(f"{label}: span dst={span['dst']} tok={span['tok']} reaches the "
+                            f"final prompt token, which must always be prefilled")
+    return problems
+
+
 def run_config(args, extra_flags, label):
     """Launches the server with `extra_flags`, runs requests A then B, returns B's text and log."""
     port = args.port
@@ -433,18 +750,21 @@ def run_config(args, extra_flags, label):
                 print(f"  server not healthy: {why}", file=sys.stderr)
                 return None, []
 
-            prefix_units, middle_units = solve_alignment(port, args.max_tokens,
-                                                        args.request_timeout, args.think)
+            pads = solve_alignment(port, args.max_tokens, args.request_timeout, args.think)
+            if pads is None:
+                print("  alignment failed: no survivor starts on a block boundary, so the edit "
+                      "would engage nothing. Aborting rather than reporting a full_reset run as a "
+                      "result.", file=sys.stderr)
+                return None, []
 
-            print("  request A (PREFIX + MIDDLE + TAIL, primes the KV cache)...")
-            _, _, usage_a, _ = post_completion(port, request_prompt("a", prefix_units or 0,
-                                                                  middle_units or 0),
-                                              args.max_tokens, args.request_timeout, args.think)
+            print(f"  request A ({PROMPT_A_SHAPE[SHAPE]})...")
+            _, _, usage_a, _ = post_completion(port, request_prompt("a", pads),
+                                               args.max_tokens, args.request_timeout, args.think)
             time.sleep(1.0)
 
-            print("  request B (PREFIX + TAIL: the middle is deleted, the tail survives)...")
+            print(f"  request B ({PROMPT_B_SHAPE[SHAPE]})...")
             content_b, reasoning_b, usage_b, finish_b = post_completion(
-                port, request_prompt("b", prefix_units or 0), args.max_tokens,
+                port, request_prompt("b", pads), args.max_tokens,
                 args.request_timeout, args.think)
             time.sleep(1.0)
         finally:
@@ -506,6 +826,21 @@ def main():
                         help="relocation shape to pass to --scr (default: tail). 'segmented' "
                              "exercises the interleaved-survivor path, whose savings differ from "
                              "the one contiguous run 'tail' uses.")
+    parser.add_argument("--shape", choices=("scope-a", "interleaved"), default="scope-a",
+                        help="prompt fixture to run (default: scope-a). 'scope-a' is the built-in "
+                             "[P R S] -> [P S] prompt, whose edit leaves one surviving run and so "
+                             "cannot tell the two relocation modes apart. 'interleaved' builds "
+                             "[P R1 S1 R2 S2] -> [P R1' S1 R2' S2], whose edit leaves two "
+                             "separated survivors: segmented relocates both, tail only the longer "
+                             "one, and that difference is the only thing that distinguishes them.")
+    parser.add_argument("--scr-max-spans", type=int, default=None,
+                        help="pass --scr-max-spans through to the --scr server (default: the "
+                             "server's own). 1 collapses segmented mode onto the single longest "
+                             "survivor, which is the choice tail mode makes, and so proves the cap "
+                             "bites on the interleaved plan rather than on one run. 0 is the "
+                             "flag-phase control -- the same server and fixture with relocation "
+                             "switched off -- which must relocate nothing and still answer "
+                             "identically, so anything else is the flags rather than relocation.")
     parser.add_argument("--scr-diag", action="store_true",
                         help="set NINFER_SCR_DIAG=1 on the server so it dumps the applied relocation "
                              "plan, the page remap, the bound block-table row, and whether the "
@@ -527,11 +862,12 @@ def main():
     # Split on whitespace. Deliberately not shlex: on Windows a backslash path would be mangled by
     # POSIX-style escape handling, and the server arguments here never need quoting.
     args.base_args_list = args.base_args.split()
-    global FACT_PLACEMENT, TAIL_REPEATS, PREFIX_REPEATS, TAIL_BLOCKS
+    global FACT_PLACEMENT, TAIL_REPEATS, PREFIX_REPEATS, TAIL_BLOCKS, SHAPE
     FACT_PLACEMENT = args.fact_in
     TAIL_REPEATS = args.tail_repeats
     PREFIX_REPEATS = args.prefix_repeats
     TAIL_BLOCKS = args.tail_blocks
+    SHAPE = args.shape
 
     artifact = next((a for a in args.base_args_list if a.lower().endswith(".ninfer")), None)
     if artifact is None:
@@ -567,9 +903,12 @@ def main():
     # arrives through --base-args, so what is printed here is what the server was actually given.
     print(f"KV dtype under test: --kv-dtype {kv_dtype}")
     print(f"Relocation shape under test: --scr-mode {args.scr_mode}")
+    print(f"Fixture under test: --shape {args.shape}")
+    if args.scr_max_spans is not None:
+        print(f"Span cap under test: --scr-max-spans {args.scr_max_spans}")
     print()
-    print(f"Pass 1: --scr --scr-mode {args.scr_mode}")
-    scr_result, scr_records = run_config(args, ["--scr", "--scr-mode", args.scr_mode], "scr")
+    print(f"Pass 1: {' '.join(scr_flags(args))}")
+    scr_result, scr_records = run_config(args, scr_flags(args), "scr")
     if scr_result is None:
         return 1
 
@@ -592,12 +931,14 @@ def main():
 
     # A request that threw leaves no completion record, so surface the server's own error text
     # rather than making the user go read the log file.
+    log_texts = {}
     for label in ("scr", "noscr"):
         log_path = os.path.join(tempfile.gettempdir(), f"ninfer_scr_{label}.log")
         if not os.path.exists(log_path):
             continue
         with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
             log_text = handle.read()
+        log_texts[label] = log_text
         # The runtime's own account of what it did, emitted when NINFER_SCR_DIAG was set.
         diagnostic = [line for line in log_text.splitlines() if "[scr-diag]" in line]
         if diagnostic:
@@ -613,13 +954,50 @@ def main():
             if needle in log_text:
                 problems.append(f"[{label}] server log contains '{needle}': {hint}")
 
+    # --- The applied plan's shape ------------------------------------------------------------
+    # The savings assertion below proves the prefill work matches the plan; this proves the plan is
+    # the shape the mode claims to measure, which nothing else can see: the request log carries the
+    # relocated token count but not the spans it came from. `--scr-diag` is the only place that
+    # geometry is printed, so on the interleaved fixture the whole point of the run -- two
+    # separated survivors, one prefilled range per gap -- is unobservable without it.
+    expected_spans = 2 if (args.shape == "interleaved" and args.scr_mode == "segmented") else 1
+    plans = parse_relocation_plans(log_texts.get("scr", ""))
+    if args.scr_diag:
+        if not plans:
+            # `--scr-max-spans 0` is the flag-phase control: it is supposed to relocate nothing, so
+            # a missing plan line is its expected output rather than a finding.
+            if args.scr_max_spans != 0:
+                problems.append("--scr-diag was set but no applied relocation plan was printed, so "
+                                "the span and range geometry could not be checked")
+        else:
+            print("applied relocation plan(s):")
+            for plan in plans:
+                print(f"  prompt={plan['prompt']} base={plan['base']} "
+                      f"spans={len(plan['spans'])} ranges={len(plan['ranges'])}")
+                print(f"    relocated: {_intervals([(s['dst'], s['dst'] + s['tok']) for s in plan['spans']])}")
+                print(f"    prefilled: {_intervals(plan['ranges'])}")
+                problems.extend(check_relocation_plan(plan, expected_spans))
+    elif args.shape == "interleaved":
+        print("(pass --scr-diag to check the plan's shape: span count, range count, and the "
+              "tiling between them)")
+
     if len(scr_records) < 2:
         problems.append(
             f"expected 2 completion records in the --scr run, saw {len(scr_records)}; "
             "check the server log for errors")
     else:
         second = scr_records[-1]
-        if second["reuse"] != "suffix_relocation":
+        if args.scr_max_spans == 0:
+            # The flag-phase control: the same server, the same fixture, the one flag that differs
+            # is the cap. The expected outcome is the inverse of every other run -- relocation
+            # switched off, nothing reused -- so the engagement check is turned around rather than
+            # reporting a vacuous pass as a failure.
+            if second["reuse"] == "suffix_relocation":
+                problems.append(
+                    "--scr-max-spans 0 still reported suffix_relocation; the cap is not being "
+                    "honoured, so the flag-phase control proves nothing")
+            print("  control run: relocation is switched off, so nothing may be reused")
+        elif second["reuse"] != "suffix_relocation":
             problems.append(
                 f"the --scr run reported reuse={second['reuse']}, not suffix_relocation. "
                 "SCR did not engage, so this comparison would be vacuous. "
@@ -670,6 +1048,14 @@ def main():
             print(f"  req {record['id']}: prompt={prompt} reuse={record['reuse']} "
                   f"relocated={record['relocated']} computed={computed} "
                   f"({100 * skipped // max(prompt, 1)}% of the prompt not prefilled)")
+            # The engine's own relocated count, read even when the reuse path is not relocation:
+            # a plan that downgraded itself must clear it, or a summary reports reuse that never
+            # ran. `--scr-max-spans 0` is the case that must report exactly zero.
+            if args.scr_max_spans == 0 and record["relocated"] != 0:
+                problems.append(
+                    f"request {record['id']} reported {record['relocated']} relocated tokens with "
+                    f"--scr-max-spans 0; the cap is not being honoured, so the flag-phase control "
+                    f"proves nothing")
             if computed != expected:
                 detail = (f"request {record['id']} ({record['reuse']}): the prefill computed "
                           f"{computed} prompt tokens, the plan accounts for {expected} "
@@ -734,7 +1120,11 @@ def main():
             print(f"  - {problem}")
         return 1
 
-    print("RESULT: PASSED (SCR engaged and produced identical output)")
+    if args.scr_max_spans == 0:
+        print("RESULT: CONTROL PASSED (relocation switched off: nothing reused, the work was a "
+               "cold prefill, and the output still matched --no-scr)")
+    else:
+        print("RESULT: PASSED (SCR engaged and produced identical output)")
     return 0
 
 
