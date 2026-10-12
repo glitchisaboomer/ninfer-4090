@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -293,7 +294,11 @@ struct RelocatedPageSubstitution {
 
 // Computes that transition. `current_ids` is the mapping being replaced (its pages, in logical order,
 // with repeats for a page mapped more than once), `mapping` the mapping being published, and
-// `protected_pages` the physical pages the copies will read, by occurrence.
+// `protected_pages` the physical pages the copies will read. A page appears as many times as the
+// moves read it -- an off-grid span reads the page its destination page starts in twice, once for the
+// head of the destination page and once for the tail of the one before it -- so this is membership,
+// not a count: what matters is that the page is read at all, and handing back *any* occurrence of it
+// frees it for another lane while the copies are still reading it.
 //
 // The one difference from `PagedKVAllocation::reassign_pages`' substitution is the point of this
 // function: a page the copies read is never a destination, so it is held out of the reuse and handed
@@ -324,28 +329,25 @@ struct RelocatedPageSubstitution {
         if (--found->second == 0) { remaining.erase(found); }
     }
 
-    // The copies read these pages, so they are priced against what the allocation owns rather than
-    // against what is left over: a page the mapping still names is read while mapped, and a protected
-    // page the allocation does not own at all is a caller error, not a silent no-op.
-    std::map<std::int32_t, std::uint32_t> protected_left;
-    std::map<std::int32_t, std::uint32_t> protected_all;
+    // The copies read these pages, so they are checked against what the allocation owns rather than
+    // against what is left over -- a page the mapping still names is read while mapped, and a
+    // protected page the allocation does not own at all is a caller error, not a silent no-op. The
+    // check is per *page*, not per occurrence: a page read by two moves is still one owned page.
+    std::set<std::int32_t> protected_pages_set;
     for (const std::int32_t page_id : protected_pages) {
-        ++protected_left[page_id];
-        ++protected_all[page_id];
-        const auto found = owned.find(page_id);
-        if (found == owned.end() || protected_all[page_id] > found->second) {
+        if (owned.find(page_id) == owned.end()) {
             throw std::invalid_argument(
                 "Paged KV relocation copies from a page this allocation does not own");
         }
+        protected_pages_set.insert(page_id);
     }
 
     std::vector<std::int32_t> free_surplus;
     std::vector<std::int32_t> held;
     for (const auto& entry : remaining) {
+        const bool read_by_a_copy = protected_pages_set.count(entry.first) != 0;
         for (std::uint32_t occurrence = 0; occurrence < entry.second; ++occurrence) {
-            const auto blocked = protected_left.find(entry.first);
-            if (blocked != protected_left.end() && blocked->second != 0) {
-                --blocked->second;
+            if (read_by_a_copy) {
                 held.push_back(entry.first);
                 continue;
             }

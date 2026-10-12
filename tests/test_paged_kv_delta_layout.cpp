@@ -605,7 +605,24 @@ void test_relocated_page_substitution() {
     rejected("a mapping naming a page the allocation does not own", {10, 11}, {10, 99}, {});
     rejected("a mapping naming the same owned page twice", {10, 11}, {10, 10}, {});
     rejected("a copy reading a page the allocation does not own", {10, 11}, {10, 11}, {99});
-    rejected("a copy reading the same page twice", {10, 11}, {10, 11}, {10, 10});
+
+    // Reading one page from two moves is not an error, it is the ordinary shape of an off-grid span:
+    // the destination page that starts inside a source page reads its head from that page, and the
+    // destination page after it reads that same page's tail. What matters is that the page is read at
+    // all, so both occurrences are stripped of their surplus in one go and nothing is handed back
+    // while the copies are still reading it.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12};
+        const std::vector<std::int32_t> mapping{10, kPagedKVAquirePage, kPagedKVAquirePage};
+        const std::vector<std::int32_t> protected_pages{11, 11};
+        const RelocatedPageSubstitution out =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        check(out.from_pool == 1, "a page read twice still cannot take a destination slot");
+        check(out.held_for_copy.size() == 1 && out.held_for_copy[0] == 11,
+              "and it is held once, as the page it is");
+        check(out.final_ids[1] == 12 && out.final_ids[2] == kPagedKVAquirePage,
+              "so the other dropped page pays for one destination and the pool for the other");
+    }
 }
 
 } // namespace

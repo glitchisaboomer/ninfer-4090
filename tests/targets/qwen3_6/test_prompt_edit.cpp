@@ -8,6 +8,8 @@
 
 #include "targets/qwen3_6/impl/runtime/prompt_edit.h"
 
+#include "core/paged_kv_delta_layout.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <exception>
@@ -1139,6 +1141,110 @@ void test_shifted_pricing_excludes_the_copy_sources() {
            "a logical page the mapping does not name blocks nothing");
 }
 
+// The planner prices a copied relocation so it can refuse one the pool cannot afford, and the copier
+// performs a substitution that spends the pages it priced. Those are two functions in two layers,
+// written from the same rules but not from one expression, and the failure of the pair is not
+// symmetric: a price that *under*-states the demand is refused by the allocation's own check after
+// the planner has already reported the reuse, which is a 500 on a prompt shape the pool can serve.
+//
+// So the two are compared here over shapes that put the copied destinations, the pages they read and
+// the pages the mapping drops in different relations to each other. The price is allowed to be
+// larger -- a source the mapping still names blocks budget it never could have spent -- but never
+// smaller, and where every source is a dropped page the two have to agree exactly.
+void test_copied_price_covers_the_substitution_the_copier_performs() {
+    using ninfer::kPagedKVAquirePage;
+    using ninfer::plan_relocated_page_moves;
+    using ninfer::plan_relocated_page_substitution;
+    using ninfer::RelocatedCopySpan;
+    using ninfer::RelocatedPageMove;
+    using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
+    using ninfer::targets::qwen3_6::detail::plan_copied_page_remap;
+    using ninfer::targets::qwen3_6::detail::remap_pages_from_pool;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::shifted_relocation_pages_from_pool;
+
+    expect(kRemapAcquirePage == kPagedKVAquirePage,
+           "the planner's acquire sentinel is the one the core substitution spells");
+
+    bool saw_a_strict_case = false;
+    bool saw_an_exact_case = false;
+    for (std::uint32_t resident = 12; resident <= 20; resident += 4) {
+        for (std::uint32_t offset = 0; offset < kPromptEditBlockTokens; offset += 13) {
+            for (std::uint32_t dest_page = 1; dest_page <= 3; ++dest_page) {
+                // An identity mapping, so a logical page and its physical page are told apart by the
+                // arithmetic under test rather than by the ids looking different.
+                std::vector<std::int32_t> current(resident);
+                for (std::uint32_t page = 0; page < resident; ++page) {
+                    current[page] = static_cast<std::int32_t>(30 + page);
+                }
+                const std::uint32_t prompt_tokens = resident * kPromptEditBlockTokens;
+                const std::uint32_t prefix_reuse  = kPromptEditBlockTokens;
+                const std::vector<RelocatedSpan> spans{
+                    RelocatedSpan{.source_begin = 4 * kPromptEditBlockTokens + offset,
+                                  .dest_begin   = dest_page * kPromptEditBlockTokens,
+                                  .tokens       = 3 * kPromptEditBlockTokens}};
+
+                const std::vector<std::int32_t> remap =
+                    plan_copied_page_remap(current, spans, prefix_reuse, prompt_tokens);
+                expect(!remap.empty(), "a whole-page destination is an expressible copied relocation");
+                if (remap.empty()) { continue; }
+
+                const std::vector<RelocatedCopySpan> copy_spans{RelocatedCopySpan{
+                    spans[0].source_begin, spans[0].dest_begin, spans[0].tokens}};
+                const std::vector<RelocatedPageMove> moves =
+                    plan_relocated_page_moves(copy_spans, current.size());
+
+                // What the runtime prices: the pages the moves read, in logical coordinates. Not a
+                // page-by-page walk of the source range -- that misses the page holding the span's
+                // last token whenever the span does not end on a page boundary, which is every
+                // off-grid span, and a price one page short is a refusal after the fact.
+                std::vector<std::uint32_t> source_logical;
+                for (const RelocatedPageMove& move : moves) {
+                    source_logical.push_back(static_cast<std::uint32_t>(move.source_page));
+                }
+                std::sort(source_logical.begin(), source_logical.end());
+                source_logical.erase(std::unique(source_logical.begin(), source_logical.end()),
+                                     source_logical.end());
+                const std::uint32_t price =
+                    shifted_relocation_pages_from_pool(current, remap, source_logical);
+
+                std::vector<std::int32_t> protected_pages;
+                protected_pages.reserve(moves.size());
+                for (const RelocatedPageMove& move : moves) {
+                    protected_pages.push_back(
+                        current[static_cast<std::size_t>(move.source_page)]);
+                }
+                const ninfer::RelocatedPageSubstitution substitution =
+                    plan_relocated_page_substitution(current, remap, protected_pages);
+
+                if (price < substitution.from_pool) {
+                    std::cerr << "FAIL: resident=" << resident << " offset=" << offset
+                              << " dest_page=" << dest_page << " priced " << price
+                              << " but the copier spends " << substitution.from_pool << '\n';
+                    ++failures;
+                }
+                if (source_logical.front() > prefix_reuse / kPromptEditBlockTokens) {
+                    // Every page the copies read is above the carried prefix, so all of them are
+                    // dropped and the two functions are counting the same occurrences.
+                    saw_an_exact_case = true;
+                    if (price != substitution.from_pool) {
+                        std::cerr << "FAIL: resident=" << resident << " offset=" << offset
+                                  << " dest_page=" << dest_page << " priced " << price
+                                  << " against a demand of " << substitution.from_pool << '\n';
+                        ++failures;
+                    }
+                }
+                if (remap_pages_from_pool(current, remap) < substitution.from_pool) {
+                    saw_a_strict_case = true;
+                }
+            }
+        }
+    }
+    expect(saw_an_exact_case, "the sweep reached a shape where the two agree exactly");
+    expect(saw_a_strict_case,
+           "and one where the re-pointing price would have understated the copying one");
+}
+
 } // namespace
 
 int main() {
@@ -1167,6 +1273,7 @@ int main() {
     test_shifted_selector_quantizes_only_the_destination();
     test_plan_copied_page_remap_acquires_every_relocated_page();
     test_shifted_pricing_excludes_the_copy_sources();
+    test_copied_price_covers_the_substitution_the_copier_performs();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";
