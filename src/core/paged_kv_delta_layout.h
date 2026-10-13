@@ -93,6 +93,22 @@ inline constexpr std::uint32_t kRopeDeltaRangeEmpty = 0xffffffffu;
     return (packed >> 6) & 0x7fu;
 }
 
+// A page whose packed interval is a strict subset of the page: part of its tokens were
+// relocated and part were not, so no single whole-page shift can describe either half and only the
+// boundary-aware score path can read it correctly.
+//
+// This is the single definition of "the boundary-aware score path applies". Every kernel must take
+// it from here rather than re-deriving it from the packed fields: `rope_delta_page_range_begin`
+// reads the empty sentinel as offset 63 and `rope_delta_page_range_end` as 127, so a derivation
+// that forgets the emptiness guard mistakes an ordinary page for a partial one. That failure is
+// silent -- both halves rotate plausibly -- which is why it gets a tested definition instead of
+// being spelled out at each use.
+[[nodiscard]] constexpr bool rope_delta_page_range_is_partial(std::uint32_t packed) noexcept {
+    if (rope_delta_page_range_is_empty(packed)) { return false; }
+    return rope_delta_page_range_begin(packed) != 0 ||
+           rope_delta_page_range_end(packed) != static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
 struct RopeDeltaLayout {
     std::int32_t logical_pages = 0;
     std::int32_t table_rows    = 0;

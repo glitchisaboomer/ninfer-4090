@@ -250,9 +250,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             const std::uint32_t* range_table = metadata.delta_range_table_ptr();
             const std::uint32_t new_range =
                 range_table == nullptr ? kRopeDeltaRangeEmpty : range_table[kb];
-            const bool partial = !rope_delta_page_range_is_empty(new_range) &&
-                                 (rope_delta_page_range_begin(new_range) != 0 ||
-                                  rope_delta_page_range_end(new_range) != kPagedKVPageSize);
+            const bool partial = rope_delta_page_range_is_partial(new_range);
             const std::int32_t new_delta = partial ? 0 : new_page_delta;
             current_page_delta = new_page_delta;
             current_range = new_range;
@@ -296,9 +294,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     };
 
     auto recompute_boundary_scores = [&](int kb, int k0, float scores[QKNt][4]) {
-        const bool partial = !rope_delta_page_range_is_empty(current_range) &&
-                             (rope_delta_page_range_begin(current_range) != 0 ||
-                              rope_delta_page_range_end(current_range) != kPagedKVPageSize);
+        const bool partial = rope_delta_page_range_is_partial(current_range);
         if (!partial || current_page_delta == 0) { return; }
 
         gqa_prefill_rotate_q_smem_inplace(q_s, Br, tid, Threads, current_page_delta, freq);

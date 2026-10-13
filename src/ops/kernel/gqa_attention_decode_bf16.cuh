@@ -212,9 +212,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         current_page_delta = delta_row[first_page];
         if (delta_range_row != nullptr) { current_range = delta_range_row[first_page]; }
     }
-    const bool current_partial = !rope_delta_page_range_is_empty(current_range) &&
-                                 (rope_delta_page_range_begin(current_range) != 0 ||
-                                  rope_delta_page_range_end(current_range) != kPagedKVPageSize);
+    const bool current_partial = rope_delta_page_range_is_partial(current_range);
     std::int32_t current_delta = current_partial ? 0 : current_page_delta;
     if (delta_row != nullptr) {
         // No runtime cross-check against pos[]. The doc asks for one, but pos[] holds
@@ -247,10 +245,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 const std::uint32_t new_range =
                     delta_range_row == nullptr ? kRopeDeltaRangeEmpty
                                                : delta_range_row[new_logical_page];
-                const bool new_partial =
-                    !rope_delta_page_range_is_empty(new_range) &&
-                    (rope_delta_page_range_begin(new_range) != 0 ||
-                     rope_delta_page_range_end(new_range) != kPagedKVPageSize);
+                const bool new_partial = rope_delta_page_range_is_partial(new_range);
                 const std::int32_t base_delta = new_partial ? 0 : new_delta;
                 if (base_delta != current_delta) {
                     for (int idx = tid; idx < Br * D; idx += Threads) {
@@ -340,10 +335,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             }
             }
 
-        if (!rope_delta_page_range_is_empty(current_range) &&
-            (rope_delta_page_range_begin(current_range) != 0 ||
-             rope_delta_page_range_end(current_range) != kPagedKVPageSize) &&
-            current_page_delta != 0) {
+        if (rope_delta_page_range_is_partial(current_range) && current_page_delta != 0) {
             unsigned shifted_q[QKKs][4];
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
