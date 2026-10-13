@@ -127,6 +127,11 @@ the packed table intentionally carries only one interval there. The CUDA numeric
 aligned and mixed destination pages, but must still be run on the RTX 4090 before enabling this for
 default traffic.
 
+How to extend it to the i8 family is specified below — *Extending the boundary score path to INT8 and
+the packed layouts* — including why it is bounded rather than prohibitive, the one place it is
+structurally harder than the bf16 version, and a trap in the decode kernels' page handling that
+reads like a bug and is not.
+
 A copy can write anywhere, so the destination is not free for a *copy* reason: a page carries exactly
 one RoPE delta, and a page holding both relocated and prefilled tokens could carry no single shift.
 Freeing the destination therefore means either making the delta finer or doing without it:
@@ -160,6 +165,106 @@ only to a run shorter than about two pages (a one-page run lands nowhere with pr
 **So do the source side first** — it is the difference between 0% and ~97% — then read the surviving
 run lengths off the `[scr-diag]` spans in real traffic. If they are typically far above 256 tokens,
 stop here; if short survivors dominate, mechanism 1 is the one to build.
+
+### Extending the boundary score path to INT8 and the packed layouts
+
+BF16 is live and INT8 is deferred. This is what the deferred half costs.
+
+**Why it is bounded rather than prohibitive.** RoPE never touches the whole head. The i8 kernels gate
+the rotation on `grp == 0` (`src/ops/kernel/gqa_attention_decode_i8.cuh:431`), because group 0 is the
+only one covering dims `[0, 64)` — the rotary region. With `kGqaKvQuantHeadDim = 256` and
+`kGqaKvQuantGroup = 64` there are four groups (`src/ops/kernel/gqa_attention_kv_quant.cuh:21-23`), so
+group 0 is 2 of the 8 `GroupKc` iterations in the score loop: **25% of the QK MMA**. The bf16 fix-up
+shape therefore carries over at a quarter of its apparent cost — re-run with a shifted Q, splice the
+scores per key — not at double it.
+
+**Why it is nonetheless harder than bf16.** The bf16 path can copy its A operand into registers
+(`af_q`) and rotate the copy, because that operand *is* the query. On i8 it is not: Q has already been
+rotated, Hadamard-transformed, `amax`-quantized and split into codes plus per-group scales
+(`gqa_attention_decode_i8.cuh:416-442`). An int8 code cannot be rotated. So the shifted variant needs
+`stage_and_quantize_q` run again into a **second** staged operand with its own scales, and the MMAs re-run
+against the same K. Two consequences:
+
+- `q_scale_tmp` has no free slot. It is `reinterpret_cast<float*>(p_s)`
+  (`gqa_attention_decode_i8.cuh:113`) — the Q scale array is aliased onto the P-matrix arena, and P is
+  written later in the same key block. The second scale array must come from somewhere that does not
+  collide, not from `p_s`.
+- The score is accumulated **per group** and is live and partial throughout
+  (`score[nt][x] += q_scale_r0[g] * ka * c`). A splice needs the baseline score, the baseline group-0
+  score and the shifted group-0 score at the same time, which is ~32 floats over the current 16 in a
+  kernel that has already had one register fight (the `q_scale_r0` comment records moving a
+  `__shfl_sync` to an LDS broadcast to escape an `-rdc` ABI stack frame). **Hold those accumulators in
+  shared memory, not registers** — `p_s` is idle during the score phase — and re-measure.
+
+**A trap that reads like a bug and is not.** `issue_kv_tile` takes a single `physical_page` for the
+whole tile and indexes with `key & kPagedKVPageMask` (`gqa_attention_decode_i8.cuh:340-400`), and the
+advance only fires on `(k0 & 63) == 0`. With `Bc == 32` that looks like it must read the wrong page
+for any tile starting at page offset 32. It cannot: `first_tile = (split_start / Bc) * Bc` is
+`Bc`-aligned by construction, and both `Bc` values in use (32 and 64) divide `kPagedKVPageSize`, so
+every key tile lies wholly inside one logical page — a tile from offset 32 with `Bc=32` covers offsets
+32..63 and stays in its page. Simulating both the bf16 synchronous and the i8 prefetch forms of the
+advance over every `(window, splits, Bc)` up to 4200 tokens gives 1.6M cases and zero mismatches.
+**Do not add a per-key page lookup to fix this.** It would cost a `block_table` load and a dependent
+issue per key on the hot decode path to defend against an impossible case, and on a memory-bound kernel
+that is a real regression for no correctness gain.
+
+What that invariant *does* mean is that the boundary gate needs no page arithmetic of its own: the
+range plane is per logical page, the tile is inside one page, and the gate is a comparison of
+`key & kPagedKVPageMask` against the packed interval — the same
+`rope_delta_page_range_is_partial` predicate the bf16 kernels now use.
+
+**Shared-memory budget.** Group 0 only needs duplicating, not the whole head, so the second operand is
+`Br * kGqaKvQuantGroup` int8 plus two extra scale slots per row:
+
+| decode config | current | +second group 0 | total |
+|---|---|---|---|
+| `<6,1,32,true>` | 47.7 KB | +3.4 KB | 51.1 KB |
+| `<8,2,32,false>` | 52.8 KB | +4.5 KB | 57.2 KB |
+| `<6,1,64,true>` | 83.2 KB | +3.4 KB | 86.6 KB |
+
+Ceiling is the sm_89 per-block shared-memory opt-in limit. The `<6,1,64,true>` shape
+(`src/ops/launcher/gqa_attention_decode.cu:179`, reached above an 8198-token implementation window) is
+the one that fits least comfortably, and the first thing to check with
+`cudaDevAttrMaxSharedMemoryPerBlockOptin` before starting.
+
+**Prefill is the easier half.** `kGqaPrefillI8Bc = 64` equals the page size
+(`src/ops/kernel/gqa_attention_prefill_i8.cuh:25`), so a key block is exactly one logical page and the
+page question does not arise. The range table is already delivered: `gqa_attention_prompt_attention_launch`
+builds `GqaPrefillDirectMetadata` with `cache.rope_delta_ranges.data` and dispatches by head count to
+bf16 *or* i8 (`src/ops/launcher/gqa_attention_prefill.cu:159`), so the i8 prefill kernel receives the
+pointer and ignores it. What it needs is the same two-lambda split the bf16 kernel gained: an explicit
+`load_and_rotate_q(delta)` so the boundary recompute can undo its in-place rotation by an ordinary
+reload at angle 0 rather than a sentinel. Its two page-transition sites are
+`gqa_attention_prefill_i8.cuh:648` and `:838`, mirroring bf16's two loops.
+
+**Gates to change, both in `src/targets/qwen3_6/impl/runtime/request_plan_impl.h`.**
+`delta_path_supports_dtype` at `:21` must stop returning true for `DType::I8` before the kernels can
+consume it (it is what currently stops the planner admitting a plan it cannot execute), and the
+`kv_dtype == DType::BF16` test at `:343` must widen once decode and prefill are both done. Leave the
+former true and the planner will produce mixed-page spans that read wrong scores silently; leave the
+latter narrow and nothing changes.
+
+**Checks required before this half ships.** Distinct from the document-level *Verification
+ladder* at the foot of this file, whose items 1-8 still apply unchanged.
+
+1. *Compile-side, no GPU:* `nvcc --ptxas-options=-v` on the existing kernel for a baseline register and
+   spill count, then again after the change. This is the only measurement that can change the design —
+   if spills appear, the accumulators move to shared memory as above. Get it before writing the
+   feature, not after.
+2. *Host:* `tests/test_paged_kv_delta_layout.cpp` already pins the encoding and the predicate, so the
+   i8 work adds nothing there.
+3. *Device:* extend `tests/ops/test_gqa_kv_page_delta_i8.cpp` with the unaligned scenario the bf16
+   equivalent gained — the harness, its `Int8Cache` fixture and its FP64 anchor all already exist, so
+   this is a port rather than new scaffolding. Keep the negative control: zeroed deltas on the
+   relocated scenario must still fail loudly.
+4. *Hardware:* the numerical oracle over mixed destination pages on every quantized layout
+   (`int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), then decode throughput on the 4090 to confirm
+   the 25%-extra-QK-on-rare-pages reading. Per `AGENTS.md` this is a gate on enabling the path for
+   default traffic, not on building it.
+
+Until all four are done, INT8 and the packed layouts stay on whole-page destinations, which is the
+status line above. The measured cost of that status quo is the fringe table in the previous section,
+so it is a known and bounded hold, not a silent one.
 
 ## What this does not fix
 
