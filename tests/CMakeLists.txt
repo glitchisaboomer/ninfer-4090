@@ -286,6 +286,16 @@ ninfer_add_op_test(ninfer_gqa_attention_test
 ninfer_add_op_test(ninfer_scr_relocation_integration_test
   SOURCES ops/test_scr_relocation_integration.cpp
   LIBRARIES ninfer_ops)
+# The copied-relocation oracle: an off-grid source relocated by payload copy,
+# held bit-for-bit against the pages it was copied from and read back through
+# the public attention entry points. Pool-backed, because the copier is a
+# PagedKVAllocation method inside a real PagedKVPool; the planner chain it drives
+# (diff_prompt_edit_shifted, plan_shifted_relocations, plan_copied_page_remap)
+# lives in ninfer_engine, hence the second library. Device-only (a pool and a
+# CUDA stream), gated off by ninfer_add_op_test's SKIP_RETURN_CODE.
+ninfer_add_op_test(ninfer_scr_copied_relocation_test
+  SOURCES ops/test_scr_copied_relocation.cpp
+  LIBRARIES ninfer_ops ninfer_engine)
 
 # Oracle test for the per-page RoPE delta machinery. It calls detail:: launchers directly with a real
 # delta plane, so it validates the Phase 4a Q counter-rotation path independently of the physical K
