@@ -266,6 +266,60 @@ Until all four are done, INT8 and the packed layouts stay on whole-page destinat
 status line above. The measured cost of that status quo is the fringe table in the previous section,
 so it is a known and bounded hold, not a silent one.
 
+### Known defect in the live BF16 boundary path: two missing barriers
+
+This section records a defect found by audit while writing the plan above. It is **not fixed**, and
+the fix has deliberately not been written down as a patch, so that whoever picks this up decides
+after seeing a hardware run rather than inheriting an unvalidated change. Analysis only; no
+execution.
+
+**Where.** `src/ops/kernel/gqa_attention_prefill_bf16.cuh`, the `recompute_boundary_scores` lambda
+(lines 305-355). `q_s` is `[64][256]` bf16 in shared memory (`:139`).
+`gqa_prefill_rotate_q_smem_inplace` writes cols 0-63 of **every** row
+(`gqa_attention_prefill_common.cuh:119-135`); the baseline QK's `ldmatrix_x4` reads cols 0-255 of this
+warp's 16 rows (`:393`, `:408`). The two regions overlap.
+
+**Hazard 1 — baseline reads vs. the in-place rotation.** The Phase 1 loop reads `q_s` for the
+baseline scores and then calls `recompute_boundary_scores`, whose first act is to overwrite `q_s` in
+place (`:309`), with the barrier only *after* it (`:310`).
+
+```
+ldmatrix_x4(af[0] ...)      // baseline reads q_s
+mma_bf16(...)
+recompute_boundary_scores(...)   →  rotate_q_smem_inplace(q_s)   // writes q_s
+                              →  __syncthreads()                // too late
+```
+
+Within a warp these are program-ordered. Across warps they are not: warp 1 can be writing `q_s`
+while warp 0 is still issuing its baseline `ldmatrix`, so warp 0 computes baseline scores from
+*rotated* Q. Since the whole point of the lambda is to combine rotated and unrotated halves, a
+contaminated baseline corrupts the splice at `:335-349`.
+
+**Hazard 2 — shifted-score reads vs. the Q reload.** The lambda reads the now-rotated `q_s` for the
+shifted scores (`:316`), splices them, and then calls `load_and_rotate_q(0)` (`:354`), which *issues*
+`cp_async<16>` into `q_s` (`:253`) before any barrier. Warp 0 can still be reading `q_s` at `:316`
+while warp 1's async write is already landing in it.
+
+**Both barriers are provably legal.** `kGqaPrefillThreads = 128` and `kGqaPrefillBr = 64` give 4 warps
+for 4 row tiles, so every warp owns a row tile. There is no `if (warp < RowTiles)` guard anywhere in
+this file — the only early-out is `:152` — and both call sites (`:424`, `:587`) are unguarded. All
+128 threads reach the lambda, so barriers are safe there.
+
+**Cost is zero on the ordinary path.** The lambda returns early at `:307` unless the page is
+partial, so both barriers only ever execute on a mixed page — which is precisely the unverified new
+functionality, and also why nothing has tripped over it yet.
+
+**How to confirm before fixing.** A single oracle pass proving nothing is worth noting: a
+shared-memory ordering can be benign under one SM scheduling pattern and fail under another, so this
+is the failure mode least likely to be caught once. Run the mixed-page oracle
+(`tests/ops/test_gqa_kv_page_delta.cpp`) in a loop rather than once; `CUDA_LAUNCH_BLOCKING=1` and
+`compute-sanitizer --tool racecheck` are both direct checks.
+
+**Sequencing implication.** Do this before the INT8 work above. The i8 port copies this exact
+rotate-then-reload structure — `gqa_attention_prefill_i8.cuh:648` and `:838` mirror bf16's two
+loops — so it would inherit both hazards plus its own quantized-Q variants, and the ptxas register
+check listed in the previous section moves to second place.
+
 ## What this does not fix
 
 - **The pre-edit head is still prefilled.** When SCR fires, the plan's reuse path is a `FullReset`, so
