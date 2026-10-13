@@ -14,6 +14,20 @@ see *Read this first*. This document specifies the test that closes that gap.
 Build and run happen on the Windows/CUDA box; the Linux sandbox has no nvcc and can only
 type-check.
 
+**Status (2026-10-13): implemented, never executed.** `tests/ops/test_scr_copied_relocation.cpp`
+exists and is registered in `tests/CMakeLists.txt`, and it is the form this document specifies
+(seven assertion groups, the real planner chain, the `{bf16, rk4v4-e8} x {PageMajor, HeadMajor}`
+matrix with the one correction recorded under *The pool*). What has been verified, and how:
+
+- the scenario's arithmetic — spans, mapping, deltas, the 8 moves, `from_pool = 7`, held = 7 — was
+  run against the real planner chain on a host build (`prompt_edit.cpp` and
+  `paged_kv_delta_layout.h` are CUDA-free), and the test asserts those numbers;
+- the TU compiles clean (`g++ -std=c++20 -Wall -Wextra -fsyntax-only` against the repo headers with
+  minimal CUDA stubs, since this sandbox has no toolkit);
+- **nothing in it has run.** There is no CUDA device here, so no byte comparison, no attention
+  number and no control separation exists yet. The gate below still stands: Phase 4d cannot be
+  committed until this binary is green on the Windows box.
+
 ---
 
 ## Read this first: what actually ran on hardware
@@ -50,7 +64,7 @@ copied path has exactly zero execution anywhere. That is the gap.
 | Device copy (`PagedKVAllocation::relocate_copied_pages`, `src/core/paged_kv_cache.cu:752`) and its runtime wiring (`program_impl.h`, the `copying` branch) | **written blind — never compiled before 2026-10-13's fix, never executed** |
 | Runtime branch that engages the copier | compiles; reached only by an off-grid span, which no fixture produces |
 | Hardware e2e, flag on | passed, but re-pointed; the copier was not on the path |
-| **Device oracle for the copy** | **not written — this is the work** |
+| **Device oracle for the copy** (`tests/ops/test_scr_copied_relocation.cpp`) | **written and registered; arithmetic host-verified and TU syntax-clean; never run — no GPU on the authoring machine** |
 
 ---
 
@@ -65,8 +79,14 @@ test in `tests/CMakeLists.txt`:
 # Device-only (a PagedKVPool and a CUDA stream), gated off by ninfer_add_op_test's SKIP_RETURN_CODE.
 ninfer_add_op_test(ninfer_scr_copied_relocation_test
   SOURCES ops/test_scr_copied_relocation.cpp
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops ninfer_engine)
 ```
+
+`ninfer_engine` is required and not optional: the planner chain the scenario drives
+(`prompt_edit.cpp`: `diff_prompt_edit_shifted`, `plan_shifted_relocations`,
+`plan_copied_page_remap`) compiles into `ninfer_engine`, not `ninfer_ops`, so a
+`ninfer_ops`-only registration fails to link. `prompt_edit.h` is CUDA-free by design, which is
+what lets a device test include it at all.
 
 Why a new file instead of extending `test_scr_relocation_integration.cpp`: that test is BF16-only
 and hand-builds its own plane tensors through `gqa_relocation_test_common.h`'s `Cache`. The copier
@@ -96,6 +116,19 @@ the copier reads its strides out of the plane `Tensor` instead of deriving them 
 orders work (`paged_kv_cache.cu`, the `page_major` branch), and that code is one of the written-blind
 review items named in `a1c27b26`'s message.
 
+**Correction (implemented, 2026-10-13): the attention matrix is PageMajor only.** The Ops address
+pages page-major — `paged_kv_page_head_offset` (`src/ops/kernel/paged_kv_address.cuh:20-25`) hardcodes
+`head + HeadExtent * physical_page` — so a `HeadMajor` plane neither passes `validate_cache`'s shape
+and contiguity rules (`{leading, page, heads, pages}` with contiguous strides) nor can be written by
+`ops::gqa_kv_append`. HeadMajor cells therefore run groups 1-4, 6 and 7, and their seed comes from a
+scratch `PageMajor` pool of the same spec through the same writer, transplanted page by page: the
+pool's page image is `[head][page_offset][leading]` in both orders, so every cache byte still
+originates from the production fill path. The copier's order-independence — the thing the matrix
+exists to prove — is exactly what the byte groups exercise; the kernel route cannot see a HeadMajor
+plane in production either. The pool sizing that fell out of the verified arithmetic: 22 owned
+pages, 9 named by the mapping, 13 acquire slots, 7 of them read by the copies, so `from_pool = 7`
+and the tight pool is 29 groups against the main cell's 30.
+
 Build it with `plan_paged_kv_pool(LayoutBuilder&, PagedKVPoolSpec{page_group_count,
 logical_page_capacity, table_rows = 1, plane_order, planes})`, construct `PagedKVPool(DeviceSpan,
 layout)`, then `pool.reserve(entitlement)` → `PagedKVAllocation`,
@@ -104,24 +137,31 @@ append, it publishes the block table and clears the delta row.
 
 ### The scenario
 
-One off-grid span, spanning two destination pages and three source pages, so every destination
-page needs the two-move split:
+The shipped scenario is a 1408-token (22-page) prompt whose first 576 tokens are prefix reuse, with
+three survivors driven through the real detector and selector from two synthetic prompts (`P R1 S1
+R2 S2 R3 S3` → `P S1 E2 S2 E3 S3 E4`, region ids chosen so no two regions share a token, so a run
+cannot grow past its own region). The leading span is prefix reuse and the selector skips it; the
+other three carry the three shapes:
 
-```
-source_begin = 741   (= 11 * 64 + 37: off-grid by construction)
-dest_begin   = 576   (=  9 * 64:      on the grid, as the destination must be)
-tokens       = 128   (2 whole destination pages)
-```
+| span | source_begin | dest_begin | tokens | why it is there |
+|---|---|---|---|---|
+| S1 | 741 (= 11·64 + 37, off-grid) | 576 | 128 | two-move destination pages |
+| S2 | 960 (= 15·64, on the grid) | 768 | 64 | the single-move branch |
+| S3 | 1216 | 896 | 192 | three destination pages |
 
-`plan_relocated_page_moves` then issues, per destination page:
+`plan_relocated_page_moves` then issues 8 moves; S1's destination pages each split across a source
+page boundary:
 
 | dest page | move 1: from | move 2: from |
 |---|---|---|
 | 9 | page 11, offset 37, 27 tokens | page 12, offset 0, 37 tokens |
 | 10 | page 12, offset 37, 27 tokens | page 13, offset 0, 37 tokens |
 
-Add one aligned-source span (`source_begin % 64 == 0`) to exercise the single-move branch, and one
-span long enough to cover three destination pages for good measure.
+and S2/S3 are one move per page (12 ← 15, 14 ← 19, 15 ← 20, 16 ← 21). The mapping keeps pages 0-8,
+acquires the other 13; the deltas are −165 on pages 9-10, −192 on page 12 and −320 on pages 14-16,
+`kRopeDeltaNone` elsewhere; `from_pool` is 7. All of these numbers were verified against the real
+planner chain on a host build before being written down here, and the test asserts them, so a planner
+change is a failure rather than a silent re-shape.
 
 Build the mapping and deltas with the **real** planner pair, not a hand-built array:
 `qwen3_6::detail::plan_copied_page_remap(current_pages, spans, prefix_reuse_tokens, prompt_tokens)`
@@ -134,7 +174,9 @@ cover detector → selector → copier as one chain.
 
 Seed the source run through the production write path: `ops::gqa_kv_append` over a
 `PagedKVLayerView` built from `pool.plane(i)` tensors plus `allocation.block_table()`. Every cache
-byte comes from the writer, exactly as the old test's contract requires.
+byte comes from the writer, exactly as the old test's contract requires. After the copy, the pages no
+span covers (the runtime's prefill ranges) are written through the same path, so the copied cache
+differs from a directly prefilled one only in what the relocation itself moved.
 
 ### The assertions, in order
 
@@ -219,7 +261,9 @@ failing — keep the `cudaFree(nullptr)` guard at `main`'s top, as the sibling t
 
 ### Done means
 
-- All seven assertion groups pass for `{bf16, rk4v4-e8} × {PageMajor, HeadMajor}`.
+- All seven assertion groups pass; groups 1-4, 6 and 7 run on both plane orders, and group 5 (the
+  attention route) runs on PageMajor — the Ops cannot address a HeadMajor plane at all, which is a
+  property of the kernels, not of the copier (see *The pool*).
 - The negative control breaks the criterion on every variant that has one.
 - The full suite is green (85 tests, 84 plus this one), per the repository rule.
 - Only then is the ladder's misaligned-edit rung meaningful — and note it needs a *misaligned* e2e
