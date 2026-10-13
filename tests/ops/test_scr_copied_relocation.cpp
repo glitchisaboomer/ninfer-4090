@@ -132,11 +132,17 @@ constexpr ExpectedSpan kExpectedSpans[] = {
     {1216, 896, 192}, // three destination pages
 };
 
-// The expected move decomposition, field types matching RelocatedPageMove so
-// the comparison below carries no sign conversions.
+// The expected move decomposition, declared in RelocatedPageMove's own field order and with its
+// field types, so the literals below can be read against the table in the header and the comparison
+// carries no sign conversions. The order is load-bearing: grouping the two int32 fields together
+// instead makes `{9, 0, 11, 37, 27}` mean source_page 0 and dest_token 11, which is not the move it
+// spells out, and every comparison then fails on a correctly decomposed plan.
 struct ExpectedMove {
-    std::int32_t dest_page, source_page;
-    std::uint32_t dest_token, source_token, tokens;
+    std::int32_t dest_page;
+    std::uint32_t dest_token;
+    std::int32_t source_page;
+    std::uint32_t source_token;
+    std::uint32_t tokens;
 };
 constexpr ExpectedMove kExpectedMoves[] = {
     {9, 0, 11, 37, 27},  {9, 27, 12, 0, 37},  {10, 0, 12, 37, 27},
@@ -434,10 +440,22 @@ public:
     }
 
     [[nodiscard]] HostImage image() const {
-        const std::size_t pages = static_cast<std::size_t>(cell_.alloc.page_ids().size());
+        // The image is indexed by *physical* page id: that is the convention the shared oracle
+        // template's Cache documents ("[physical page][kv head][page offset][d]") and the one
+        // k_logical/v_logical resolve a position into through page_ids(). `copy_pages_to_host`
+        // writes the pages it is given contiguously, in the order it is given them, so the plane
+        // has to be gathered over the pool's page groups by id. Sizing it by the allocation's
+        // logical slot count instead lines the two up only while every owned page happens to have
+        // an id below that count -- true for a cache that was never relocated, false for one whose
+        // acquire slots came from the pool, where each page id past the allocation's own pages
+        // indexes 32 KiB further past the end of the image and reads unmapped heap.
+        const std::size_t pages = static_cast<std::size_t>(cell_.pool->page_group_count());
+        std::vector<std::int32_t> ids(pages);
+        for (std::size_t i = 0; i < pages; ++i) {
+            ids[i] = static_cast<std::int32_t>(i);
+        }
         const std::size_t elems = pages * kPageSize * kKvHeads * kHeadDim;
         const std::size_t scale_elems = pages * kPageSize * kKvHeads * kQuantGroups;
-        const std::vector<std::int32_t> ids = page_ids();
 
         const bool quantized = variant_.dtype == DType::I8;
         const std::int32_t k_leading = quantized && variant_.packed_k ? kHeadDim / 2 : kHeadDim;
