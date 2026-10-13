@@ -89,7 +89,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                             Tensor& partial_m, Tensor& partial_l, cudaStream_t stream,
-                            const std::int32_t* rope_page_deltas, RerotateFreq freq) {
+                            const std::int32_t* rope_page_deltas,
+                            const std::uint32_t* rope_page_delta_ranges, RerotateFreq freq) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
@@ -110,7 +111,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
         logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-          rope_page_deltas, freq);
+          rope_page_deltas, rope_page_delta_ranges, freq);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -121,7 +122,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                           std::int32_t logical_capacity, std::int32_t implementation_window,
                           std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
                           Tensor& partial_l, cudaStream_t stream,
-                          const std::int32_t* rope_page_deltas, RerotateFreq freq) {
+                          const std::int32_t* rope_page_deltas,
+                          const std::uint32_t* rope_page_delta_ranges, RerotateFreq freq) {
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k       = cache.k_pages;
     Tensor& cache_v       = cache.v_pages;
@@ -158,7 +160,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                rope_page_deltas, freq);
+                rope_page_deltas, rope_page_delta_ranges, freq);
     };
     if constexpr (TokenTile >= 7) {
         if constexpr (Geometry::GroupSize == 6) {
@@ -222,6 +224,7 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .v_scale_pages = cache.v_scale_pages,
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
         .rope_deltas   = cache.rope_deltas,
+        .rope_delta_ranges = cache.rope_delta_ranges,
         .rope_inv_freq = cache.rope_inv_freq,
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
@@ -280,6 +283,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream,  \
                         static_cast<const std::int32_t*>(cache.rope_deltas.data),                  \
+                        static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),            \
                         make_rerotate_freq(cache.rope_inv_freq));                                  \
                 } else if (cache.e8_lattice) {                                                     \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
@@ -287,6 +291,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream,  \
                         static_cast<const std::int32_t*>(cache.rope_deltas.data),                  \
+                        static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),            \
                         make_rerotate_freq(cache.rope_inv_freq));                                  \
                 } else if (cache.packed_k) {                                                       \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, false, false, \
@@ -294,6 +299,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream,  \
                         static_cast<const std::int32_t*>(cache.rope_deltas.data),                  \
+                        static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),            \
                         make_rerotate_freq(cache.rope_inv_freq));                                  \
                 } else if (cache.packed_v) {                                                       \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, false,\
@@ -301,6 +307,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream,  \
                         static_cast<const std::int32_t*>(cache.rope_deltas.data),                  \
+                        static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),            \
                         make_rerotate_freq(cache.rope_inv_freq));                                  \
                 } else {                                                                           \
                     launch_tc_partial_i8<Geometry, (TOKENS), false, false, false, false, false,    \
@@ -308,13 +315,16 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream,  \
                         static_cast<const std::int32_t*>(cache.rope_deltas.data),                  \
+                        static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),            \
                         make_rerotate_freq(cache.rope_inv_freq));                                  \
                 }                                                                                  \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
                     partial_acc, partial_m, partial_l, stream,                                 \
-                    static_cast<const std::int32_t*>(cache.rope_deltas.data), make_rerotate_freq(cache.rope_inv_freq));        \
+                    static_cast<const std::int32_t*>(cache.rope_deltas.data),                     \
+                    static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),               \
+                    make_rerotate_freq(cache.rope_inv_freq));                                      \
             }                                                                                      \
         };                                                                                         \
         const bool masked = invocation.valid_columns != nullptr;                                   \

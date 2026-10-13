@@ -839,23 +839,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // and the drift would surface as a silently wrong shift rather than as a failure.
                 std::vector<std::int32_t> deltas(remap.size(), kRopeDeltaNone);
                 if (copying) {
-                    // Destination coordinates, because the plane is indexed by logical page and a
-                    // copied source may start anywhere inside one: a page is inside the span when its
-                    // *destination* range says so. The shift is the same number either way -- it is
-                    // the span's own move -- but a source page index would name the wrong tokens, and
-                    // `rope_delta_for_dest_page` is the containment test on the grid that exists.
-                    for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
-                        for (std::uint32_t offset = 0; offset < span.tokens;
-                             offset += kPagedKVPageSize) {
-                            const std::int32_t dest_page = static_cast<std::int32_t>(
-                                (span.dest_begin + offset) / kPagedKVPageSize);
-                            if (dest_page < 0 ||
-                                static_cast<std::size_t>(dest_page) >= deltas.size()) {
-                                throw std::logic_error(
-                                    "relocated span destination page is outside the mapping");
-                            }
-                            deltas[static_cast<std::size_t>(dest_page)] = rope_delta_for_dest_page(
-                                span.source_begin, span.dest_begin, span.tokens, dest_page);
+                    const std::vector<RopeDeltaPageRange> page_ranges =
+                        plan_rope_delta_page_ranges(copy_spans, remap.size());
+                    for (std::size_t page = 0; page < page_ranges.size(); ++page) {
+                        if (page_ranges[page].begin != page_ranges[page].end) {
+                            deltas[page] = page_ranges[page].delta;
                         }
                     }
                 } else {

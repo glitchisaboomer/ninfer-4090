@@ -93,8 +93,13 @@ int expect_device_page_ids(const ninfer::Tensor& row, std::initializer_list<std:
 int expect_rope_delta_row_clear(ninfer::PagedKVPool& pool, std::int32_t row, cudaStream_t stream,
                                 const char* label) {
     const ninfer::Tensor& deltas = pool.rope_deltas();
+    const ninfer::Tensor& ranges = pool.rope_delta_ranges();
     if (deltas.ne[0] <= 0 || deltas.ne[1] != pool.table_row_count()) {
         std::cerr << label << " plane shape is inconsistent\n";
+        return 1;
+    }
+    if (ranges.ne[0] != deltas.ne[0] || ranges.ne[1] != deltas.ne[1]) {
+        std::cerr << label << " range plane shape is inconsistent\n";
         return 1;
     }
     const std::size_t rows      = static_cast<std::size_t>(deltas.ne[1]);
@@ -109,6 +114,14 @@ int expect_rope_delta_row_clear(ninfer::PagedKVPool& pool, std::int32_t row, cud
                                       cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) {
         std::cerr << label << " fill failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    std::vector<std::uint32_t> range_pattern(pattern.size(), 0xccccccccu);
+    err = cudaMemcpyAsync(ranges.data, range_pattern.data(),
+                          range_pattern.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                          stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " range fill failed: " << cudaGetErrorString(err) << '\n';
         return 1;
     }
     err = cudaStreamSynchronize(stream);
@@ -131,6 +144,13 @@ int expect_rope_delta_row_clear(ninfer::PagedKVPool& pool, std::int32_t row, cud
         std::cerr << label << " readback failed: " << cudaGetErrorString(err) << '\n';
         return 1;
     }
+    std::vector<std::uint32_t> range_after(range_pattern.size(), 0);
+    err = cudaMemcpy(range_after.data(), ranges.data, range_after.size() * sizeof(std::uint32_t),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::cerr << label << " range readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
 
     int failures = 0;
     for (std::size_t r = 0; r < rows; ++r) {
@@ -143,6 +163,15 @@ int expect_rope_delta_row_clear(ninfer::PagedKVPool& pool, std::int32_t row, cud
                 if (failures < 4) {
                     std::cerr << label << " row " << r << " page " << p << " is " << after[index]
                               << ", expected " << want << '\n';
+                }
+                ++failures;
+            }
+            const std::uint32_t range_want = cleared ? ninfer::kRopeDeltaRangeEmpty : 0xccccccccu;
+            if (range_after[index] != range_want) {
+                if (failures < 4) {
+                    std::cerr << label << " row " << r << " page " << p
+                              << " has range " << range_after[index] << ", expected "
+                              << range_want << '\n';
                 }
                 ++failures;
             }
@@ -474,14 +503,16 @@ int main() {
         2 * ninfer::Tensor(nullptr, ninfer::DType::FP16, {1, 64, 2, 10}).bytes();
     failures +=
         expect_size(paged_plan.layout.payload_bytes(), expected_payload, "paged payload bytes");
-    // Metadata is the sum of the block table's and the RoPE delta plane's own sizes, matching how
+    // Metadata is the sum of the block table, delta plane and boundary-range plane sizes, matching how
     // `payload_bytes` accounts the storage planes. The alignment padding LayoutBuilder inserts
     // between them is deliberately not included -- this is a tensor-size total, not an allocation
     // size, and the only thing that reads it is this assertion.
-    const std::size_t expected_metadata = 2 * 10 * 2 * sizeof(std::int32_t);
+    const std::size_t expected_metadata = 3 * 10 * 2 * sizeof(std::int32_t);
     failures += expect_size(paged_plan.layout.metadata_bytes(), expected_metadata,
                             "paged metadata bytes");
     failures += check_shape(paged_pool.rope_deltas(), {10, 2, 1, 1}, "paged rope-delta plane");
+    failures += check_shape(paged_pool.rope_delta_ranges(), {10, 2, 1, 1},
+                            "paged rope-delta range plane");
     // The effect, not just the arithmetic: filling the plane with a plausible shift and clearing one
     // row must leave that row zero and the other byte-identical.
     failures += expect_rope_delta_row_clear(paged_pool, 0, ctx.stream, "rope-delta row 0 clear");

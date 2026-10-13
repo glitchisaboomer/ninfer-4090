@@ -100,9 +100,8 @@ struct PromptEditDiff {
 
 // One surviving region that Suffix Cache Reuse would relocate instead of re-prefilling.
 // `source_begin` indexes the previous prompt/resident KV; `dest_begin` indexes the current
-// prompt. Both ranges are disjoint. `dest_begin` and `tokens` are whole pages on every path; the
-// source is a whole page only on the re-pointing path, and an arbitrary token offset on the
-// copying one, where the payload is moved rather than the page table re-pointed.
+// prompt. Both ranges are disjoint. The re-pointing path requires whole pages at both ends; the
+// copied path accepts arbitrary token offsets at both ends and records each page's relocated interval.
 struct RelocatedSpan {
     std::uint32_t source_begin = 0;
     std::uint32_t dest_begin   = 0;
@@ -149,23 +148,23 @@ struct RelocatedSpan {
                                                          std::optional<std::uint32_t> turn_rewrite_boundary,
                                                          std::uint32_t max_spans);
 
-// The source-shifting selector: every survivor `diff_prompt_edit_shifted` found, quantized to whole
-// *destination* pages and left off-grid at the source.
+// The source-shifting selector: every survivor `diff_prompt_edit_shifted` found, left off-grid at the
+// source. Destination pages are quantized unless `destination_may_shift` is true and the attention
+// path consumes packed sub-page delta ranges.
 //
 // Same rules as `plan_relocations` for everything but the grid: the leading run is prefix reuse and
 // is skipped, the source has to be resident, the destination has to start at or after the reuse
-// frontier, and no span may reach the limit. The one difference is that a destination is trimmed
-// *upward* to the first whole page inside the run and back to the last whole page before the limit,
-// instead of being dropped when it is not already on the grid. Trimming is what keeps a destination
-// page wholly relocated or wholly prefilled, so it still carries exactly one RoPE delta.
+// frontier, and no span may reach the limit. With `destination_may_shift == false`, the destination
+// is trimmed inward to whole pages. With it true, the full surviving token interval is returned;
+// copied remap and boundary-aware attention handle mixed destination pages.
 //
-// The cost is one page of fringe per run -- up to 63 tokens at each end, recomputed rather than
-// relocated -- which is the same fringe the re-pointing path loses on an *aligned* edit. A run with
-// no whole destination page in it returns nothing.
+// When destinations are quantized, up to 63 tokens at each end are recomputed. A run with no whole
+// destination page returns nothing in that mode; boundary-aware mode can relocate any nonempty run.
 [[nodiscard]] std::vector<RelocatedSpan> plan_shifted_relocations(
     const PromptEditDiff& diff, std::uint32_t resident_kv_tokens,
     std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens,
-    std::optional<std::uint32_t> turn_rewrite_boundary, std::uint32_t max_spans);
+    std::optional<std::uint32_t> turn_rewrite_boundary, std::uint32_t max_spans,
+    bool destination_may_shift = false);
 
 // A range of prompt tokens the runtime prefills, `[begin, end)`.
 struct PrefillRange {

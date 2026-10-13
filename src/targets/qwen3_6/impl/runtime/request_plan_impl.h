@@ -333,14 +333,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 plan_spans = tail.spans;
             } else if (source_may_shift) {
                 // The re-pointing selector declined, and with the copied path enabled that is not the
-                // end of the story: the survivors it dropped for being off the page grid are exactly
-                // what the source-shifting selector keeps, quantizing only their destinations. Asking
-                // it here rather than replacing the call above keeps the aligned plan -- and the
-                // hardware-verified re-pointing path behind it -- byte-identical when it exists.
+                // end of the story. BF16 attention can consume packed boundary ranges, so it retains
+                // the exact destination interval; quantized attention still quantizes destinations to
+                // whole pages until its boundary score path is implemented. The aligned plan and the
+                // hardware-verified re-pointing path remain unchanged when either can express it.
                 plan_spans = qwen3_6::detail::plan_shifted_relocations(
                     diff, sequence.text_kv_valid, plan->reuse_base,
                     static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
-                    base.suffix_reuse_max_spans);
+                    base.suffix_reuse_max_spans, kv_dtype == DType::BF16);
             }
         }
 

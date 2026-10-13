@@ -143,6 +143,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .e8_lattice    = e8_lattice_,
         .e8_root       = e8_root_,
         .rope_deltas   = pool_.rope_delta_row_for_block_table(block_table),
+        .rope_delta_ranges = pool_.rope_delta_range_row_for_block_table(block_table),
         .rope_inv_freq = rope_inv_freq_,
     };
 }
@@ -159,6 +160,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
         .block_tables  = pool_.block_tables(),
         .rope_deltas   = pool_.rope_deltas(),
+        .rope_delta_ranges = pool_.rope_delta_ranges(),
         .rope_inv_freq = rope_inv_freq_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,

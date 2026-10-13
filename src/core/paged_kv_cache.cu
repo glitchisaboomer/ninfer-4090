@@ -112,6 +112,8 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     }
     layout.rope_deltas = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                             "Paged KV rope deltas");
+    layout.rope_delta_ranges = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows},
+                                                  256, "Paged KV rope delta ranges");
     return layout;
 }
 
@@ -128,12 +130,13 @@ std::size_t PagedKVPoolLayout::payload_bytes() const noexcept {
 // payload, which is what a first attempt at "include the padding" did and what the kv-cache test
 // caught: 169296 bytes of planes reported as metadata.
 std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept {
-    return block_tables.region.bytes + rope_deltas.region.bytes;
+    return block_tables.region.bytes + rope_deltas.region.bytes + rope_delta_ranges.region.bytes;
 }
 
 PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     : spec_(layout.spec), block_tables_(layout.block_tables.bind(backing)),
       rope_deltas_(layout.rope_deltas.bind(backing)),
+            rope_delta_ranges_(layout.rope_delta_ranges.bind(backing)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false) {
     if (layout.planes.size() != spec_.planes.size() || layout.planes.empty()) {
         throw std::invalid_argument("Paged KV layout plane inventory is inconsistent");
@@ -152,6 +155,12 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
         rope_deltas_.ne[0] != block_tables_.ne[0] || rope_deltas_.ne[1] != block_tables_.ne[1] ||
         rope_deltas_.ne[2] != 1 || rope_deltas_.ne[3] != 1) {
         throw std::logic_error("Paged KV rope-delta layout is inconsistent with its block table");
+    }
+    if (rope_delta_ranges_.dtype != DType::I32 ||
+        rope_delta_ranges_.ne[0] != block_tables_.ne[0] ||
+        rope_delta_ranges_.ne[1] != block_tables_.ne[1] ||
+        rope_delta_ranges_.ne[2] != 1 || rope_delta_ranges_.ne[3] != 1) {
+        throw std::logic_error("Paged KV rope-delta range layout is inconsistent with its block table");
     }
 
     planes_.reserve(layout.planes.size());
@@ -227,6 +236,8 @@ const Tensor& PagedKVPool::block_tables() const noexcept { return block_tables_;
 
 const Tensor& PagedKVPool::rope_deltas() const noexcept { return rope_deltas_; }
 
+const Tensor& PagedKVPool::rope_delta_ranges() const noexcept { return rope_delta_ranges_; }
+
 void PagedKVPool::clear_rope_delta_row(std::int32_t row, cudaStream_t stream) {
     // Own precondition, so the diagnostic names the actual cause. The degenerate-plane case is not
     // reachable from a pool this repo builds -- `plan_paged_kv_pool` rejects `table_rows <= 0` and
@@ -253,6 +264,8 @@ void PagedKVPool::clear_rope_delta_row(std::int32_t row, cudaStream_t stream) {
     // tile the plane, which is what makes one memset over one row safe.
     auto* row_base = static_cast<unsigned char*>(rope_deltas_.data) + span.offset;
     CUDA_CHECK(cudaMemsetAsync(row_base, 0, span.bytes, stream));
+    auto* range_base = static_cast<unsigned char*>(rope_delta_ranges_.data) + span.offset;
+    CUDA_CHECK(cudaMemsetAsync(range_base, 0xff, span.bytes, stream));
 }
 
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
@@ -269,6 +282,31 @@ Tensor PagedKVPool::rope_delta_row(std::int32_t row) const {
     }
     return rope_deltas_.slice(1, row, 1).view(
         {static_cast<std::int32_t>(logical_page_capacity())});
+}
+
+Tensor PagedKVPool::rope_delta_range_row(std::int32_t row) const {
+    if (row < 0 || row >= table_row_count()) {
+        throw std::out_of_range("Paged KV rope-delta range row out of range");
+    }
+    return rope_delta_ranges_.slice(1, row, 1).view(
+        {static_cast<std::int32_t>(logical_page_capacity())});
+}
+
+Tensor PagedKVPool::rope_delta_range_row_for_block_table(Tensor block_table) const {
+    if (block_table.data == nullptr) { return Tensor{}; }
+    const auto* base = static_cast<const unsigned char*>(block_tables_.data);
+    const auto* ptr  = static_cast<const unsigned char*>(block_table.data);
+    const auto span = static_cast<std::size_t>(block_tables_.numel()) * sizeof(std::int32_t);
+    if (ptr < base || ptr >= base + span) {
+        throw std::out_of_range("block-table slice does not belong to this pool");
+    }
+    const std::size_t stride =
+        static_cast<std::size_t>(logical_page_capacity()) * sizeof(std::int32_t);
+    const std::size_t offset = static_cast<std::size_t>(ptr - base);
+    if (stride == 0 || offset % stride != 0) {
+        throw std::invalid_argument("block-table slice is not row-aligned");
+    }
+    return rope_delta_range_row(static_cast<std::int32_t>(offset / stride));
 }
 
 // Tensor::slice advances the view's `data` pointer by `start * nb[dim]` and Tensor
@@ -564,6 +602,7 @@ PagedKVAllocation::PagedKVAllocation(PagedKVPool& pool, std::uint32_t page_entit
     : pool_(&pool), page_entitlement_(page_entitlement) {
     page_ids_.reserve(page_entitlement);
     rope_deltas_.reserve(page_entitlement);
+    rope_delta_ranges_.reserve(page_entitlement);
 }
 
 PagedKVAllocation::~PagedKVAllocation() { release(); }
@@ -571,6 +610,7 @@ PagedKVAllocation::~PagedKVAllocation() { release(); }
 PagedKVAllocation::PagedKVAllocation(PagedKVAllocation&& other) noexcept
     : pool_(other.pool_), page_ids_(std::move(other.page_ids_)),
       rope_deltas_(std::move(other.rope_deltas_)),
+    rope_delta_ranges_(std::move(other.rope_delta_ranges_)),
       page_entitlement_(other.page_entitlement_), bound_row_(other.bound_row_) {
     other.pool_             = nullptr;
     other.page_entitlement_ = 0;
@@ -583,6 +623,7 @@ PagedKVAllocation& PagedKVAllocation::operator=(PagedKVAllocation&& other) noexc
     pool_                   = other.pool_;
     page_ids_               = std::move(other.page_ids_);
     rope_deltas_            = std::move(other.rope_deltas_);
+    rope_delta_ranges_      = std::move(other.rope_delta_ranges_);
     page_entitlement_       = other.page_entitlement_;
     bound_row_              = other.bound_row_;
     other.pool_             = nullptr;
@@ -617,6 +658,8 @@ void PagedKVAllocation::set_page_entitlement(std::uint32_t pages) {
     }
     if (!pool_->can_replace_entitlement(page_entitlement_, pages)) { throw std::bad_alloc(); }
     page_ids_.reserve(pages);
+    rope_deltas_.reserve(pages);
+    rope_delta_ranges_.reserve(pages);
     pool_->replace_entitlement(page_entitlement_, pages);
     page_entitlement_ = pages;
 }
@@ -640,6 +683,7 @@ void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stre
     std::vector<std::int32_t> acquired = pool_->take_pages(count, preferred);
     page_ids_.insert(page_ids_.end(), acquired.begin(), acquired.end());
     rope_deltas_.insert(rope_deltas_.end(), count, kRopeDeltaNone);
+    rope_delta_ranges_.insert(rope_delta_ranges_.end(), count, kRopeDeltaRangeEmpty);
     if (bound_row_ >= 0) { publish_range(old_count, count, stream); }
 }
 
@@ -657,6 +701,7 @@ void PagedKVAllocation::trim_pages(std::uint32_t pages) {
         page_ids_.data() + pages, static_cast<std::size_t>(mapped_page_count() - pages)));
     page_ids_.resize(pages);
     rope_deltas_.resize(pages);
+    rope_delta_ranges_.resize(pages);
 }
 
 void PagedKVAllocation::trim_tokens(std::uint32_t tokens) { trim_pages(pages_for_tokens(tokens)); }
@@ -746,6 +791,7 @@ void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping,
 
     page_ids_ = std::move(final_ids);
     rope_deltas_.assign(deltas.begin(), deltas.end());
+    rope_delta_ranges_.assign(mapping.size(), kRopeDeltaRangeEmpty);
     if (bound_row_ >= 0) { publish_mapping(stream); }
 }
 
@@ -777,6 +823,8 @@ void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapp
     // `core/paged_kv_delta_layout.h`, so they are testable without a GPU -- and both refuse a span that
     // does not fit the mapping, which is what keeps a half-copied relocation from being published.
     const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(spans, sources.size());
+    std::vector<std::uint32_t> planned_ranges =
+        encode_rope_delta_page_ranges(spans, mapping.size());
     std::vector<std::int32_t> protected_pages;
     protected_pages.reserve(moves.size());
     for (const RelocatedPageMove& move : moves) {
@@ -815,8 +863,8 @@ void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapp
 
     // The copies. A destination page's payload is contiguous per head and the head pitch is the same
     // on both sides, so the tokens a move carries are one 2-D copy per plane: `width` is the byte span
-    // of those tokens, `height` the head count, and the pitch the head's stride. Two moves per
-    // destination page where the source page boundary falls inside it, one where it does not.
+    // of those tokens, `height` the head count, and the pitch the head's stride. Moves stop at either
+    // logical page boundary so partial destination pages are copied without touching adjacent tokens.
     const bool page_major = pool_->spec_.plane_order == PagedKVPlaneOrder::PageMajor;
     for (std::size_t plane_index = 0; plane_index < pool_->plane_count(); ++plane_index) {
         const Tensor& plane = pool_->plane(plane_index);
@@ -866,6 +914,7 @@ void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapp
 
     page_ids_ = std::move(final_ids);
     rope_deltas_.assign(deltas.begin(), deltas.end());
+    rope_delta_ranges_ = std::move(planned_ranges);
     if (bound_row_ >= 0) { publish_mapping(stream); }
 }
 
@@ -912,8 +961,8 @@ void PagedKVAllocation::publish_mapping(cudaStream_t stream) const {
 void PagedKVAllocation::publish_range(std::uint32_t first_page, std::uint32_t page_count,
                                       cudaStream_t stream) const {
     if (page_count == 0) { return; }
-    if (rope_deltas_.size() != page_ids_.size()) {
-        throw std::logic_error("Paged KV delta plane does not parallel its block table");
+    if (rope_deltas_.size() != page_ids_.size() || rope_delta_ranges_.size() != page_ids_.size()) {
+        throw std::logic_error("Paged KV delta metadata does not parallel its block table");
     }
 
     Tensor block_row = pool_->block_table_row(bound_row_);
@@ -928,6 +977,13 @@ void PagedKVAllocation::publish_range(std::uint32_t first_page, std::uint32_t pa
     const auto* src_delta = rope_deltas_.data() + first_page;
     CUDA_CHECK(cudaMemcpyAsync(dst_delta, src_delta,
                                static_cast<std::size_t>(page_count) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    Tensor range_row = pool_->rope_delta_range_row(bound_row_);
+    auto* dst_range = static_cast<std::uint32_t*>(range_row.data) + first_page;
+    const auto* src_range = rope_delta_ranges_.data() + first_page;
+    CUDA_CHECK(cudaMemcpyAsync(dst_range, src_range,
+                               static_cast<std::size_t>(page_count) * sizeof(std::uint32_t),
                                cudaMemcpyHostToDevice, stream));
 }
 
@@ -949,6 +1005,7 @@ void PagedKVAllocation::release() noexcept {
     pool_->replace_entitlement(page_entitlement_, 0);
     page_ids_.clear();
     rope_deltas_.clear();
+    rope_delta_ranges_.clear();
     page_entitlement_ = 0;
     pool_             = nullptr;
 }
@@ -994,6 +1051,8 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
     // Complete every potentially throwing host allocation before changing any pool accounting.
     for (const PagedKVResize& change : changes) {
         change.allocation->page_ids_.reserve(change.page_entitlement);
+        change.allocation->rope_deltas_.reserve(change.page_entitlement);
+        change.allocation->rope_delta_ranges_.reserve(change.page_entitlement);
     }
     for (const PagedKVResize& change : changes) {
         change.allocation->trim_pages(change.mapped_pages);

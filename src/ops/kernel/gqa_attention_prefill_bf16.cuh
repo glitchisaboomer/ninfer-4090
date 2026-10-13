@@ -242,9 +242,20 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     int physical_page    = block_table[0];
 
     std::int32_t current_delta = 0;
+    std::int32_t current_page_delta = 0;
+    std::uint32_t current_range = kRopeDeltaRangeEmpty;
     auto reload_and_rotate_q = [&](int kb) {
         if (delta_table != nullptr) {
-            const std::int32_t new_delta = delta_table[kb]; // kb == logical page since Bc=64
+            const std::int32_t new_page_delta = delta_table[kb];
+            const std::uint32_t* range_table = metadata.delta_range_table_ptr();
+            const std::uint32_t new_range =
+                range_table == nullptr ? kRopeDeltaRangeEmpty : range_table[kb];
+            const bool partial = !rope_delta_page_range_is_empty(new_range) &&
+                                 (rope_delta_page_range_begin(new_range) != 0 ||
+                                  rope_delta_page_range_end(new_range) != kPagedKVPageSize);
+            const std::int32_t new_delta = partial ? 0 : new_page_delta;
+            current_page_delta = new_page_delta;
+            current_range = new_range;
             if (new_delta != current_delta) {
                 const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0);
                 constexpr int VecPerRow = D / 8;
@@ -282,6 +293,55 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 __syncthreads();
             }
         }
+    };
+
+    auto recompute_boundary_scores = [&](int kb, int k0, float scores[QKNt][4]) {
+        const bool partial = !rope_delta_page_range_is_empty(current_range) &&
+                             (rope_delta_page_range_begin(current_range) != 0 ||
+                              rope_delta_page_range_end(current_range) != kPagedKVPageSize);
+        if (!partial || current_page_delta == 0) { return; }
+
+        gqa_prefill_rotate_q_smem_inplace(q_s, Br, tid, Threads, current_page_delta, freq);
+        __syncthreads();
+        float shifted[QKNt][4]{};
+        unsigned q_frag[4];
+        unsigned k_frag[4];
+        for (int k = 0; k < QKKs; ++k) {
+            const unsigned ck = static_cast<unsigned>(k << 5);
+            ldmatrix_x4(q_frag[0], q_frag[1], q_frag[2], q_frag[3],
+                        gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
+#pragma unroll
+            for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
+                ldmatrix_x4(k_frag[0], k_frag[1], k_frag[2], k_frag[3],
+                            gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096),
+                                                 ck, k_as, k_r));
+                mma_bf16(shifted[nt2][0], shifted[nt2][1], shifted[nt2][2], shifted[nt2][3],
+                         q_frag[0], q_frag[1], q_frag[2], q_frag[3], k_frag[0], k_frag[1]);
+                mma_bf16(shifted[nt2 + 1][0], shifted[nt2 + 1][1], shifted[nt2 + 1][2],
+                         shifted[nt2 + 1][3], q_frag[0], q_frag[1], q_frag[2], q_frag[3],
+                         k_frag[2], k_frag[3]);
+            }
+        }
+        const std::uint32_t range_begin = rope_delta_page_range_begin(current_range);
+        const std::uint32_t range_end = rope_delta_page_range_end(current_range);
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+            const int key0 = k0 + nt * 8 + 2 * lid;
+            const int key1 = key0 + 1;
+            const std::uint32_t offset0 = static_cast<std::uint32_t>(key0) & kPagedKVPageMask;
+            const std::uint32_t offset1 = static_cast<std::uint32_t>(key1) & kPagedKVPageMask;
+            if (offset0 >= range_begin && offset0 < range_end) {
+                scores[nt][0] = shifted[nt][0];
+                scores[nt][2] = shifted[nt][2];
+            }
+            if (offset1 >= range_begin && offset1 < range_end) {
+                scores[nt][1] = shifted[nt][1];
+                scores[nt][3] = shifted[nt][3];
+            }
+        }
+
+        current_delta = (-2147483647 - 1);
+        reload_and_rotate_q(kb);
     };
 
     // Prologue: commit Q, then kick off K(0).
@@ -349,6 +409,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                          af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
             }
         }
+
+        recompute_boundary_scores(kb, kb * Bc, score);
 
         // Unmasked block row-max on raw (unscaled) scores
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
@@ -508,6 +570,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qrow1 = q0 + row1;
         const int qabs0 = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1 = (qrow1 < tokens) ? base_pos + qrow1 : -1;
+
+        recompute_boundary_scores(kb, k0, score);
 
         // Masked block row-max on raw (unscaled) scores
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;

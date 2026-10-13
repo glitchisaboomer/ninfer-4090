@@ -95,6 +95,13 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
     require_shape(cache.block_table, logical_pages, 1, 1, 1, op, "block table");
     require_contiguous_nonnull(cache.block_table, op, "block table");
+    if (cache.rope_delta_ranges.data != nullptr) {
+        if (cache.rope_delta_ranges.dtype != DType::I32) {
+            throw std::invalid_argument(std::string(op) + ": delta ranges must be I32");
+        }
+        require_shape(cache.rope_delta_ranges, logical_pages, 1, 1, 1, op, "delta ranges");
+        require_contiguous_nonnull(cache.rope_delta_ranges, op, "delta ranges");
+    }
 
     if (cache.dtype == DType::BF16) {
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
@@ -163,6 +170,14 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     require_shape(cache.block_tables, logical_pages, table_rows, 1, 1, op, "block tables");
     require_contiguous_nonnull(cache.block_tables, op, "block tables");
+    if (cache.rope_delta_ranges.data != nullptr) {
+        if (cache.rope_delta_ranges.dtype != DType::I32) {
+            throw std::invalid_argument(std::string(op) + ": delta ranges must be I32");
+        }
+        require_shape(cache.rope_delta_ranges, logical_pages, table_rows, 1, 1, op,
+                      "delta ranges");
+        require_contiguous_nonnull(cache.rope_delta_ranges, op, "delta ranges");
+    }
 
     if (cache.dtype == DType::BF16) {
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {

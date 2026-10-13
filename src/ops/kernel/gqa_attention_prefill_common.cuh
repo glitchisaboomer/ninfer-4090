@@ -5,6 +5,7 @@
 // shared-memory arena, warp schedule, or kernel body.
 
 #include "ops/common/math.cuh"
+#include "core/paged_kv_delta_layout.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
@@ -29,17 +30,22 @@ inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) 
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
     const std::int32_t* delta_table;
+    const std::uint32_t* delta_range_table;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
     __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
     __device__ __forceinline__ const std::int32_t* delta_table_ptr() const { return delta_table; }
+    __device__ __forceinline__ const std::uint32_t* delta_range_table_ptr() const {
+        return delta_range_table;
+    }
 };
 
 template <bool Masked>
 struct GqaPrefillBatchMetadata {
     const std::int32_t* tables;
     const std::int32_t* delta_tables;
+    const std::uint32_t* delta_range_tables;
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
@@ -57,6 +63,11 @@ struct GqaPrefillBatchMetadata {
     }
     __device__ __forceinline__ const std::int32_t* delta_table_ptr() const {
         return delta_tables == nullptr ? nullptr : delta_tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+    __device__ __forceinline__ const std::uint32_t* delta_range_table_ptr() const {
+        return delta_range_tables == nullptr
+                   ? nullptr
+                   : delta_range_tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
 };
 

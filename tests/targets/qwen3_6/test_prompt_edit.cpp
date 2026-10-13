@@ -1071,6 +1071,20 @@ void test_shifted_selector_quantizes_only_the_destination() {
            "a whole-page destination with an off-grid source is expressible when the payload is copied");
     expect(!relocation_is_expressible(spans, ranges, 0, prompt),
            "and refused by the re-pointing path, whose source has to name a page that holds it");
+
+    const auto destination_free =
+        plan_shifted_relocations(diff, resident, 0, prompt, std::nullopt, 6, true);
+    expect(destination_free.size() == 1, "boundary-aware attention keeps the untrimmed run");
+    if (destination_free.size() == 1) {
+        expect(destination_free.front().dest_begin == block_tokens(3) + 3,
+               "destination freedom preserves the run's exact token offset");
+         expect(destination_free.front().tokens == block_tokens(5),
+             "the full surviving run is retained when it ends before the prompt tail");
+        const auto destination_free_ranges =
+            relocation_prefill_ranges(destination_free, 0, prompt);
+        expect(relocation_is_expressible(destination_free, destination_free_ranges, 0, prompt, true),
+               "token-granular copied ranges still tile the prompt");
+    }
 }
 
 void test_plan_copied_page_remap_acquires_every_relocated_page() {
@@ -1104,8 +1118,12 @@ void test_plan_copied_page_remap_acquires_every_relocated_page() {
     const std::vector<RelocatedSpan> partial{
         RelocatedSpan{.source_begin = block_tokens(3), .dest_begin = block_tokens(2) + 1,
                       .tokens = block_tokens(2)}};
-    expect(plan_copied_page_remap(resident, partial, 0, block_tokens(6)).empty(),
-           "a destination that is not whole pages is refused");
+    const auto partial_remap = plan_copied_page_remap(resident, partial, 0, block_tokens(6));
+    expect(partial_remap.size() == 6, "a partial copied span still has a complete page mapping");
+    if (partial_remap.size() == 6) {
+        expect(partial_remap[2] == kRemapAcquirePage && partial_remap[3] == kRemapAcquirePage,
+               "both pages touched by a partial destination span are acquired");
+    }
     const std::vector<RelocatedSpan> beyond{
         RelocatedSpan{.source_begin = 0, .dest_begin = block_tokens(6), .tokens = block_tokens(2)}};
     expect(plan_copied_page_remap(resident, beyond, 0, block_tokens(6)).empty(),

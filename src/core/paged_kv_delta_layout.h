@@ -65,6 +65,34 @@ struct RelocatedCopySpan {
     [[nodiscard]] constexpr std::uint32_t dest_end() const noexcept { return dest_begin + tokens; }
 };
 
+struct RopeDeltaPageRange {
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;
+    std::int32_t delta = 0;
+};
+
+inline constexpr std::uint32_t kRopeDeltaRangeEmpty = 0xffffffffu;
+
+[[nodiscard]] constexpr std::uint32_t pack_rope_delta_page_range(
+    std::uint32_t begin, std::uint32_t end) noexcept {
+    if (begin >= end || end > static_cast<std::uint32_t>(kPagedKVPageSize)) {
+        return kRopeDeltaRangeEmpty;
+    }
+    return begin | (end << 6);
+}
+
+[[nodiscard]] constexpr bool rope_delta_page_range_is_empty(std::uint32_t packed) noexcept {
+    return packed == kRopeDeltaRangeEmpty;
+}
+
+[[nodiscard]] constexpr std::uint32_t rope_delta_page_range_begin(std::uint32_t packed) noexcept {
+    return packed & 0x3fu;
+}
+
+[[nodiscard]] constexpr std::uint32_t rope_delta_page_range_end(std::uint32_t packed) noexcept {
+    return (packed >> 6) & 0x7fu;
+}
+
 struct RopeDeltaLayout {
     std::int32_t logical_pages = 0;
     std::int32_t table_rows    = 0;
@@ -207,9 +235,9 @@ resolve_rope_delta_layout(std::int32_t max_context, std::int32_t table_rows) noe
 // One device-to-device move a copied relocation issues: `tokens` tokens of one destination page that
 // come from one source page. `dest_page` and `source_page` are *logical* page indices -- of the
 // mapping being published and of the mapping being replaced, respectively -- because the physical
-// pages behind them are exactly what the substitution below is computing. A destination page whose
-// source token offset is zero is one move; any other is two, because the source page it starts in
-// ends before the destination page does and the remainder comes from the next source page.
+// pages behind them are exactly what the substitution below is computing. A move ends at either page
+// boundary; a partial destination page may therefore require up to three segments when both boundaries
+// fall inside the span at different offsets.
 //
 // This is arithmetic, not device code, and it lives here for the reason the rest of this header does:
 // the statement "a destination page needs at most two moves, and here they are" is the part of the
@@ -227,51 +255,42 @@ struct RelocatedPageMove {
 // current mapping's logical pages, the destinations the published mapping's, and a relocation never
 // changes the logical page count (it re-points and drops, it does not resize).
 //
-// Throws `std::invalid_argument` for a span that is not whole destination pages, for one that reaches
-// past the mapping at either end, and for a relocation with no moves -- which copies nothing, so a
-// caller that accepted it would believe it had relocated something.
+// Splits at both source and destination page boundaries. Throws `std::invalid_argument` for a span
+// outside either mapping or for a relocation with no moves.
 [[nodiscard]] inline std::vector<RelocatedPageMove>
 plan_relocated_page_moves(std::span<const RelocatedCopySpan> spans, std::size_t mapping_pages) {
     constexpr std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
     std::vector<RelocatedPageMove> moves;
-    moves.reserve(spans.size() * 2);
+    moves.reserve(spans.size() * 4);
     for (const RelocatedCopySpan& span : spans) {
-        if (!relocated_dest_is_page_aligned(span.dest_begin, span.tokens)) {
-            throw std::invalid_argument(
-                "Paged KV relocation span is not whole destination pages");
-        }
-        if (static_cast<std::size_t>(span.dest_end()) > mapping_pages * page) {
+        const std::uint64_t dest_end = static_cast<std::uint64_t>(span.dest_begin) + span.tokens;
+        const std::uint64_t source_end = static_cast<std::uint64_t>(span.source_begin) + span.tokens;
+        const std::uint64_t mapping_tokens = static_cast<std::uint64_t>(mapping_pages) * page;
+        if (span.tokens == 0 || dest_end > mapping_tokens) {
             throw std::invalid_argument("Paged KV relocation span reaches past its mapping");
         }
-        for (std::uint32_t dest_token = span.dest_begin; dest_token < span.dest_end();
-             dest_token += page) {
-            const std::uint32_t source_token = span.source_begin + (dest_token - span.dest_begin);
+        if (source_end > mapping_tokens) {
+            throw std::invalid_argument("Paged KV relocation source reaches past its mapping");
+        }
+
+        std::uint64_t dest_token = span.dest_begin;
+        while (dest_token < dest_end) {
+            const std::uint64_t source_token =
+                static_cast<std::uint64_t>(span.source_begin) + (dest_token - span.dest_begin);
+            const std::uint32_t dest_offset = static_cast<std::uint32_t>(dest_token % page);
             const std::uint32_t source_offset = source_token % page;
-            const std::size_t source_page     = source_token / page;
-            if (source_page >= mapping_pages) {
-                throw std::invalid_argument(
-                    "Paged KV relocation span reaches past the current mapping");
-            }
+            const std::uint32_t take = static_cast<std::uint32_t>(std::min({
+                static_cast<std::uint64_t>(page - dest_offset),
+                static_cast<std::uint64_t>(page - source_offset), dest_end - dest_token}));
 
             RelocatedPageMove move;
             move.dest_page    = static_cast<std::int32_t>(dest_token / page);
-            move.dest_token   = 0;
-            move.source_page  = static_cast<std::int32_t>(source_page);
+            move.dest_token   = dest_offset;
+            move.source_page  = static_cast<std::int32_t>(source_token / page);
             move.source_token = source_offset;
-            move.tokens       = page - source_offset;
+            move.tokens       = take;
             moves.push_back(move);
-
-            if (move.tokens != page) {
-                if (source_page + 1 >= mapping_pages) {
-                    throw std::invalid_argument(
-                        "Paged KV relocation span's source runs past its mapping");
-                }
-                move.dest_token   = move.tokens;
-                move.source_page  = static_cast<std::int32_t>(source_page + 1);
-                move.source_token = 0;
-                move.tokens       = page - move.dest_token;
-                moves.push_back(move);
-            }
+            dest_token += take;
         }
     }
     if (moves.empty()) {
@@ -398,6 +417,53 @@ struct RelocatedPageSubstitution {
         static_cast<std::int64_t>(dest_begin) - static_cast<std::int64_t>(source_begin);
     if (delta < -0x7fffffffLL || delta > 0x7fffffffLL) { return kRopeDeltaNone; }
     return static_cast<std::int32_t>(delta);
+}
+
+[[nodiscard]] inline std::vector<RopeDeltaPageRange> plan_rope_delta_page_ranges(
+    std::span<const RelocatedCopySpan> spans, std::size_t mapping_pages) {
+    constexpr std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
+    std::vector<RopeDeltaPageRange> ranges(mapping_pages);
+    std::vector<bool> claimed(mapping_pages, false);
+    for (const RelocatedCopySpan& span : spans) {
+        if (span.tokens == 0 || static_cast<std::uint64_t>(span.dest_begin) + span.tokens >
+                                    static_cast<std::uint64_t>(mapping_pages) * page) {
+            throw std::invalid_argument("Paged KV relocation span is outside its destination mapping");
+        }
+        const std::int64_t delta = static_cast<std::int64_t>(span.dest_begin) - span.source_begin;
+        if (delta < -0x7fffffffLL || delta > 0x7fffffffLL) {
+            throw std::invalid_argument("Paged KV relocation delta does not fit int32");
+        }
+        const std::uint32_t end = span.dest_begin + span.tokens;
+        for (std::uint32_t token = span.dest_begin; token < end;) {
+            const std::uint32_t logical_page = token / page;
+            const std::uint32_t page_begin = logical_page * page;
+            const std::uint32_t range_end = std::min(end, page_begin + page);
+            if (claimed[logical_page]) {
+                throw std::invalid_argument("Multiple relocation spans share a logical page");
+            }
+            claimed[logical_page] = true;
+            ranges[logical_page] = RopeDeltaPageRange{
+                .begin = token - page_begin,
+                .end = range_end - page_begin,
+                .delta = static_cast<std::int32_t>(delta),
+            };
+            token = range_end;
+        }
+    }
+    return ranges;
+}
+
+[[nodiscard]] inline std::vector<std::uint32_t> encode_rope_delta_page_ranges(
+    std::span<const RelocatedCopySpan> spans, std::size_t mapping_pages) {
+    const std::vector<RopeDeltaPageRange> ranges =
+        plan_rope_delta_page_ranges(spans, mapping_pages);
+    std::vector<std::uint32_t> packed(mapping_pages, kRopeDeltaRangeEmpty);
+    for (std::size_t page = 0; page < ranges.size(); ++page) {
+        if (ranges[page].begin != ranges[page].end) {
+            packed[page] = pack_rope_delta_page_range(ranges[page].begin, ranges[page].end);
+        }
+    }
+    return packed;
 }
 
 } // namespace ninfer

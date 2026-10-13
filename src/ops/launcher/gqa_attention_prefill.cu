@@ -156,6 +156,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data),
         static_cast<const std::int32_t*>(cache.rope_deltas.data),
+        static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
@@ -170,7 +171,8 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
                           PagedKVLayerView cache, cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data),
-        nullptr // TODO(step-4b): Wire runtime delta plane here
+        nullptr,
+        nullptr,
     };
     if (k.ne[1] == Gqa27Geometry::KVHeads) {
         gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
@@ -187,6 +189,7 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
             .delta_tables = static_cast<const std::int32_t*>(cache.rope_deltas.data),
+            .delta_range_tables = static_cast<const std::uint32_t*>(cache.rope_delta_ranges.data),
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),

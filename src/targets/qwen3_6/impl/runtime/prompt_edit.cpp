@@ -349,13 +349,11 @@ std::vector<std::int32_t> plan_copied_page_remap(std::span<const std::int32_t> c
     // copy's sources, which this mapping deliberately does not name.
     std::vector<std::uint8_t> copied(logical_pages, 0);
     for (const RelocatedSpan& span : spans) {
-        if (span.tokens == 0 || span.tokens % kPromptEditBlockTokens != 0 ||
-            span.dest_begin % kPromptEditBlockTokens != 0) {
-            return {};
-        }
-        const std::uint32_t last_page = span.dest_end() / kPromptEditBlockTokens;
-        if (last_page > logical_pages) { return {}; }
-        for (std::uint32_t page = span.dest_begin / kPromptEditBlockTokens; page < last_page; ++page) {
+        if (span.tokens == 0 || span.dest_end() > prompt_tokens) { return {}; }
+        const std::uint32_t first_page = span.dest_begin / kPromptEditBlockTokens;
+        const std::uint32_t last_page = (span.dest_end() - 1) / kPromptEditBlockTokens;
+        if (last_page >= logical_pages) { return {}; }
+        for (std::uint32_t page = first_page; page <= last_page; ++page) {
             copied[page] = 1;
         }
     }
@@ -456,18 +454,30 @@ std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges) {
     });
     for (std::size_t i = 0; i < sorted.size(); ++i) {
         const RelocatedSpan& span = sorted[i];
-        if (span.tokens == 0 || span.tokens % kPromptEditBlockTokens != 0 ||
-            span.dest_begin % kPromptEditBlockTokens != 0) {
-            return false;
-        }
+        if (span.tokens == 0) { return false; }
         // The re-pointing path moves the page table, so the source has to name a page that already
         // holds the content and must be a whole page. The copying path moves the payload, so its
         // source is just a token offset -- the freedom a shifted edit needs.
-        if (!source_may_shift && span.source_begin % kPromptEditBlockTokens != 0) { return false; }
+        if (!source_may_shift &&
+            (span.source_begin % kPromptEditBlockTokens != 0 ||
+             span.dest_begin % kPromptEditBlockTokens != 0 ||
+             span.tokens % kPromptEditBlockTokens != 0)) {
+            return false;
+        }
         if (span.dest_begin < prefix_reuse_tokens || span.dest_end() > prompt_tokens - 1) {
             return false;
         }
+        if (source_may_shift && prefix_reuse_tokens % kPromptEditBlockTokens != 0 &&
+            span.dest_begin / kPromptEditBlockTokens ==
+                prefix_reuse_tokens / kPromptEditBlockTokens) {
+            return false;
+        }
         if (i != 0 && span.dest_begin < sorted[i - 1].dest_end()) { return false; }
+        if (source_may_shift && i != 0 &&
+            span.dest_begin / kPromptEditBlockTokens <=
+                (sorted[i - 1].dest_end() - 1) / kPromptEditBlockTokens) {
+            return false;
+        }
     }
 
     // Ranges and spans have to tile the suffix exactly: every token prefilled or relocated, none
@@ -644,7 +654,8 @@ std::vector<RelocatedSpan> plan_shifted_relocations(const PromptEditDiff& diff,
                                                     std::uint32_t prefix_reuse_tokens,
                                                     std::uint32_t prompt_tokens,
                                                     std::optional<std::uint32_t> turn_rewrite_boundary,
-                                                    std::uint32_t max_spans) {
+                                                    std::uint32_t max_spans,
+                                                    bool destination_may_shift) {
     std::vector<RelocatedSpan> candidates;
     if (max_spans == 0 || prompt_tokens == 0 || prompt_tokens <= prefix_reuse_tokens) {
         return candidates;
@@ -659,14 +670,16 @@ std::vector<RelocatedSpan> plan_shifted_relocations(const PromptEditDiff& diff,
         if (span.new_begin < prefix_reuse_tokens) { continue; }
         if (span.tokens == 0) { continue; }
 
-        // The first whole destination page inside the run, and the last whole page that ends before
-        // the limit. Quantizing here rather than at the detector is what keeps every destination
-        // page wholly relocated, so it carries exactly one delta and prefill never shares it.
-        const std::uint32_t dest_begin =
-            ((span.new_begin + kPromptEditBlockTokens - 1) / kPromptEditBlockTokens) *
-            kPromptEditBlockTokens;
         const std::uint32_t reach = std::min(span.new_begin + span.tokens, limit);
-        const std::uint32_t dest_end = (reach / kPromptEditBlockTokens) * kPromptEditBlockTokens;
+        const std::uint32_t dest_begin =
+            destination_may_shift
+                ? span.new_begin
+                : ((span.new_begin + kPromptEditBlockTokens - 1) / kPromptEditBlockTokens) *
+                      kPromptEditBlockTokens;
+        const std::uint32_t dest_end = destination_may_shift
+                                           ? reach
+                                           : (reach / kPromptEditBlockTokens) *
+                                                 kPromptEditBlockTokens;
         if (dest_begin >= dest_end) { continue; }
 
         candidates.push_back(

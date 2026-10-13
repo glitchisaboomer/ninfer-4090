@@ -67,7 +67,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
         __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
-        const std::int32_t* __restrict__ rope_page_deltas, RerotateFreq freq) {
+        const std::int32_t* __restrict__ rope_page_deltas,
+        const std::uint32_t* __restrict__ rope_page_delta_ranges, RerotateFreq freq) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -143,6 +144,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                         ? nullptr
                                         : rope_page_deltas + static_cast<std::int64_t>(table_row) *
                                                                  table_stride;
+    const std::uint32_t* delta_range_row =
+        rope_page_delta_ranges == nullptr
+            ? nullptr
+            : rope_page_delta_ranges + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads *
                        TokenTile * split_count;

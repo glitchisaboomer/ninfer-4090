@@ -37,6 +37,7 @@ struct PagedKVLayerView {
     bool e8_lattice           = false;
     bool e8_root              = false;
     Tensor rope_deltas;          // [logical_pages] int32, or empty (data==nullptr)
+    Tensor rope_delta_ranges;    // [logical_pages] packed [begin,end) token offsets, or empty
     std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
 };
 
@@ -54,6 +55,7 @@ struct PagedKVBatchLayerView {
     Tensor v_scale_pages;
     Tensor block_tables;
     Tensor rope_deltas;          // [table_rows, logical_pages] int32, or empty
+    Tensor rope_delta_ranges;    // [logical_pages, table_rows] packed [begin,end) offsets, or empty
     std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
@@ -97,11 +99,12 @@ struct PagedKVPoolLayout {
     PagedKVPoolSpec spec;
     std::vector<PagedKVPlaneLayout> planes;
     TensorRegion block_tables;
-    // Per-(logical page, table row) RoPE delta, parallel to the block tables. One int32 per entry:
-    // the number of positions a page's keys were moved by relocation, so attention can counter-rotate
-    // its query tile instead of the quantized K plane being rewritten. Sized from the block table it
-    // parallels, never independently -- see plan_paged_kv_pool.
+    // Per-(logical page, table row) RoPE delta and packed relocated [begin,end) token interval.
+    // The ordinary delta remains one int32 per page; the range plane packs a 6-bit begin and 7-bit
+    // exclusive end per page, with 0xffffffff meaning no copied interval. Both are sized from and
+    // parallel to the block table, never independently.
     TensorRegion rope_deltas;
+    TensorRegion rope_delta_ranges;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
@@ -129,12 +132,15 @@ public:
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] const Tensor& block_tables() const noexcept;
-    // The RoPE delta plane, one int32 per (logical page, table row), indexed exactly like the block
-    // table beside it. `kRopeDeltaNone` (0) means the page is ordinary and attention takes its
-    // existing route. Reading this is what makes a quantized K plane relocatable without rewriting it.
+    // The RoPE delta plane and packed sub-page interval plane, both indexed like the block table.
+    // `kRopeDeltaNone` (0) is an ordinary page; an empty packed interval means no copied interval,
+    // while a nonempty interval limits the shift to copied destination tokens.
     [[nodiscard]] const Tensor& rope_deltas() const noexcept;
+    [[nodiscard]] const Tensor& rope_delta_ranges() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
     [[nodiscard]] Tensor rope_delta_row(std::int32_t row) const;
+    [[nodiscard]] Tensor rope_delta_range_row(std::int32_t row) const;
+    [[nodiscard]] Tensor rope_delta_range_row_for_block_table(Tensor block_table) const;
     // Given a single-row block-table slice (as returned by `block_table_row`), return the
     // matching rope-delta row. Pointer-range matching: the block_table tensor's data pointer
     // must lie inside `block_tables_`. Throws if it does not.
@@ -191,6 +197,7 @@ private:
     std::vector<Tensor> planes_;
     Tensor block_tables_;
     Tensor rope_deltas_;
+    Tensor rope_delta_ranges_;
     std::vector<std::int32_t> free_page_ids_;
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
@@ -308,6 +315,7 @@ private:
     PagedKVPool* pool_ = nullptr;
     std::vector<std::int32_t> page_ids_;
     std::vector<std::int32_t> rope_deltas_;
+    std::vector<std::uint32_t> rope_delta_ranges_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
 };

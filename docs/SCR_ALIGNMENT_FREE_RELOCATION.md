@@ -112,6 +112,21 @@ against seconds of re-prefill for the same tokens.
 
 ## The other half: freeing the destination as well
 
+### Implementation status
+
+The first destination-free implementation uses one packed relocated interval per logical page beside
+the existing page delta. BF16 decode and prefill attention use the page delta for whole-page spans and
+recompute QK scores with the shifted query only for keys inside a mixed page's interval. The resulting
+scores join the existing softmax/PV update, so K/V storage and the ordinary-page route are unchanged.
+Copied remaps acquire every destination page touched and move only the span's token ranges.
+
+This path is currently enabled for BF16 KV only. INT8 and packed layouts continue to quantize the
+destination to whole pages until their decode and prefill kernels implement the same boundary score
+handling. Plans with multiple independent relocated intervals in one logical page are refused because
+the packed table intentionally carries only one interval there. The CUDA numerical oracle covers both
+aligned and mixed destination pages, but must still be run on the RTX 4090 before enabling this for
+default traffic.
+
 A copy can write anywhere, so the destination is not free for a *copy* reason: a page carries exactly
 one RoPE delta, and a page holding both relocated and prefilled tokens could carry no single shift.
 Freeing the destination therefore means either making the delta finer or doing without it:
