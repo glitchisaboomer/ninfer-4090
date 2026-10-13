@@ -1119,7 +1119,32 @@ void check_attention(const Variant& variant, const PromptPair& prompts,
     }
     copied.alloc.relocate_copied_pages(planned.mapping, planned.deltas, planned.copy_spans,
                                        ctx.stream);
+    // This cell carries no group-3 assertion of its own, and the stage between the
+    // publish and the attention reads is the re-prefill of the un-relocated ranges.
+    // Reading the plane on both sides of it separates a relocation whose shifts never
+    // reached this cell from a re-prefill that overwrote them -- and both of those read
+    // a relocated page at the source phase, which is what the equivalence below would
+    // otherwise report as an unexplained mismatch against the directly prefilled cache.
+    const std::vector<std::int32_t> deltas_at_publish =
+        read_i32_row(copied.pool->rope_delta_row(0), ctx.stream);
+    if (deltas_at_publish != expected_deltas()) {
+        fail(cell_label +
+             " A3: this cell's relocation published a delta plane the scenario does not describe");
+    }
     append_reedited_pages(copied, curr_k, curr_v, freq, ctx.stream);
+    const std::vector<std::int32_t> deltas_after_prefill =
+        read_i32_row(copied.pool->rope_delta_row(0), ctx.stream);
+    if (deltas_after_prefill != deltas_at_publish) {
+        std::string where;
+        for (std::size_t i = 0; i < deltas_after_prefill.size(); ++i) {
+            if (deltas_after_prefill[i] != deltas_at_publish[i]) {
+                where += " page " + std::to_string(i) + " " + std::to_string(deltas_at_publish[i]) +
+                         " -> " + std::to_string(deltas_after_prefill[i]);
+            }
+        }
+        fail(cell_label + " A3: the re-prefill changed the published delta plane (" + where +
+             "), so a relocated page is read at the source phase");
+    }
 
     const PoolCache copied_cache(variant, copied, ctx.stream);
     const PoolCache reference_cache(variant, reference, ctx.stream);
@@ -1192,13 +1217,22 @@ void check_attention(const Variant& variant, const PromptPair& prompts,
     // The negative control: the same cache read through a zeroed delta plane.
     // That is a relocation that published nothing, so every relocated key is
     // read at the source phase, and it has to break the same criterion.
-    const std::vector<std::int32_t> zeros(static_cast<std::size_t>(kPromptPages), kRopeDeltaNone);
+    //
+    // What it is measured against is the *correct* reading -- the delta oracle the
+    // run above was judged by -- which is how every other control in this suite
+    // states it (`test_scr_relocation_integration.cpp` measures its stale run
+    // against the directly prefilled cache, `test_gqa_kv_page_delta_rotated.cpp`
+    // against its delta reference). Measuring the stale run against an oracle
+    // handed the same zeros compares the broken path with itself: the number is
+    // then the kernel's self-consistency, not the damage of the skipped rotation,
+    // and it is indistinguishable from the correct path's own noise.
     copied.pool->clear_rope_delta_row(0, ctx.stream);
     const AttentionRun got_stale =
         run_a3(copied, copied_cache, q, kQueryBase, kQueryTokens, kVisible, freq, ctx.stream);
     const Error control =
         measure(got_stale.out,
-                ideal_attention_with_delta(q, copied_cache, kQueryBase, kQueryTokens, zeros, freq));
+                ideal_attention_with_delta(q, copied_cache, kQueryBase, kQueryTokens, page_deltas,
+                                           freq));
     if (quantized) {
         if (!expect_control_outside(control, cell_label + " control: a skipped rotation",
                                     kConformanceRotatedI8)) {
@@ -1216,7 +1250,8 @@ void check_attention(const Variant& variant, const PromptPair& prompts,
                freq, ctx.stream);
     const Error tail_control =
         measure(got_tail_stale.out,
-                ideal_attention_with_delta(q_1, copied_cache, kTailFirst, kTailTokens, zeros, freq));
+                ideal_attention_with_delta(q_1, copied_cache, kTailFirst, kTailTokens, page_deltas,
+                                           freq));
     if (quantized) {
         if (!expect_control_outside(tail_control, cell_label + " A1 control: a skipped rotation",
                                     kConformanceRotatedI8)) {
