@@ -1085,18 +1085,20 @@ void append_reedited_pages(const PoolCell& cell, const std::vector<__nv_bfloat16
 // path applies the plane; if the corrected rows do not agree, the payload and the shift it is paired
 // with disagree, and no reader can be expected to reconcile them.
 void check_stored_keys(const PoolCache& copied_cache, const PoolCache& reference_cache,
-                       const std::vector<std::int32_t>& page_deltas, std::int32_t tokens,
-                       const FreqTable& freq, const std::string& label) {
+                       const std::vector<std::int32_t>& page_deltas, const FreqTable& freq,
+                       const std::string& label) {
     const PoolCache::HostImage copied_img = copied_cache.image();
     const PoolCache::HostImage ref_img    = reference_cache.image();
     std::array<double, kHeadDim> stored{};
     std::array<double, kHeadDim> corrected{};
-    double raw_worst = 0.0;
-    double corrected_worst = 0.0;
-    std::int32_t raw_at = -1;
-    std::int32_t corrected_at = -1;
-    for (std::int32_t x = kQueryBase; x < kQueryBase + tokens; ++x) {
-        const std::int32_t delta = page_deltas[static_cast<std::size_t>(x / kPageSize)];
+    // Per logical page, so a page with no delta and a page the relocation moved cannot be confused:
+    // the window the queries sit in is a single page, and a single aggregate number cannot say
+    // whether the mismatch is the moved pages, the kept ones, or everything.
+    std::vector<double> raw_worst(static_cast<std::size_t>(kPromptPages), 0.0);
+    std::vector<double> corrected_worst(static_cast<std::size_t>(kPromptPages), 0.0);
+    for (std::int32_t x = 0; x < kVisible; ++x) {
+        const std::int32_t page  = x / kPageSize;
+        const std::int32_t delta = page_deltas[static_cast<std::size_t>(page)];
         for (std::int32_t head = 0; head < kKvHeads; ++head) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 stored[static_cast<std::size_t>(d)] = copied_cache.k_logical(copied_img, x, head, d);
@@ -1107,25 +1109,31 @@ void check_stored_keys(const PoolCache& copied_cache, const PoolCache& reference
                 const double want       = reference_cache.k_logical(ref_img, x, head, d);
                 const double raw_err    = std::fabs(stored[index] - want);
                 const double fixed_err  = std::fabs(corrected[index] - want);
-                if (raw_err > raw_worst) {
-                    raw_worst = raw_err;
-                    raw_at    = x;
-                }
-                if (fixed_err > corrected_worst) {
-                    corrected_worst = fixed_err;
-                    corrected_at    = x;
-                }
+                double& raw_slot        = raw_worst[static_cast<std::size_t>(page)];
+                double& fixed_slot      = corrected_worst[static_cast<std::size_t>(page)];
+                if (raw_err > raw_slot) { raw_slot = raw_err; }
+                if (fixed_err > fixed_slot) { fixed_slot = fixed_err; }
             }
         }
     }
-    std::printf("  %s: stored keys vs the directly prefilled cache: as stored %.3e (position %d), "
-                "corrected by the published delta %.3e (position %d)\n",
-                label.c_str(), raw_worst, raw_at, corrected_worst, corrected_at);
-    if (corrected_worst > 3.0e-2) {
-        fail(label +
-             ": the copied cache's stored keys do not reconstruct the directly prefilled cache's "
-             "even with the published delta applied, so the payload and the shift it is paired with "
-             "disagree");
+    std::printf("  %s: stored keys vs the directly prefilled cache, per logical page "
+                "(as stored / corrected):",
+                label.c_str());
+    for (std::int32_t page = 0; page < kPromptPages; ++page) {
+        const std::size_t index = static_cast<std::size_t>(page);
+        if (raw_worst[index] < 1.0e-2 && corrected_worst[index] < 1.0e-2) { continue; }
+        std::printf("\n      page %d delta %d: %.3e / %.3e", page,
+                    page_deltas[index], raw_worst[index], corrected_worst[index]);
+    }
+    std::printf("\n");
+    for (std::int32_t page = 0; page < kPromptPages; ++page) {
+        const std::size_t index = static_cast<std::size_t>(page);
+        if (corrected_worst[index] > 3.0e-2) {
+            fail(label + ": page " + std::to_string(page) + " (delta " +
+                 std::to_string(page_deltas[index]) +
+                 ") does not reconstruct the directly prefilled cache's keys even with its published "
+                 "delta applied, so the payload and the shift it is paired with disagree");
+        }
     }
 }
 
@@ -1210,7 +1218,7 @@ void check_attention(const Variant& variant, const PromptPair& prompts,
         run_a3(copied, copied_cache, q, kQueryBase, kQueryTokens, kVisible, freq, ctx.stream);
     const std::vector<std::int32_t> page_deltas =
         read_i32_row(copied.pool->rope_delta_row(0), ctx.stream);
-    check_stored_keys(copied_cache, reference_cache, page_deltas, kQueryTokens, freq,
+    check_stored_keys(copied_cache, reference_cache, page_deltas, freq,
                       cell_label + " stored keys");
     if (!expect_conformant(measure(got_reference.out,
                                    ideal_attention(q, reference_cache, kQueryBase, kQueryTokens)),
