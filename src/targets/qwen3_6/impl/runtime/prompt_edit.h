@@ -101,7 +101,16 @@ struct PromptEditDiff {
 // One surviving region that Suffix Cache Reuse would relocate instead of re-prefilling.
 // `source_begin` indexes the previous prompt/resident KV; `dest_begin` indexes the current
 // prompt. Both ranges are disjoint. The re-pointing path requires whole pages at both ends; the
-// copied path accepts arbitrary token offsets at both ends and records each page's relocated interval.
+// copied path accepts arbitrary token offsets at both ends and records each page's relocated
+// interval.
+//
+// What bounds that freedom is the one interval a page can carry: at most one relocated span may
+// cover a given logical page, because the packed range plane names a single [begin, end) shift per
+// page and a page two spans met in could describe neither. Tokens prefilled into a page a span
+// also reloads are not a violation -- they simply sit outside the span's interval and keep the
+// ordinary-page route -- so a span may begin or end mid-page. `relocation_is_expressible`
+// enforces the one-span-per-page rule and `plan_rope_delta_page_ranges` enforces it again, so a
+// plan that breaks it is refused rather than silently truncated.
 struct RelocatedSpan {
     std::uint32_t source_begin = 0;
     std::uint32_t dest_begin   = 0;
@@ -160,6 +169,11 @@ struct RelocatedSpan {
 //
 // When destinations are quantized, up to 63 tokens at each end are recomputed. A run with no whole
 // destination page returns nothing in that mode; boundary-aware mode can relocate any nonempty run.
+//
+// In either mode the returned spans never share a logical destination page with each other. That is
+// not a property of the selector passing the checks in `relocation_is_expressible` -- it is what
+// lets the packed range plane name one interval per page at all, so a caller that merges, splits or
+// otherwise combines these spans downstream has to preserve it.
 [[nodiscard]] std::vector<RelocatedSpan> plan_shifted_relocations(
     const PromptEditDiff& diff, std::uint32_t resident_kv_tokens,
     std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens,
