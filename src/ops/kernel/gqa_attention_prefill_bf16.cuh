@@ -244,6 +244,47 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     std::int32_t current_delta = 0;
     std::int32_t current_page_delta = 0;
     std::uint32_t current_range = kRopeDeltaRangeEmpty;
+    // Reload this CTA's Q rows into q_s and rotate them in place by `delta`. The rotation is a
+    // no-op for delta 0, so an unrotated reload is the same call -- which is what lets the caller
+    // undo an in-place rotation with an ordinary reload instead of a sentinel that forces one.
+    //
+    // Not parameterized by the key page: Q for this CTA tile is fixed by `q0` and `q_head`, and only
+    // the angle it is rotated by changes from page to page.
+    auto load_and_rotate_q = [&](std::int32_t delta) {
+        const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0);
+        constexpr int VecPerRow = D / 8;
+        constexpr int QRowStride = D * Geometry::QHeads;
+        if (q0 + Br <= tokens) {
+            #pragma unroll
+            for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                const int row = chunk >> 5;
+                const int d   = (chunk & 31) << 3;
+                __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
+                cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+            }
+        } else {
+            #pragma unroll
+            for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                const int row = chunk >> 5;
+                const int d   = (chunk & 31) << 3;
+                __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
+                if (q0 + row < tokens) {
+                    cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+                } else {
+                    store_vec(p, make_int4(0, 0, 0, 0));
+                }
+            }
+        }
+        ninfer::ops::cp_commit();
+        ninfer::ops::cp_wait<0>();
+        // Wait for the cp.async Q reload to land in q_s before the rotation reads it.
+        __syncthreads();
+        gqa_prefill_rotate_q_smem_inplace(q_s, Br, tid, Threads, delta, freq);
+        // Wait for the in-place rotation writes to q_s to be visible before the
+        // next iteration's ldmatrix reads Q from it.
+        __syncthreads();
+    };
+
     auto reload_and_rotate_q = [&](int kb) {
         if (delta_table != nullptr) {
             const std::int32_t new_page_delta = delta_table[kb];
@@ -255,45 +296,13 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             current_page_delta = new_page_delta;
             current_range = new_range;
             if (new_delta != current_delta) {
-                const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0);
-                constexpr int VecPerRow = D / 8;
-                constexpr int QRowStride = D * Geometry::QHeads;
-                if (q0 + Br <= tokens) {
-                    #pragma unroll
-                    for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
-                        const int row = chunk >> 5;
-                        const int d   = (chunk & 31) << 3;
-                        __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
-                        cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
-                    }
-                } else {
-                    #pragma unroll
-                    for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
-                        const int row = chunk >> 5;
-                        const int d   = (chunk & 31) << 3;
-                        __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
-                        if (q0 + row < tokens) {
-                            cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
-                        } else {
-                            store_vec(p, make_int4(0, 0, 0, 0));
-                        }
-                    }
-                }
-                ninfer::ops::cp_commit();
-                ninfer::ops::cp_wait<0>();
-                // Wait for the cp.async Q reload to land in q_s before the rotation reads it.
-                __syncthreads();
-                
-                gqa_prefill_rotate_q_smem_inplace(q_s, Br, tid, Threads, new_delta, freq);
+                load_and_rotate_q(new_delta);
                 current_delta = new_delta;
-                // Wait for the in-place rotation writes to q_s to be visible before the
-                // next iteration's ldmatrix reads Q from it.
-                __syncthreads();
             }
         }
     };
 
-    auto recompute_boundary_scores = [&](int kb, int k0, float scores[QKNt][4]) {
+    auto recompute_boundary_scores = [&](int k0, float scores[QKNt][4]) {
         const bool partial = rope_delta_page_range_is_partial(current_range);
         if (!partial || current_page_delta == 0) { return; }
 
@@ -336,8 +345,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             }
         }
 
-        current_delta = (-2147483647 - 1);
-        reload_and_rotate_q(kb);
+        // Undo the in-place rotation above. The scores already computed for this key block used
+        // the unrotated Q that was in q_s, so q_s has to go back to that before the epilogue's
+        // ldmatrix reads it. This is a plain reload at angle 0, with kb and the delta plane left
+        // out of it: `load_and_rotate_q` is a no-op rotation there, and forcing it through the
+        // sentinel that the page-transition comparison used to require was an indirect way to ask
+        // for exactly this.
+        load_and_rotate_q(0);
+        current_delta = 0;
     };
 
     // Prologue: commit Q, then kick off K(0).
@@ -406,7 +421,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             }
         }
 
-        recompute_boundary_scores(kb, kb * Bc, score);
+        recompute_boundary_scores(kb * Bc, score);
 
         // Unmasked block row-max on raw (unscaled) scores
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
@@ -567,7 +582,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qabs0 = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1 = (qrow1 < tokens) ? base_pos + qrow1 : -1;
 
-        recompute_boundary_scores(kb, k0, score);
+        recompute_boundary_scores(k0, score);
 
         // Masked block row-max on raw (unscaled) scores
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
