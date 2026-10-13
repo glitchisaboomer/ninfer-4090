@@ -1077,62 +1077,240 @@ void append_reedited_pages(const PoolCell& cell, const std::vector<__nv_bfloat16
 // the anchor that keeps the harness itself honest; the zeroed delta plane is
 // the control, and the design is only discriminating if the control breaks the
 // criterion the correct run is judged by.
-// The storage side of the equivalence, measured directly. Group 1 shows the copy moved the source
-// bytes; this shows whether those bytes, read at their destination through the published mapping and
-// corrected by the page's own delta, are the keys a direct prefill wrote. Both numbers are reported
-// because the comparison between them is the measurement: if the corrected rows agree with the
-// directly prefilled cache and the attention comparison still does not, the defect is in how the read
-// path applies the plane; if the corrected rows do not agree, the payload and the shift it is paired
-// with disagree, and no reader can be expected to reconcile them.
-void check_stored_keys(const PoolCache& copied_cache, const PoolCache& reference_cache,
+// The storage side of the equivalence, measured against two references at once.
+//
+// Parity with the directly prefilled cache is the design's own anchor and is kept: group 1 shows the
+// copy moved the source bytes, this shows whether those bytes, read at their destination through the
+// published mapping and corrected by the page's own delta, are the keys a direct prefill wrote.
+//
+// Parity alone cannot name a side. The pages the relocation never touches are written from the same
+// activation at the same position through the same kernel in both caches, so they hold the same bytes
+// by construction; a harness that reports a disagreement there has measured itself, not the copier,
+// and no parity number can say that. So each side is additionally held against the activation this
+// fixture wrote, which is an independent oracle and the only reading here that can name one:
+//
+//   * on the plane whose writer is exact (bf16 in, bf16 stored, no codec between them) the stored row
+//     reproduces that activation bit for bit, so a non-zero column there is a defect rather than
+//     rounding. It is the column that decides whether the anchor itself is the current prompt's
+//     content, before any parity number is read as a property of the relocation;
+//   * on a quantized plane the stored codes are not the activation, so that column is omitted rather
+//     than fudged, and only parity is judged.
+//
+// Every column is per logical page: the query window is one page wide, and one aggregate cannot
+// separate the moved pages from the kept ones. The probe rows print both halves of a single row -- the
+// rotary dims forward_rope rewrites and the dims it copies verbatim -- because a correction that
+// leaves an aggregate unchanged must have reached one of them and not the other, and that asymmetry
+// is the difference between a rotation that did nothing and a rotation that was not needed.
+void check_stored_keys(const PoolCell& copied_cell, const PoolCache& copied_cache,
+                       const PoolCell& reference_cell, const PoolCache& reference_cache,
+                       const std::vector<__nv_bfloat16>& curr_k, bool exact_plane,
                        const std::vector<std::int32_t>& page_deltas, const FreqTable& freq,
-                       const std::string& label) {
+                       cudaStream_t stream, const std::string& label) {
     const PoolCache::HostImage copied_img = copied_cache.image();
     const PoolCache::HostImage ref_img    = reference_cache.image();
+    const std::size_t pages               = static_cast<std::size_t>(kPromptPages);
     std::array<double, kHeadDim> stored{};
     std::array<double, kHeadDim> corrected{};
-    // Per logical page, so a page with no delta and a page the relocation moved cannot be confused:
-    // the window the queries sit in is a single page, and a single aggregate number cannot say
-    // whether the mismatch is the moved pages, the kept ones, or everything.
-    std::vector<double> raw_worst(static_cast<std::size_t>(kPromptPages), 0.0);
-    std::vector<double> corrected_worst(static_cast<std::size_t>(kPromptPages), 0.0);
+    std::vector<double> raw_worst(pages, 0.0);
+    std::vector<double> corrected_worst(pages, 0.0);
+    std::vector<double> anchor_host_worst(pages, 0.0);
+    std::vector<double> copied_host_raw_worst(pages, 0.0);
+    std::vector<double> copied_host_worst(pages, 0.0);
+    std::vector<std::int32_t> copied_host_dim(pages, -1);
+    // The magnitude on each side, because a page that holds nothing and a page that holds the wrong
+    // thing are the same difference and not the same defect: a side reading zeros shows up here as an
+    // empty row, which no deviation column can separate from a row of unrelated keys.
+    std::vector<double> copied_magnitude(pages, 0.0);
+    std::vector<double> anchor_magnitude(pages, 0.0);
     for (std::int32_t x = 0; x < kVisible; ++x) {
         const std::int32_t page  = x / kPageSize;
-        const std::int32_t delta = page_deltas[static_cast<std::size_t>(page)];
+        const std::size_t index  = static_cast<std::size_t>(page);
+        const std::int32_t delta = page_deltas[index];
         for (std::int32_t head = 0; head < kKvHeads; ++head) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 stored[static_cast<std::size_t>(d)] = copied_cache.k_logical(copied_img, x, head, d);
             }
             forward_rope(stored.data(), delta, freq, corrected.data());
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                const std::size_t index = static_cast<std::size_t>(d);
-                const double want       = reference_cache.k_logical(ref_img, x, head, d);
-                const double raw_err    = std::fabs(stored[index] - want);
-                const double fixed_err  = std::fabs(corrected[index] - want);
-                double& raw_slot        = raw_worst[static_cast<std::size_t>(page)];
-                double& fixed_slot      = corrected_worst[static_cast<std::size_t>(page)];
-                if (raw_err > raw_slot) { raw_slot = raw_err; }
-                if (fixed_err > fixed_slot) { fixed_slot = fixed_err; }
+                const std::size_t dim  = static_cast<std::size_t>(d);
+                const double want      = reference_cache.k_logical(ref_img, x, head, d);
+                const double raw_err   = std::fabs(stored[dim] - want);
+                const double fixed_err = std::fabs(corrected[dim] - want);
+                if (raw_err > raw_worst[index]) { raw_worst[index] = raw_err; }
+                if (fixed_err > corrected_worst[index]) { corrected_worst[index] = fixed_err; }
+                if (std::fabs(stored[dim]) > copied_magnitude[index]) {
+                    copied_magnitude[index] = std::fabs(stored[dim]);
+                }
+                if (std::fabs(want) > anchor_magnitude[index]) {
+                    anchor_magnitude[index] = std::fabs(want);
+                }
+                if (!exact_plane) { continue; }
+                const double truth = static_cast<double>(
+                    __bfloat162float(curr_k[act_index(head, x, kKvHeads, d)]));
+                const double anchor_err = std::fabs(want - truth);
+                const double host_raw   = std::fabs(stored[dim] - truth);
+                const double host_fixed = std::fabs(corrected[dim] - truth);
+                if (anchor_err > anchor_host_worst[index]) { anchor_host_worst[index] = anchor_err; }
+                if (host_raw > copied_host_raw_worst[index]) {
+                    copied_host_raw_worst[index] = host_raw;
+                }
+                if (host_fixed > copied_host_worst[index]) {
+                    copied_host_worst[index]  = host_fixed;
+                    copied_host_dim[index]    = d;
+                }
             }
         }
     }
-    std::printf("  %s: stored keys vs the directly prefilled cache, per logical page "
-                "(as stored / corrected):",
+
+    // The two probe rows: one on a page the relocation never touches, one on the page the queries sit
+    // in, each read through the same correction the aggregate used.
+    const std::int32_t probe_positions[2] = {0, kQueryBase};
+    for (int i = 0; i < 2; ++i) {
+        const std::int32_t x     = probe_positions[i];
+        const std::int32_t delta = page_deltas[static_cast<std::size_t>(x / kPageSize)];
+        for (std::int32_t d = 0; d < kHeadDim; ++d) {
+            stored[static_cast<std::size_t>(d)] = copied_cache.k_logical(copied_img, x, 0, d);
+        }
+        forward_rope(stored.data(), delta, freq, corrected.data());
+        for (int j = 0; j < 2; ++j) {
+            const std::int32_t d    = j == 0 ? 0 : kRotaryPairs;
+            const std::size_t dim   = static_cast<std::size_t>(d);
+            const double truth      = exact_plane
+                                          ? static_cast<double>(__bfloat162float(
+                                                curr_k[act_index(0, x, kKvHeads, d)]))
+                                          : std::numeric_limits<double>::quiet_NaN();
+            std::printf("\n      probe x=%d head 0 d=%d: copied as stored %.6e, corrected %.6e; anchor "
+                        "%.6e; activation %.6e",
+                        x, d, stored[dim], corrected[dim],
+                        reference_cache.k_logical(ref_img, x, 0, d), truth);
+        }
+    }
+
+    const auto ids_of = [](const PoolCell& cell) {
+        std::string out;
+        for (const std::int32_t id : cell.alloc.page_ids()) { out += std::to_string(id) + " "; }
+        return out;
+    };
+    std::printf("\n  %s: stored keys per logical page (parity: as stored / corrected by the delta;"
+                " copied against the written activation: as stored / corrected, worst dim; anchor"
+                " against the written activation):",
                 label.c_str());
     for (std::int32_t page = 0; page < kPromptPages; ++page) {
         const std::size_t index = static_cast<std::size_t>(page);
-        if (raw_worst[index] < 1.0e-2 && corrected_worst[index] < 1.0e-2) { continue; }
-        std::printf("\n      page %d delta %d: %.3e / %.3e", page,
-                    page_deltas[index], raw_worst[index], corrected_worst[index]);
+        const bool quiet = raw_worst[index] < 1.0e-2 && corrected_worst[index] < 1.0e-2 &&
+                           anchor_host_worst[index] < 1.0e-2 &&
+                           copied_host_worst[index] < 1.0e-2;
+        // An empty page on either side is never quiet, whatever the deviation columns say.
+        const bool empty = copied_magnitude[index] < 1.0e-6 || anchor_magnitude[index] < 1.0e-6;
+        if (quiet && !empty) { continue; }
+        if (!exact_plane) {
+            std::printf("\n      page %d delta %d: |copied| %.3e |anchor| %.3e ; parity %.3e / %.3e", page,
+                        page_deltas[index], copied_magnitude[index], anchor_magnitude[index],
+                        raw_worst[index], corrected_worst[index]);
+            continue;
+        }
+        std::printf("\n      page %d delta %d: |copied| %.3e |anchor| %.3e ; parity %.3e / %.3e ; copied"
+                    " %.3e / %.3e (d=%d) ; anchor %.3e",
+                    page, page_deltas[index], copied_magnitude[index], anchor_magnitude[index],
+                    raw_worst[index], corrected_worst[index], copied_host_raw_worst[index],
+                    copied_host_worst[index], copied_host_dim[index], anchor_host_worst[index]);
+    }
+    std::printf("\n      copied page ids:    %s\n      reference page ids: %s\n",
+                ids_of(copied_cell).c_str(), ids_of(reference_cell).c_str());
+
+    // The ground truth under both images: the K plane's own bytes on the physical page each logical page
+    // resolves to, read straight out of the two pools. A decoded comparison cannot separate a wrong page
+    // from a wrong decode, and the difference decides which of the two is being looked at; these bytes
+    // are the only reading here that does not go through the image at all.
+    const PlaneSnapshot copied_pages    = snapshot_pages(*copied_cell.pool, stream);
+    const PlaneSnapshot reference_pages = snapshot_pages(*reference_cell.pool, stream);
+    const std::int32_t probe_pages[3]   = {0, 11, 16};
+    std::printf("      K-plane bytes per page (kept frontier / re-prefilled / relocated destination):");
+    for (const std::int32_t page : probe_pages) {
+        const std::int32_t copied_id =
+            copied_cell.alloc.page_ids()[static_cast<std::size_t>(page)];
+        const std::int32_t reference_id =
+            reference_cell.alloc.page_ids()[static_cast<std::size_t>(page)];
+        const PageImage& copied_bytes = copied_pages[0][static_cast<std::size_t>(copied_id)];
+        const PageImage& reference_bytes = reference_pages[0][static_cast<std::size_t>(reference_id)];
+        std::size_t first_diff = copied_bytes.size();
+        const std::size_t shared = std::min(copied_bytes.size(), reference_bytes.size());
+        for (std::size_t i = 0; i < shared; ++i) {
+            if (copied_bytes[i] != reference_bytes[i]) {
+                first_diff = i;
+                break;
+            }
+        }
+        const auto hex = [](const PageImage& bytes) {
+            std::string out;
+            char buf[4];
+            for (std::size_t i = 0; i < 8 && i < bytes.size(); ++i) {
+                std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned>(bytes[i]));
+                out += buf;
+            }
+            return out;
+        };
+        const bool identical = copied_bytes.size() == reference_bytes.size() &&
+                               first_diff == copied_bytes.size();
+        std::printf("\n      logical page %d: copied id %d %s vs reference id %d %s -> %s (first "
+                    "differing byte %zu of %zu)",
+                    page, copied_id, hex(copied_bytes).c_str(), reference_id,
+                    hex(reference_bytes).c_str(), identical ? "identical" : "differ", first_diff,
+                    copied_bytes.size());
     }
     std::printf("\n");
+
+    // Three readings, named as measured rather than as their likely cause, because they are three
+    // different defects and only one of them is the copier's: an empty side is the harness failing to
+    // read a cache the anchored attention checks in this same cell say holds content; a stored-and-
+    // corrected mismatch is a payload/shift disagreement; and a stored match that the correction
+    // breaks is a page whose published shift does not describe the row it was published for.
     for (std::int32_t page = 0; page < kPromptPages; ++page) {
         const std::size_t index = static_cast<std::size_t>(page);
-        if (corrected_worst[index] > 3.0e-2) {
+        const std::string where =
+            " page " + std::to_string(page) + " (delta " + std::to_string(page_deltas[index]) + "): ";
+        const bool copied_empty = copied_magnitude[index] < 1.0e-6;
+        const bool anchor_empty = anchor_magnitude[index] < 1.0e-6;
+        if (copied_empty || anchor_empty) {
+            fail(label + where + "the " +
+                 std::string(copied_empty ? "copied" : "directly prefilled") +
+                 " cache reads an empty row here (magnitudes " +
+                 std::to_string(copied_magnitude[index]) + " and " +
+                 std::to_string(anchor_magnitude[index]) +
+                 "), so this comparison has no second side and measures the harness's read of that "
+                 "cache rather than the relocation");
+            continue;
+        }
+        const bool reconstructs = corrected_worst[index] > 3.0e-2;
+        const bool already_matches = raw_worst[index] < 3.0e-2;
+        if (already_matches && reconstructs) {
+            fail(label + where + "the copied cache's stored keys already equal the directly prefilled "
+                 "cache's (as stored " + std::to_string(raw_worst[index]) +
+                 ") and the published delta is what breaks them (corrected " +
+                 std::to_string(corrected_worst[index]) +
+                 "), so that page's shift does not describe the row it is paired with");
+        } else if (reconstructs) {
+            fail(label + where + "the copied cache's stored keys do not reconstruct the directly "
+                 "prefilled cache's even with the published delta applied (as stored " +
+                 std::to_string(raw_worst[index]) + ", corrected " +
+                 std::to_string(corrected_worst[index]) +
+                 "), so the payload and the shift it is paired with disagree");
+        }
+        if (!exact_plane) { continue; }
+        if (anchor_host_worst[index] > 3.0e-2) {
             fail(label + ": page " + std::to_string(page) + " (delta " +
                  std::to_string(page_deltas[index]) +
-                 ") does not reconstruct the directly prefilled cache's keys even with its published "
-                 "delta applied, so the payload and the shift it is paired with disagree");
+                 ") disagrees by " + std::to_string(anchor_host_worst[index]) +
+                 " with the activation this fixture wrote, so the directly prefilled anchor every "
+                 "comparison here is anchored to is not the current prompt's content");
+        }
+        if (copied_host_worst[index] > 3.0e-2) {
+            fail(label + ": page " + std::to_string(page) + " (delta " +
+                 std::to_string(page_deltas[index]) +
+                 ") disagrees by " + std::to_string(copied_host_worst[index]) + " (worst at dim " +
+                 std::to_string(copied_host_dim[index]) +
+                 ") with the activation this fixture wrote even after its published delta is applied, "
+                 "so the relocated payload at that page is not the current prompt's keys");
         }
     }
 }
@@ -1218,8 +1396,8 @@ void check_attention(const Variant& variant, const PromptPair& prompts,
         run_a3(copied, copied_cache, q, kQueryBase, kQueryTokens, kVisible, freq, ctx.stream);
     const std::vector<std::int32_t> page_deltas =
         read_i32_row(copied.pool->rope_delta_row(0), ctx.stream);
-    check_stored_keys(copied_cache, reference_cache, page_deltas, freq,
-                      cell_label + " stored keys");
+    check_stored_keys(copied, copied_cache, reference, reference_cache, curr_k, !quantized,
+                      page_deltas, freq, ctx.stream, cell_label + " stored keys");
     if (!expect_conformant(measure(got_reference.out,
                                    ideal_attention(q, reference_cache, kQueryBase, kQueryTokens)),
                            cell_label + " A3 over a directly prefilled cache", criterion)) {
