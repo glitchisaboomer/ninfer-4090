@@ -1077,6 +1077,58 @@ void append_reedited_pages(const PoolCell& cell, const std::vector<__nv_bfloat16
 // the anchor that keeps the harness itself honest; the zeroed delta plane is
 // the control, and the design is only discriminating if the control breaks the
 // criterion the correct run is judged by.
+// The storage side of the equivalence, measured directly. Group 1 shows the copy moved the source
+// bytes; this shows whether those bytes, read at their destination through the published mapping and
+// corrected by the page's own delta, are the keys a direct prefill wrote. Both numbers are reported
+// because the comparison between them is the measurement: if the corrected rows agree with the
+// directly prefilled cache and the attention comparison still does not, the defect is in how the read
+// path applies the plane; if the corrected rows do not agree, the payload and the shift it is paired
+// with disagree, and no reader can be expected to reconcile them.
+void check_stored_keys(const PoolCache& copied_cache, const PoolCache& reference_cache,
+                       const std::vector<std::int32_t>& page_deltas, std::int32_t tokens,
+                       const FreqTable& freq, const std::string& label) {
+    const PoolCache::HostImage copied_img = copied_cache.image();
+    const PoolCache::HostImage ref_img    = reference_cache.image();
+    std::array<double, kHeadDim> stored{};
+    std::array<double, kHeadDim> corrected{};
+    double raw_worst = 0.0;
+    double corrected_worst = 0.0;
+    std::int32_t raw_at = -1;
+    std::int32_t corrected_at = -1;
+    for (std::int32_t x = kQueryBase; x < kQueryBase + tokens; ++x) {
+        const std::int32_t delta = page_deltas[static_cast<std::size_t>(x / kPageSize)];
+        for (std::int32_t head = 0; head < kKvHeads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                stored[static_cast<std::size_t>(d)] = copied_cache.k_logical(copied_img, x, head, d);
+            }
+            forward_rope(stored.data(), delta, freq, corrected.data());
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const std::size_t index = static_cast<std::size_t>(d);
+                const double want       = reference_cache.k_logical(ref_img, x, head, d);
+                const double raw_err    = std::fabs(stored[index] - want);
+                const double fixed_err  = std::fabs(corrected[index] - want);
+                if (raw_err > raw_worst) {
+                    raw_worst = raw_err;
+                    raw_at    = x;
+                }
+                if (fixed_err > corrected_worst) {
+                    corrected_worst = fixed_err;
+                    corrected_at    = x;
+                }
+            }
+        }
+    }
+    std::printf("  %s: stored keys vs the directly prefilled cache: as stored %.3e (position %d), "
+                "corrected by the published delta %.3e (position %d)\n",
+                label.c_str(), raw_worst, raw_at, corrected_worst, corrected_at);
+    if (corrected_worst > 3.0e-2) {
+        fail(label +
+             ": the copied cache's stored keys do not reconstruct the directly prefilled cache's "
+             "even with the published delta applied, so the payload and the shift it is paired with "
+             "disagree");
+    }
+}
+
 void check_attention(const Variant& variant, const PromptPair& prompts,
                      const std::vector<__nv_bfloat16>& prev_k,
                      const std::vector<__nv_bfloat16>& prev_v,
@@ -1158,6 +1210,8 @@ void check_attention(const Variant& variant, const PromptPair& prompts,
         run_a3(copied, copied_cache, q, kQueryBase, kQueryTokens, kVisible, freq, ctx.stream);
     const std::vector<std::int32_t> page_deltas =
         read_i32_row(copied.pool->rope_delta_row(0), ctx.stream);
+    check_stored_keys(copied_cache, reference_cache, page_deltas, kQueryTokens, freq,
+                      cell_label + " stored keys");
     if (!expect_conformant(measure(got_reference.out,
                                    ideal_attention(q, reference_cache, kQueryBase, kQueryTokens)),
                            cell_label + " A3 over a directly prefilled cache", criterion)) {
