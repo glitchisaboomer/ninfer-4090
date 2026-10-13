@@ -296,13 +296,16 @@ rewritten, so it bounds how far a relocated span may reach rather than forbiddin
 block ending before it. Before the fix every e2e run reported `full_reset`; after it, relocation is
 planned and executed.
 
-**The planner has no guard for quantized KV.** `gqa_kv_rerotate` requires an uncompressed BF16 Text
-KV plane, so a quantized `--kv-dtype` plans a relocation that then throws at runtime instead of
-degrading to `AppendAtFrontier`. This is the cheapest outstanding fix and is not done.
+**The planner has no guard for quantized KV.** *(Superseded: `gqa_kv_rerotate` and
+`validate_text_k_cache` are both gone and the planner now consults
+`delta_path_supports_dtype` — see "SCR is no longer limited to BF16 KV" below. Recorded here
+because it was one of the two blockers this section describes.)* `gqa_kv_rerotate` required an
+uncompressed BF16 Text KV plane, so a quantized `--kv-dtype` planned a relocation that then threw at
+runtime instead of degrading to `AppendAtFrontier`.
 
 ## Verification status
 
-Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 88-test suite green):
+Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 84-test suite green):
 
 1. `reassign_pages` against the real pool -- **done**, `tests/test_paged_kv_reassign_pages.cpp`.
    Permutation, grow from the pool, shrink, reclaiming a whole entitlement, the shrink-one-region
@@ -328,7 +331,19 @@ Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 88-test sui
 4. End-to-end relocation wiring in `program_impl.h` -- **wiring defect found and fixed**, see below.
    `tools/scr_e2e_check.py` drives a live server over prompts that share a prefix and a suffix and
    differ in the middle, and refuses to report a pass unless the server logs `reuse=suffix_relocation`.
-5. Phase 5.5 quality harness -- **not started**. `eval/ninfer_eval` has no `--scr` support`.
+5. Phase 5.5 quality harness -- **built and measured**, `apps/scr_quality`
+   (`ninfer-scr-quality.exe`), scored by `evaluate_scr_quality` against the roadmap's thresholds. It
+   runs four phases per prompt (`--flag-control` adds the fourth) and prints an `ATTRIBUTION` table
+   that reads the measurement against both floors it must clear -- the run-to-run control and the
+   flag-only configuration -- never against zero. The 2026-10-08 measurements leave the K=2 sweep
+   point as an unexplained, reproducible signal; `docs/SCR_ROADMAP.md`'s Phase 5.5 records what is
+   measured and what is still owed.
+6. Copied relocation (off-grid source) -- **zero execution**. The device copy is written
+   (`src/core/paged_kv_cache.cu`, `relocate_copied_pages`) and the runtime branch engages it, but the
+   e2e fixture aligns by construction, so no hardware run has reached it: the device oracle in
+   `tests/ops/test_scr_copied_relocation.cpp` does not exist yet.
+   `docs/SCR_COPIED_RELOCATION_HANDOFF.md` specifies it. The interleaved-fixture and per-dtype
+   hardware runs that remain are laddered in `docs/SCR_ALIGNMENT_FREE_RELOCATION.md`.
 
 ### The defect: the chunk's base position was captured before the cursor skipped the relocated run
 
@@ -402,13 +417,18 @@ head_dim, against 16.96 GiB of `groupwise-int` weights on a 23.99 GiB card.
 | kv-dtype | KiB/token | KV @65k | KV @131k | KV @262k | SCR |
 |---|---|---|---|---|---|
 | bf16 | 64 | 4.0 GiB | 8.0 GiB (over) | 16 GiB (over) | yes |
-| int8 | 32 | 2.0 GiB | 4.0 GiB | 8.0 GiB (over) | no |
-| rk4v4-e8 | 16 | 1.0 GiB | 2.0 GiB | 4.0 GiB | no |
-| rk2v4-e8 | 12 | 0.8 GiB | 1.5 GiB | 3.0 GiB | no |
+| int8 | 32 | 2.0 GiB | 4.0 GiB | 8.0 GiB (over) | yes* |
+| rk4v4-e8 | 16 | 1.0 GiB | 2.0 GiB | 4.0 GiB | yes* |
+| rk2v4-e8 | 12 | 0.8 GiB | 1.5 GiB | 3.0 GiB | refused |
 
-So on this card SCR works only up to roughly 65k context, while the quantized formats are what buy
-the 160k-500k configurations in the README. That is backwards for a memory-constrained device: the
-feature is available only in the regime with the least memory pressure to relieve.
+\* The delta-plane path admits every I8 layout (`delta_path_supports_dtype`), and the e2e check
+accepts `bf16, int8, rk8v4, rk4v4, rk4v4-e8`; the per-dtype hardware runs are still owed.
+`rk2v4-e8` is deliberately refused by that check: its K read path is a different codec
+(`e8_root_decode_8d_int8`) whose oracle is not written, so nothing can attribute a pass there yet.
+
+So the binding limit is context length, not dtype: `bf16` caps at roughly 65k on this card, and the
+quantized layouts are what buy the longer configurations. One hardware run at `rk4v4-e8` has engaged
+relocation and produced output identical to `--no-scr`.
 
 ### Why quantized K is the blocker, and why V is not
 
@@ -428,12 +448,11 @@ rotation at all:
   rotated vector, which is generally not the rotation of the original codeword. This is a research
   problem, not an implementation detail, and there is no known cheap encoding. Deferred.
 
-Both need a decision on error accounting before implementation: whether a relocated quantized key is
-allowed to carry more error than a key prefilled at that position, and if so how much, measured
-against the same < 0.05 nat divergence threshold Phase 5.5 already defines.
-
-Recommended order: (1) the planner-side guard so `--scr` is safe to leave enabled across
-config changes, (2) `int8` K re-rotation, (3) the E8 work only if (2) shows the approach pays off.
+Both would need a decision on error accounting before implementation: whether a relocated quantized
+key is allowed to carry more error than a key prefilled at that position, and if so how much,
+measured against the same < 0.05 nat divergence threshold Phase 5.5 already defines. *(Historical:
+the per-dtype analysis above was the case behind the re-rotation approach. The delta plane made it
+moot — relocation never rewrites the codes, so none of this work is owed.)*
 
 ### A note on how SCR is triggered, for anyone writing tests
 

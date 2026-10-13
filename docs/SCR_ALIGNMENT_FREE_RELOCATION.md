@@ -159,13 +159,65 @@ stop here; if short survivors dominate, mechanism 1 is the one to build.
 
 ## Verification ladder
 
+### The device copy
+
 1. Host: the ports in `tests/test_scr_e2e_shape.py` (detector, selector, tiling, copy segments, one
-   delta per page) — already in place, no hardware needed.
+   delta per page) — already in place, no hardware needed: `python3 -m pytest
+   tests/test_scr_e2e_shape.py` from the repo root.
 2. Host: `tests/targets/qwen3_6/test_prompt_edit.cpp` for the detector and selector, and
    `tests/test_paged_kv_delta_layout.cpp` for the split predicates.
-3. Device: extend `tests/ops/test_scr_relocation_integration.cpp` to relocate an off-grid source and
-   compare the destination pages against a freshly prefilled cache, bit for bit — that is the oracle
-   the copy must match, and it is also the test that catches an aliasing bug.
-4. Hardware: `tools/scr_e2e_check.py --scr-mode segmented --shape interleaved` per `--kv-dtype`
-   (`bf16`, `int8`, `rk4v4-e8`), with an intentionally misaligned edit, which the e2e plan-shape check
-   should now accept.
+3. Device: `tests/ops/test_scr_copied_relocation.cpp`, specified in full by
+   `docs/SCR_COPIED_RELOCATION_HANDOFF.md` — an off-grid source relocated by payload copy, held
+   bit-for-bit against the pages it was copied from and read back through the public attention entry
+   points, across `{bf16, rk4v4-e8} x {PageMajor, HeadMajor}`. It is a new pool-backed file, not an
+   extension of `test_scr_relocation_integration.cpp`: the copier is a `PagedKVAllocation` method
+   inside a real `PagedKVPool`, and the existing integration test is BF16-only with hand-built
+   planes. Until it exists the copied path has zero execution anywhere: the e2e fixture aligns by
+   construction, so `relocate_copied_pages` is never reached on hardware.
+
+### The interleaved fixture, segmented against tail
+
+The two-deletion fixture (`[P R1 S1 R2 S2] -> [P R1' S1 R2' S2]`) is implemented and host-tested; what
+remains is the hardware comparison that separates segmented relocation from tail.
+
+4. Host: `tests/test_scr_e2e_shape.py` (22 tests) already pins the interleaved fixture's shape
+   against ports of the real detector, both selectors, and the plan-shape and tiling checks the
+   `--scr-diag` plan is read back through. No hardware needed.
+5. Hardware, on the Windows box from the repo root, capturing raw output:
+
+   ```powershell
+   python tools\scr_e2e_check.py --exe build-ninja\apps\ninfer-serve.exe `
+     --base-args ".\models\qwen3_8_27b.ninfer --kv-dtype bf16 --max-context 32768" `
+     --scr-mode segmented --shape interleaved --scr-diag
+   ```
+
+   Pass criteria, all of them:
+
+   - the plan line reports **two spans and three ranges**: `span{...} span{...} ranges=3 [0,a)
+     [b,c) [d,prompt)` with the tiling exact;
+   - the savings line accounts exactly: `computed == prompt - relocated`, where
+     `relocated == |S1| + |S2| - 64`. The tail survivor loses exactly its final 64-token block to
+     the final-token rule (prompt logits need a real forward pass); the middle survivor, which ends
+     at a replacement that is itself prefilled, is unaffected;
+   - `RESULT: outputs are identical`, exit 0.
+6. The same fixture in tail mode: it must relocate **strictly less** — tail selects one contiguous
+   run, segmented relocates both survivors. Then step 5 again with `--scr-max-spans 1`: segmented
+   must collapse onto tail's choice, which proves the cap applies to the interleaved plan rather
+   than to a single run. And the flag control: `--scr-max-spans 0` must relocate nothing, so a
+   difference between two runs is relocation and not the flags.
+7. Repeat step 5 per quantized dtype (`int8`, then `rk4v4-e8`) — the relocation path is the same
+   code for every dtype the planner admits. **Trap:** the `[scr-diag]` post-prefill integrity line
+   is still BF16-only — it decodes the K plane as `uint16` BF16 words, so on a quantized cache it
+   reports `before=nan after=nan`, `non_finite` counts and `summary{0/3 intact}` even when the
+   relocation is correct. The outputs decide correctness; that line is diagnostic only and wants
+   either a dtype-aware decode or an explicit "not checked for this dtype".
+
+### Still owed: the misaligned edit end to end
+
+8. The alignment-free claim itself has no end-to-end run, and the e2e script cannot yet produce it:
+   `solve_alignment` (`tools/scr_e2e_check.py`) pads every region until the survivors land on the
+   grid — the interleaved shape runs five such searches — so an edit whose token delta is not a
+   multiple of 64 never reaches the server. Add a mode for the deliberately misaligned edit (and
+   teach `check_relocation_plan` to accept an off-grid `src` while still demanding aligned
+   `dst`/`tok` pages) before the copy is exercised through the served path. Until then, ladder
+   item 3's device test is the only execution the copied relocation will ever have.

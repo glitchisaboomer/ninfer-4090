@@ -1,10 +1,9 @@
 # Handoff: the copied-relocation device oracle — ladder item 3
 
 For a model picking this up cold. This is ladder item 3 of
-`docs/SCR_ALIGNMENT_FREE_RELOCATION.md`: *extend `tests/ops/test_scr_relocation_integration.cpp`
-to relocate an off-grid source and compare the destination pages against a freshly prefilled cache,
-bit for bit — that is the oracle the copy must match, and it is also the test that catches an
-aliasing bug.*
+`docs/SCR_ALIGNMENT_FREE_RELOCATION.md`: *relocate an off-grid source by payload copy and compare the
+destination pages against a freshly prefilled cache, bit for bit — that is the oracle the copy must
+match, and it is also the test that catches an aliasing bug.*
 
 **Nothing is broken.** The host arithmetic is green on every level, and the one hardware run that
 has happened passed. What is open is narrower and more serious than "broken": **the copied
@@ -125,9 +124,10 @@ Add one aligned-source span (`source_begin % 64 == 0`) to exercise the single-mo
 span long enough to cover three destination pages for good measure.
 
 Build the mapping and deltas with the **real** planner pair, not a hand-built array:
-`qwen3_6::detail::plan_copied_page_remap(current_pages, spans, base, prompt_tokens)` for the
-mapping and `ninfer::rope_delta_for_dest_page` per destination page for the deltas (that is
-exactly what `program_impl.h`'s `copying` branch does — mirror it). `prompt_edit.h` is CUDA-free
+`qwen3_6::detail::plan_copied_page_remap(current_pages, spans, prefix_reuse_tokens, prompt_tokens)`
+for the mapping and `ninfer::rope_delta_for_dest_page` per destination page for the deltas (that is
+exactly what `program_impl.h`'s `copying` branch does — mirror it; there the third argument is the
+local `base`, which *is* the prefix-reuse frontier). `prompt_edit.h` is CUDA-free
 and host-buildable by design, so including it from this test is sanctioned; driving one case
 through `diff_prompt_edit_shifted` on two token sequences is worth it, because it makes the test
 cover detector → selector → copier as one chain.
@@ -221,7 +221,7 @@ failing — keep the `cudaFree(nullptr)` guard at `main`'s top, as the sibling t
 
 - All seven assertion groups pass for `{bf16, rk4v4-e8} × {PageMajor, HeadMajor}`.
 - The negative control breaks the criterion on every variant that has one.
-- The full suite is green (84 tests), per the repository rule.
-- Only then is ladder item 4 meaningful — and note it needs a *misaligned* e2e shape the current
-  script cannot produce (`solve_alignment` exists to prevent exactly that). Until such a mode
-  exists, this device test is the only execution the copied relocation will ever have.
+- The full suite is green (85 tests, 84 plus this one), per the repository rule.
+- Only then is the ladder's misaligned-edit rung meaningful — and note it needs a *misaligned* e2e
+  shape the current script cannot produce (`solve_alignment` exists to prevent exactly that). Until
+  such a mode exists, this device test is the only execution the copied relocation will ever have.

@@ -377,7 +377,7 @@ type error to catch it:
 - `prepare_ragged_prefix` / `kv_cache_append_prefix`, which read previously written K;
 - any diagnostic that fingerprints the K plane — reusing the existing `[scr-diag]` page fingerprints is
   the right instinct, but they must be taken *after* the operations that consume the pages, which is
-  the lesson `SCR_PHASE_5_5_HANDOFF.md` §4 records.
+  the lesson `docs/maintainer/op-development.md` §6.4 records.
 
 **Audit status.** Every reader above was checked against the code rather than assumed:
 

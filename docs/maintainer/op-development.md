@@ -417,6 +417,29 @@ Different production routes use different criteria only when their arithmetic or
 profiles differ materially. Widening a criterion requires a numerical reason and requalification
 of its complete affected domain; one failing implementation is not sufficient justification.
 
+### 6.4 Failure modes qualification has paid for
+
+Each of these shipped once and cost more time to find than to prevent. They are rules because the
+failure they describe does not announce itself.
+
+- **A warp collective must be reached by every named lane.** An early `return` above a
+  `__shfl_*_sync` with a full mask deadlocks: the shuffle waits on threads that have already
+  exited. Guard only the *use* of the partner value, never the shuffle itself; `argmax.cuh` is the
+  reference shape. A log-sum-exp merge is not idempotent — `merge(x, x)` doubles the sum — so
+  unlike a maximum reduction it needs its use guarded as well.
+- **A diagnostic must be derived from the variable the consumer uses.** A trace that prints a
+  plausible intermediate can read perfectly healthy while the kernel acts on a different one. When
+  a diagnostic looks clean and the system is broken, suspect the diagnostic first.
+- **Arithmetic simulation validates arithmetic, not concurrency.** A host-side simulation that
+  executes every branch for every lane agrees with the oracle both before and after a divergence
+  fix. Divergence requires a device or `compute-sanitizer`.
+- **Check state at the moment it is consumed, not at the moment it is produced.** A diagnostic
+  bracketing stage N cannot see damage done at stage N+1; fingerprint after the consumer runs.
+- **A self-consistent test cannot detect a convention disagreement.** A test that seeds inputs
+  through the same addressing or encoding helper the implementation uses can only verify a result
+  *given* that convention. Route qualification bytes and reads through an independent path, and when
+  a test and its Op share a helper, ask who could disagree.
+
 ## 7. Performance evidence
 
 An Op microbenchmark measures the public semantic operation at an exact shape, format, layout,
