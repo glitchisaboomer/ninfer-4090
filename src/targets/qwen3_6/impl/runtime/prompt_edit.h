@@ -22,6 +22,8 @@
 #include <span>
 #include <vector>
 
+namespace ninfer::targets::qwen3_6::detail {
+
 // Relocation diagnostics are off unless NINFER_SCR_DIAG is set, so a refusal costs nothing in
 // production. Defined here rather than in the runtime because the planner needs it too: a relocation
 // that is declined is exactly as interesting as one that is applied, and until this existed only the
@@ -49,8 +51,6 @@ inline bool scr_source_shift_enabled() {
     }();
     return enabled;
 }
-
-namespace ninfer::targets::qwen3_6::detail {
 
 // Diff granularity. Matches kPagedKVPageSize so a surviving span maps onto whole KV
 // pages and can be described by page-aligned relocation metadata.
