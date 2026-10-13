@@ -48,11 +48,14 @@ using ninfer::RelocatedPageMove;
 using ninfer::RelocatedPageSubstitution;
 using ninfer::RopeDeltaPageRange;
 using ninfer::plan_rope_delta_page_ranges;
+using ninfer::encode_rope_delta_page_ranges;
 using ninfer::pack_rope_delta_page_range;
 using ninfer::rope_delta_page_range_begin;
 using ninfer::rope_delta_page_range_end;
 using ninfer::rope_delta_page_range_is_empty;
+using ninfer::rope_delta_page_range_is_partial;
 using ninfer::kRopeDeltaRangeEmpty;
+using ninfer::kRopeDeltaRangeMaxOffset;
 
 int g_failures = 0;
 
@@ -489,6 +492,68 @@ void test_rope_delta_page_ranges() {
         "a full page uses a valid packed interval");
     check(rope_delta_page_range_is_empty(pack_rope_delta_page_range(10, 10)),
         "an empty interval is rejected by the packer");
+
+    // Every representable interval, not a sample. begin and end share one uint32, so the encoding
+    // is only correct if the two half-widths never overlap: any pair that decodes to something
+    // other than what it encoded is a bug the sampled cases above can miss, and the ones that
+    // miss it are the boundary values at the ends of a mixed page.
+    {
+        std::size_t mismatches   = 0;
+        std::size_t rejected     = 0;
+        for (std::uint32_t begin = 0; begin < kRopeDeltaRangeMaxOffset; ++begin) {
+            for (std::uint32_t end = begin + 1; end <= kRopeDeltaRangeMaxOffset; ++end) {
+                const std::uint32_t packed = pack_rope_delta_page_range(begin, end);
+                if (rope_delta_page_range_is_empty(packed)) { ++rejected; continue; }
+                if (rope_delta_page_range_begin(packed) != begin ||
+                    rope_delta_page_range_end(packed) != end) {
+                    if (mismatches < 4) {
+                        std::printf("    FAIL: (%u,%u) decodes as (%u,%u)\n", begin, end,
+                                    rope_delta_page_range_begin(packed),
+                                    rope_delta_page_range_end(packed));
+                    }
+                    ++mismatches;
+                }
+            }
+        }
+        check(rejected == 0,
+              "every valid interval encodes, and none is silently turned into the sentinel");
+        check(mismatches == 0,
+              "every representable offset pair round-trips exactly");
+        // A pair the packer must refuse, so the caller learns it rather than reading a wrong
+        // interval back out. `end <= begin` is empty or inverted; `end > begin` below the page size is
+        // valid and encoded.
+        for (std::uint32_t begin = 0; begin <= kRopeDeltaRangeMaxOffset; ++begin) {
+            check(rope_delta_page_range_is_empty(pack_rope_delta_page_range(begin, begin)),
+                  "a zero-width interval decodes as empty");
+            if (begin > 0) {
+                check(rope_delta_page_range_is_empty(pack_rope_delta_page_range(begin, begin - 1)),
+                      "an inverted interval decodes as empty");
+            }
+        }
+        check(rope_delta_page_range_is_empty(
+                  pack_rope_delta_page_range(0, kRopeDeltaRangeMaxOffset + 1)),
+              "an interval past the end of a page decodes as empty");
+    }
+
+    // The boundary page shapes the kernels actually branch on. A page whose interval is the whole
+    // page takes the whole-page delta route; anything narrower must be recognized as partial, or
+    // the boundary score path never runs for it.
+    {
+        check(rope_delta_page_range_is_partial(pack_rope_delta_page_range(0, 1)),
+              "a one-token interval at the start of a page is partial");
+        check(rope_delta_page_range_is_partial(pack_rope_delta_page_range(63, 64)),
+              "a one-token interval at the end of a page is partial");
+        check(rope_delta_page_range_is_partial(pack_rope_delta_page_range(7, 8)),
+              "a single interior token is partial");
+        check(!rope_delta_page_range_is_partial(pack_rope_delta_page_range(0, 64)),
+              "a whole-page interval is not partial");
+        check(!rope_delta_page_range_is_partial(kRopeDeltaRangeEmpty),
+              "the empty sentinel is not partial");
+        check(rope_delta_page_range_begin(kRopeDeltaRangeEmpty) == 63 &&
+                  rope_delta_page_range_end(kRopeDeltaRangeEmpty) == 127,
+              "the sentinel decodes as a nonsensical interval, which is why callers must test
+               emptiness first");
+    }
     const std::vector<RelocatedCopySpan> spans{{465, 321, 100}};
     const std::vector<RopeDeltaPageRange> ranges = plan_rope_delta_page_ranges(spans, 16);
     check(ranges.size() == 16, "the range table parallels logical pages");
@@ -514,6 +579,57 @@ void test_rope_delta_page_ranges() {
         (void)plan_rope_delta_page_ranges(overlapping, 16);
         check(false, "two relocation spans sharing a page are rejected");
     } catch (const std::invalid_argument&) {
+    }
+
+    // The two planes are published together and neither alone means anything, so they have to
+    // name the same move. The runtime derives the scalar delta plane from this same table and
+    // ignores a page whose interval is empty. A bug that split the two derivations would leave a
+    // page with a range but a stale delta -- which no runtime check catches, because the kernel
+    // reads the range to pick the score path and the delta to pick the angle, and only disagrees
+    // with itself on a mixed page, producing plausible wrong attention.
+    {
+        // Destination pages 5, 10, 11, 12: 5/10/11 wholly relocated, 12 crossed by the tail of
+        // the second span. Chosen so the two planes can be compared on whole and partial pages
+        // alike, and so no two spans share a destination page, which the planner refuses.
+        const std::vector<RelocatedCopySpan> spans{{448, 320, 64}, {896, 640, 130}};
+        const std::size_t pages = 16;
+        const std::vector<RopeDeltaPageRange> ranges = plan_rope_delta_page_ranges(spans, pages);
+        const std::vector<std::uint32_t> packed =
+            encode_rope_delta_page_ranges(spans, pages);
+
+        std::size_t relocated_pages = 0;
+        for (std::size_t page = 0; page < pages; ++page) {
+            const RopeDeltaPageRange& range = ranges[page];
+            const bool has_interval = range.begin != range.end;
+
+            // The scalar plane, exactly as ProgramImplCore builds it.
+            const std::int32_t scalar_delta = has_interval ? range.delta : 0;
+
+            const std::uint32_t this_packed = packed[page];
+
+            check(rope_delta_page_range_is_empty(this_packed) == !has_interval,
+                  "the packed plane is empty exactly where the table has no interval");
+            check(has_interval || scalar_delta == 0,
+                  "a page with no interval keeps the ordinary-page delta");
+            if (!has_interval) { continue; }
+
+            ++relocated_pages;
+            check(rope_delta_page_range_begin(this_packed) == range.begin &&
+                      rope_delta_page_range_end(this_packed) == range.end,
+                  "the packed interval decodes back to the table's interval");
+            check(scalar_delta == range.delta,
+                  "the scalar delta equals the range table's shift wherever a range exists");
+            check(rope_delta_page_range_is_partial(this_packed) ==
+                      (range.begin != 0 || range.end != kPagedKVPageSize),
+                  "the partial predicate matches the table's interval shape");
+        }
+        check(relocated_pages == 4,
+              "the scenario relocated four pages: three whole and one crossed");
+        check(!rope_delta_page_range_is_partial(packed[5]) &&
+                  !rope_delta_page_range_is_partial(packed[10]) &&
+                  !rope_delta_page_range_is_partial(packed[11]) &&
+                  rope_delta_page_range_is_partial(packed[12]),
+              "only the page the span's tail crosses reads as partial");
     }
 }
 

@@ -73,6 +73,11 @@ struct RopeDeltaPageRange {
 
 inline constexpr std::uint32_t kRopeDeltaRangeEmpty = 0xffffffffu;
 
+// The largest token offset a packed interval can name. `end` is inclusive of it because a whole
+// page's relocated interval ends at its last token plus one, so this is `kPagedKVPageSize`.
+inline constexpr std::uint32_t kRopeDeltaRangeMaxOffset =
+    static_cast<std::uint32_t>(kPagedKVPageSize);
+
 [[nodiscard]] constexpr std::uint32_t pack_rope_delta_page_range(
     std::uint32_t begin, std::uint32_t end) noexcept {
     if (begin >= end || end > static_cast<std::uint32_t>(kPagedKVPageSize)) {
