@@ -25,6 +25,10 @@
 // 1408-token (22-page) prompt whose first 576 tokens are prefix reuse.
 //
 // The assertion groups, in order:
+//   0. the write path this harness itself depends on: a page written at two positions
+//      comes back bit-identical, and a full chunked seeding of the fixture reads back
+//      with no empty page and, on the exact plane, no deviation -- so a disagreement
+//      between two caches is a property of one of them and not of the writes;
 //   1. bytes: every moved range bit-identical to its source, per plane (codes
 //      and both scale planes), per head, with no tolerance at all;
 //   2. nothing else moved: every page equals its pre-copy image with exactly
@@ -62,6 +66,7 @@
 #include "core/paged_kv_cache.h"
 #include "targets/qwen3_6/impl/runtime/prompt_edit.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -1070,13 +1075,162 @@ void append_reedited_pages(const PoolCell& cell, const std::vector<__nv_bfloat16
     }
 }
 
-// 5: operational equivalence. Attention over the copied cache through the
-// public entry points, judged by the anchored FP64 delta oracle -- the oracle
-// that rotates every decoded key back by its page's published shift, so it
-// carries the plane's own encode error exactly. The directly prefilled cache is
-// the anchor that keeps the harness itself honest; the zeroed delta plane is
-// the control, and the design is only discriminating if the control breaks the
-// criterion the correct run is judged by.
+// Group 0: the precondition every comparison here rests on. Every cache in this test is written by the
+// production writer, so before a disagreement between two of them is read as a property of the
+// relocation, the harness has to establish that a write is readable at all.
+//
+// The check is deliberately codec-free: the same activation appended at two different positions has to
+// come back as two bit-identical pages, whatever the plane's encoding does to the values. That holds
+// for every variant without the harness owning a model of the codec, and it fails loudly on the one
+// thing a missing page cannot be distinguished from inside the equivalence -- a page that holds
+// nothing, which reads as a payload that does not match rather than as a write that never landed.
+//
+// What it does not cover is named rather than implied: two pages agree on *what* was written, not on
+// the writer having written everything the run told it to, so an activation whose own slice is empty
+// would pass. The seeded activations are checked against the assembled prompt by the fixture's own
+// prefix assertion, which is why this is a precondition and not a substitute for the equivalence.
+[[nodiscard]] bool page_is_empty(const PageImage& page) {
+    return std::all_of(page.begin(), page.end(), [](std::uint8_t byte) { return byte == 0; });
+}
+
+// A compact list of the pages a message names, so a whole-cell failure does not print 22 lines for
+// one defect.
+[[nodiscard]] std::string page_list(const std::vector<std::int32_t>& pages) {
+    std::string out;
+    const std::size_t shown = std::min<std::size_t>(pages.size(), 8);
+    for (std::size_t i = 0; i < shown; ++i) {
+        out += (i == 0 ? "" : " ") + std::to_string(pages[i]);
+    }
+    if (pages.size() > shown) { out += " (+ " + std::to_string(pages.size() - shown) + " more)"; }
+    return out;
+}
+
+void check_writer_round_trip(const Variant& variant, const std::vector<__nv_bfloat16>& k,
+                             const std::vector<__nv_bfloat16>& v, const FreqTable& freq,
+                             DeviceContext& ctx, const std::string& label) {
+    const std::size_t page_elems = static_cast<std::size_t>(kPageSize) * kHeadDim * kKvHeads;
+    // Part one, codec-free: the same page written at two positions has to come back as two
+    // bit-identical pages, whatever the plane's encoding does to the values. No model of the codec is
+    // needed for that, and it isolates the writer's position handling on a fresh cell with one
+    // allocation and no relocation in it.
+    if (k.size() >= page_elems * 2 && v.size() >= page_elems * 2) {
+        PoolCell pair;
+        build_cell(pair, variant, PagedKVPlaneOrder::PageMajor, kPoolPages, ctx.stream);
+        const std::vector<__nv_bfloat16> first_k(
+            k.begin(), k.begin() + static_cast<std::ptrdiff_t>(page_elems));
+        const std::vector<__nv_bfloat16> first_v(
+            v.begin(), v.begin() + static_cast<std::ptrdiff_t>(page_elems));
+        append_chunk(pair, first_k, first_v, 0, kPageSize, freq, ctx.stream);
+        append_chunk(pair, first_k, first_v, kPageSize, kPageSize, freq, ctx.stream);
+        const PlaneSnapshot pages = snapshot_pages(*pair.pool, ctx.stream);
+        for (std::size_t plane = 0; plane < pair.pool->plane_count(); ++plane) {
+            const PageImage& at_zero = pages[plane][0];
+            const PageImage& at_one  = pages[plane][1];
+            if (page_is_empty(at_zero) || page_is_empty(at_one)) {
+                fail(label + ": plane " + std::to_string(plane) + " page " +
+                     (page_is_empty(at_zero) ? "0" : "1") +
+                     " reads as all zeros after the production writer wrote it");
+                continue;
+            }
+            if (at_zero != at_one) {
+                std::size_t first_diff = 0;
+                while (first_diff < at_zero.size() && at_zero[first_diff] == at_one[first_diff]) {
+                    ++first_diff;
+                }
+                fail(label + ": plane " + std::to_string(plane) +
+                     " holds the same activation at position 0 and position " +
+                     std::to_string(kPageSize) + " but the two pages differ from byte " +
+                     std::to_string(first_diff) +
+                     ", so the writer's position handling is not the one this harness assumes");
+            }
+        }
+        pair.alloc.release();
+    }
+
+    // Part two, the seeding shape the other checks consume: a whole run written in chunks the way
+    // prefill writes it, read straight back. A page of the seeded range that is all zeros was never
+    // written; on the exact plane a page that differs from the activation is a write that landed
+    // somewhere else or not at all. Both are properties of this harness on this machine and are
+    // reported as such, because inside the equivalence below a missing page looks exactly like a
+    // payload that does not match the delta it is paired with.
+    PoolCell seeded;
+    build_cell(seeded, variant, PagedKVPlaneOrder::PageMajor, kPoolPages, ctx.stream);
+    append_run(seeded, k, v, 0, kPromptTokens, freq, ctx.stream);
+    const PlaneSnapshot planted = snapshot_pages(*seeded.pool, ctx.stream);
+    // Only the plane whose writer is exact can be held against the activation itself, so that reading
+    // is built once and skipped on a quantized variant rather than fudged.
+    const bool exact_plane = variant.dtype == DType::BF16;
+    std::optional<PoolCache> exact_adapter;
+    if (exact_plane) { exact_adapter.emplace(variant, seeded, ctx.stream); }
+    const PoolCache::HostImage exact_image =
+        exact_plane ? exact_adapter->image() : PoolCache::HostImage{};
+    std::vector<std::int32_t> empty_pages;
+    std::vector<std::int32_t> lossy_pages;
+    double worst_loss = 0.0;
+    for (std::int32_t page = 0; page < kPromptPages; ++page) {
+        const std::int32_t id = seeded.alloc.page_ids()[static_cast<std::size_t>(page)];
+        for (std::size_t plane = 0; plane < seeded.pool->plane_count(); ++plane) {
+            if (page_is_empty(planted[plane][static_cast<std::size_t>(id)])) {
+                empty_pages.push_back(page);
+                break;
+            }
+        }
+        if (!exact_plane) { continue; }
+        double worst = 0.0;
+        for (std::int32_t x = page * kPageSize; x < (page + 1) * kPageSize; ++x) {
+            for (std::int32_t head = 0; head < kKvHeads; ++head) {
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    const double wrote = static_cast<double>(
+                        __bfloat162float(k[act_index(head, x, kKvHeads, d)]));
+                    worst = std::max(
+                        worst, std::fabs(exact_adapter->k_logical(exact_image, x, head, d) - wrote));
+                }
+            }
+        }
+        if (worst != 0.0) {
+            lossy_pages.push_back(page);
+            worst_loss = std::max(worst_loss, worst);
+        }
+    }
+    if (!empty_pages.empty()) {
+        fail(label + ": " + std::to_string(empty_pages.size()) + " of the " +
+             std::to_string(kPromptPages) + " pages this harness seeded read as all zeros on every "
+             "plane (pages " + page_list(empty_pages) +
+             "), so the production writer did not land there and every comparison between two caches "
+             "in this file measures the write path before it measures the relocation");
+    }
+    if (!lossy_pages.empty()) {
+        fail(label + ": a direct prefill of this fixture does not read back what it wrote on " +
+             std::to_string(lossy_pages.size()) + " pages (" + page_list(lossy_pages) +
+             ", worst " + std::to_string(worst_loss) +
+             "), where the bf16 plane stores the activation verbatim and the read has to be exact");
+    }
+    if (empty_pages.empty() && lossy_pages.empty()) {
+        note(label + ": the writer round-trips -- the same activation at two positions is "
+                      "bit-identical on every plane, and a " + std::to_string(kPromptTokens) +
+                      "-token chunked seeding reads back with no empty page and no deviation");
+    }
+    seeded.alloc.release();
+}
+
+// What a stored-key disagreement means depends on the plane, so the limit does too.
+//
+// On the exact plane (bf16 in, bf16 stored) both caches hold bf16 rows, so two of them that were
+// written from the same activation at the same position are identical and anything past a bf16
+// rounding is a defect -- but the plane's own rounding has to be tolerated on the pages a delta moved,
+// which is the 3.0e-2 the equivalence below has always used.
+//
+// On a quantized plane the two sides are two *independent* quantizations: the codes are 4-bit
+// magnitudes against a per-64-group half scale, so a step is (max|row|/7) ~ 0.7 on this fixture and
+// two encodings of nearby values differ by a step before any relocation is involved. That is the floor
+// this comparison can reach, and it is not zero -- asserting a bf16-sized tolerance there asserts
+// something the codec cannot deliver, which fails a correct relocation and proves nothing about the
+// copier. The measured separation on rk4v4-e8 is 6.2 to 8.9 on the pages the published delta
+// describes (a payload or shift disagreement) against 1.0 to 1.16 after correction (the codec's own
+// step), so a limit of 2.0 sits between them with 72% of margin over the observed floor.
+constexpr double kStoredParityExact     = 3.0e-2;
+constexpr double kStoredParityQuantized = 2.0;
+
 // The storage side of the equivalence, measured against two references at once.
 //
 // Parity with the directly prefilled cache is the design's own anchor and is kept: group 1 shows the
@@ -1191,6 +1345,38 @@ void check_stored_keys(const PoolCell& copied_cell, const PoolCache& copied_cach
         for (const std::int32_t id : cell.alloc.page_ids()) { out += std::to_string(id) + " "; }
         return out;
     };
+    const auto join_i32 = [](const std::vector<std::int32_t>& values) {
+        std::string out;
+        for (const std::int32_t value : values) { out += std::to_string(value) + " "; }
+        return out;
+    };
+    // Every column above is indexed through the host-side id list, while the kernels resolve positions
+    // through the block table on the device. The two agreeing is what makes those columns a statement
+    // about the cache the kernels wrote and read; if the table were something else, each column would
+    // be a comparison between two different caches than the attention ran over, and no amount of
+    // per-page numbers would show it. Group 3 asserts this for the cells it owns -- these are not those
+    // cells, so it is asserted here too rather than assumed.
+    const std::vector<std::int32_t> copied_table =
+        read_i32_row(copied_cell.alloc.block_table(), stream);
+    const std::vector<std::int32_t> reference_table =
+        read_i32_row(reference_cell.alloc.block_table(), stream);
+    const struct {
+        const char* name;
+        const PoolCell* cell;
+        const std::vector<std::int32_t>* table;
+    } published[2] = {{"copied", &copied_cell, &copied_table},
+                      {"directly prefilled", &reference_cell, &reference_table}};
+    for (const auto& side : published) {
+        const std::span<const std::int32_t> ids = side.cell->alloc.page_ids();
+        if (side.table->size() != ids.size() ||
+            !std::equal(side.table->begin(), side.table->end(), ids.begin())) {
+            fail(label + ": the " + side.name +
+                 " cache's published block table is not the mapping this harness reads through (table " +
+                 join_i32(*side.table) + " vs ids " + join_i32(std::vector<std::int32_t>(ids.begin(),
+                                                                                          ids.end())) +
+                 "), so every column above describes different pages than the kernels wrote and read");
+        }
+    }
     std::printf("\n  %s: stored keys per logical page (parity: as stored / corrected by the delta;"
                 " copied against the written activation: as stored / corrected, worst dim; anchor"
                 " against the written activation):",
@@ -1215,8 +1401,10 @@ void check_stored_keys(const PoolCell& copied_cell, const PoolCache& copied_cach
                     raw_worst[index], corrected_worst[index], copied_host_raw_worst[index],
                     copied_host_worst[index], copied_host_dim[index], anchor_host_worst[index]);
     }
-    std::printf("\n      copied page ids:    %s\n      reference page ids: %s\n",
-                ids_of(copied_cell).c_str(), ids_of(reference_cell).c_str());
+    std::printf("\n      copied page ids:    %s\n      reference page ids: %s\n      copied table row:   "
+                "%s\n      reference table row: %s\n",
+                ids_of(copied_cell).c_str(), ids_of(reference_cell).c_str(),
+                join_i32(copied_table).c_str(), join_i32(reference_table).c_str());
 
     // The ground truth under both images: the K plane's own bytes on the physical page each logical page
     // resolves to, read straight out of the two pools. A decoded comparison cannot separate a wrong page
@@ -1281,11 +1469,13 @@ void check_stored_keys(const PoolCell& copied_cell, const PoolCache& copied_cach
                  "cache rather than the relocation");
             continue;
         }
-        const bool reconstructs = corrected_worst[index] > 3.0e-2;
-        const bool already_matches = raw_worst[index] < 3.0e-2;
+        const double parity_limit = exact_plane ? kStoredParityExact : kStoredParityQuantized;
+        const bool reconstructs    = corrected_worst[index] > parity_limit;
+        const bool already_matches = raw_worst[index] < parity_limit;
         if (already_matches && reconstructs) {
-            fail(label + where + "the copied cache's stored keys already equal the directly prefilled "
-                 "cache's (as stored " + std::to_string(raw_worst[index]) +
+            fail(label + where + "the copied cache's stored keys already match the directly prefilled "
+                 "cache's within " + std::to_string(parity_limit) + " (as stored " +
+                 std::to_string(raw_worst[index]) +
                  ") and the published delta is what breaks them (corrected " +
                  std::to_string(corrected_worst[index]) +
                  "), so that page's shift does not describe the row it is paired with");
@@ -1293,7 +1483,8 @@ void check_stored_keys(const PoolCell& copied_cell, const PoolCache& copied_cach
             fail(label + where + "the copied cache's stored keys do not reconstruct the directly "
                  "prefilled cache's even with the published delta applied (as stored " +
                  std::to_string(raw_worst[index]) + ", corrected " +
-                 std::to_string(corrected_worst[index]) +
+                 std::to_string(corrected_worst[index]) + ", limit " +
+                 std::to_string(parity_limit) +
                  "), so the payload and the shift it is paired with disagree");
         }
         if (!exact_plane) { continue; }
@@ -1315,6 +1506,13 @@ void check_stored_keys(const PoolCell& copied_cell, const PoolCache& copied_cach
     }
 }
 
+// 5: operational equivalence. Attention over the copied cache through the
+// public entry points, judged by the anchored FP64 delta oracle -- the oracle
+// that rotates every decoded key back by its page's published shift, so it
+// carries the plane's own encode error exactly. The directly prefilled cache is
+// the anchor that keeps the harness itself honest; the zeroed delta plane is
+// the control, and the design is only discriminating if the control breaks the
+// criterion the correct run is judged by.
 void check_attention(const Variant& variant, const PromptPair& prompts,
                      const std::vector<__nv_bfloat16>& prev_k,
                      const std::vector<__nv_bfloat16>& prev_v,
@@ -1761,6 +1959,8 @@ int main() {
     std::printf("  (prefix reuse %u of %d tokens)\n", prompts.prefix_reuse, kPromptTokens);
 
     for (const Variant& variant : kVariants) {
+        check_writer_round_trip(variant, curr_k, curr_v, freq, ctx,
+                                std::string(variant.name) + " writer round trip");
         for (const PagedKVPlaneOrder order : kOrders) {
             run_cell(variant, order, kPoolPages, false, prompts, prev_k, prev_v, freq, ctx);
         }
