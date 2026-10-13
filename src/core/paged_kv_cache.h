@@ -146,6 +146,13 @@ public:
     // must lie inside `block_tables_`. Throws if it does not.
     [[nodiscard]] Tensor rope_delta_row_for_block_table(Tensor block_table) const;
 
+  private:
+    // Which row of `block_tables_` a single-row slice points into, or a throw if it does not name
+    // one. Shared by both `*_for_block_table` lookups, which differ only in the plane they read
+    // afterwards: both must agree on the pointer arithmetic, and a divergence there is silent -
+    // the wrong row still holds well-formed data.
+    [[nodiscard]] std::int32_t block_table_row_index(Tensor block_table) const;
+
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;

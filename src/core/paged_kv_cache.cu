@@ -292,32 +292,19 @@ Tensor PagedKVPool::rope_delta_range_row(std::int32_t row) const {
         {static_cast<std::int32_t>(logical_page_capacity())});
 }
 
-Tensor PagedKVPool::rope_delta_range_row_for_block_table(Tensor block_table) const {
-    if (block_table.data == nullptr) { return Tensor{}; }
-    const auto* base = static_cast<const unsigned char*>(block_tables_.data);
-    const auto* ptr  = static_cast<const unsigned char*>(block_table.data);
-    const auto span = static_cast<std::size_t>(block_tables_.numel()) * sizeof(std::int32_t);
-    if (ptr < base || ptr >= base + span) {
-        throw std::out_of_range("block-table slice does not belong to this pool");
-    }
-    const std::size_t stride =
-        static_cast<std::size_t>(logical_page_capacity()) * sizeof(std::int32_t);
-    const std::size_t offset = static_cast<std::size_t>(ptr - base);
-    if (stride == 0 || offset % stride != 0) {
-        throw std::invalid_argument("block-table slice is not row-aligned");
-    }
-    return rope_delta_range_row(static_cast<std::int32_t>(offset / stride));
-}
-
 // Tensor::slice advances the view's `data` pointer by `start * nb[dim]` and Tensor
 // carries no separate offset field, so a block-table row slice's `data` already points
 // at its first element inside `block_tables_`. The row index therefore comes from the
 // raw pointer difference alone, with no offset compensation.
-Tensor PagedKVPool::rope_delta_row_for_block_table(Tensor block_table) const {
-    if (block_table.data == nullptr) { return Tensor{}; }
+std::int32_t PagedKVPool::block_table_row_index(Tensor block_table) const {
+    if (block_table.data == nullptr) {
+        // Both callers treat a null slice as "no bound row" rather than as an error, so this
+        // reports the same thing out of band.
+        return -1;
+    }
     const auto* base = static_cast<const unsigned char*>(block_tables_.data);
     const auto* ptr  = static_cast<const unsigned char*>(block_table.data);
-    const auto  span = static_cast<std::size_t>(block_tables_.numel()) * sizeof(std::int32_t);
+    const auto span  = static_cast<std::size_t>(block_tables_.numel()) * sizeof(std::int32_t);
     if (ptr < base || ptr >= base + span) {
         throw std::out_of_range("block-table slice does not belong to this pool");
     }
@@ -327,8 +314,17 @@ Tensor PagedKVPool::rope_delta_row_for_block_table(Tensor block_table) const {
     if (stride_bytes == 0 || offset_bytes % stride_bytes != 0) {
         throw std::invalid_argument("block-table slice is not row-aligned");
     }
-    const std::int32_t row = static_cast<std::int32_t>(offset_bytes / stride_bytes);
-    return rope_delta_row(row);
+    return static_cast<std::int32_t>(offset_bytes / stride_bytes);
+}
+
+Tensor PagedKVPool::rope_delta_range_row_for_block_table(Tensor block_table) const {
+    const std::int32_t row = block_table_row_index(block_table);
+    return row < 0 ? Tensor{} : rope_delta_range_row(row);
+}
+
+Tensor PagedKVPool::rope_delta_row_for_block_table(Tensor block_table) const {
+    const std::int32_t row = block_table_row_index(block_table);
+    return row < 0 ? Tensor{} : rope_delta_row(row);
 }
 
 std::uint32_t PagedKVPool::entitled_pages() const noexcept { return entitled_pages_; }
