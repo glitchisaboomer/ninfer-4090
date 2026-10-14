@@ -163,10 +163,6 @@ ninfer_add_test(ninfer_qwen3_6_prefill_trace_hash_test
 ninfer_add_test(ninfer_qwen3_6_scr_quality_test
   SOURCES targets/qwen3_6/test_scr_quality.cpp
   LIBRARIES ninfer_engine)
-ninfer_add_test(ninfer_qwen3_6_gqa_kv_rerotate_test
-  SOURCES targets/qwen3_6/test_gqa_kv_rerotate.cpp
-  LIBRARIES ninfer_engine ninfer_core)
-set_tests_properties(ninfer_qwen3_6_gqa_kv_rerotate_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_paged_kv_reassign_pages_test
   SOURCES test_paged_kv_reassign_pages.cpp
   LIBRARIES ninfer_core)
@@ -284,11 +280,38 @@ endforeach()
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
-# Pairs with the gqa_kv_rerotate component test: same Op, but every cache byte is written by
-# gqa_kv_append and every read goes through the attention kernels, so an addressing convention the
-# component test cannot disagree with is still exercised end to end.
+# Pairs with the per-page delta oracle test: same scenario, but every cache byte is written by
+# gqa_kv_append and every read goes through the public attention entry points, so an addressing
+# convention the component test cannot disagree with is still exercised end to end.
 ninfer_add_op_test(ninfer_scr_relocation_integration_test
   SOURCES ops/test_scr_relocation_integration.cpp
+  LIBRARIES ninfer_ops)
+# The copied-relocation oracle: an off-grid source relocated by payload copy,
+# held bit-for-bit against the pages it was copied from and read back through
+# the public attention entry points. Pool-backed, because the copier is a
+# PagedKVAllocation method inside a real PagedKVPool; the planner chain it drives
+# (diff_prompt_edit_shifted, plan_shifted_relocations, plan_copied_page_remap)
+# lives in ninfer_engine, hence the second library. Device-only (a pool and a
+# CUDA stream), gated off by ninfer_add_op_test's SKIP_RETURN_CODE.
+ninfer_add_op_test(ninfer_scr_copied_relocation_test
+  SOURCES ops/test_scr_copied_relocation.cpp
+  LIBRARIES ninfer_ops ninfer_engine)
+
+# Oracle test for the per-page RoPE delta machinery. It calls detail:: launchers directly with a real
+# delta plane, so it validates the Phase 4a Q counter-rotation path independently of the physical K
+# re-rotation Op, and its own negative control proves the harness is not blind.
+ninfer_add_op_test(ninfer_gqa_kv_page_delta_test
+  SOURCES ops/test_gqa_kv_page_delta.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gqa_kv_page_delta_i8_test
+  SOURCES ops/test_gqa_kv_page_delta_i8.cpp
+  LIBRARIES ninfer_ops)
+# Rotated int8 variants (rk8v4, rk4v4-e8): the same delta scenario with packed int4 planes and a host
+# port of the 64-point Hadamard, plus the I8 prefill route the plain-int8 oracle test defers. Its own
+# self-checks (DC gain, involution, orthogonality, nibble order) and its negative control are what
+# prove the host rotation and the packed decode are not no-ops.
+ninfer_add_op_test(ninfer_gqa_kv_page_delta_rotated_test
+  SOURCES ops/test_gqa_kv_page_delta_rotated.cpp
   LIBRARIES ninfer_ops)
 # Log-probability of the chosen token, against an FP64 log-softmax oracle. Phase 5.5 of
 # docs/SCR_ROADMAP.md scores the two reuse paths in nats, so this measures the quantity that score

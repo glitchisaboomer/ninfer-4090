@@ -8,6 +8,7 @@
 #include <iostream>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -152,6 +153,180 @@ int expect_rope_delta_row_clear(ninfer::PagedKVPool& pool, std::int32_t row, cud
                   << " entries wrong after clearing row " << row << " (row is " << row_bytes
                   << " bytes)\n";
     }
+    return failures == 0 ? 0 : 1;
+}
+
+// A row is recycled between sequences. The delta plane must not carry a previous sequence's
+// relocations into the next one's attention: the failure mode is a query counter-rotated by a
+// stale shift for a page that was never moved, which no type error catches and no test that
+// ignores the recycling sequence will see.
+//
+// This test exercises the sequence: write deltas into row 0 -> release the row -> bind a fresh
+// allocation to row 0 -> assert row 0's deltas are all zero *before* anything writes them.
+int expect_rope_delta_recycling(ninfer::PagedKVPool& pool, cudaStream_t stream, const char* label) {
+    const ninfer::Tensor& deltas = pool.rope_deltas();
+    const std::int32_t page_count = deltas.ne[0];
+    if (page_count <= 0 || pool.table_row_count() < 1) {
+        std::cerr << label << " pool shape is inconsistent for recycling test\n";
+        return 1;
+    }
+
+    // 1. Reserve the whole row's worth of entitlement and materialize that many distinct pages.
+    //    The pool this test runs against has page_group_count == logical_page_capacity == 10
+    //    (see `plan_paged_cache(10, 10, 2, ...)` in main), and no earlier test in main holds
+    //    entitlement on paged_pool at the point this function runs, so reserving `page_count`
+    //    pages succeeds. The distinct-pages requirement is not optional: `reassign_pages` rejects
+    //    a mapping that names the same owned physical page more than once.
+    const std::uint32_t entitlement = static_cast<std::uint32_t>(page_count);
+    auto first = pool.reserve(entitlement);
+    first.materialize_pages(entitlement, stream);
+    first.bind_row(0, stream);
+
+    // 2. Write nonzero deltas into every logical page of row 0, one distinct physical page each.
+    //    `first.page_ids()` is now exactly `page_count` distinct pages, so it can be used as the
+    //    mapping directly — no repetition, no padding.
+    std::vector<std::int32_t> mapping(first.page_ids().begin(), first.page_ids().end());
+    if (static_cast<std::int32_t>(mapping.size()) != page_count) {
+        std::cerr << label << " allocation materialized " << mapping.size()
+                  << " pages, expected " << page_count << '\n';
+        return 1;
+    }
+    std::vector<std::int32_t> deltas_in(static_cast<std::size_t>(page_count), 17);
+    first.reassign_pages(mapping, deltas_in, stream);
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " reassign sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    // 3. Read back and confirm the row is all-17. If this fails, the test cannot say anything
+    //    about recycling.
+    auto read_row = [&](std::vector<std::int32_t>& out) -> cudaError_t {
+        out.assign(static_cast<std::size_t>(page_count), 0);
+        ninfer::Tensor row = pool.rope_delta_row(0);
+        return cudaMemcpy(out.data(), row.data,
+                          static_cast<std::size_t>(page_count) * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost);
+    };
+    std::vector<std::int32_t> after_write;
+    err = read_row(after_write);
+    if (err != cudaSuccess) {
+        std::cerr << label << " first readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    for (std::int32_t p = 0; p < page_count; ++p) {
+        if (after_write[p] != 17) {
+            std::cerr << label << " precondition failed: row 0 page " << p << " is "
+                      << after_write[p] << ", expected 17\n";
+            return 1;
+        }
+    }
+
+    // 4. Release the row: unbind the allocation and drop it.
+    first.unbind_row();
+    first.release();
+
+    // 5. Bind a *different* allocation to the same row. bind_row is what must clear the row.
+    auto second = pool.reserve(1);
+    second.bind_row(0, stream);
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " second bind sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    // 6. Read back. Every entry must be zero.
+    std::vector<std::int32_t> after_rebind;
+    err = read_row(after_rebind);
+    if (err != cudaSuccess) {
+        std::cerr << label << " second readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+    int failures = 0;
+    for (std::int32_t p = 0; p < page_count; ++p) {
+        if (after_rebind[p] != 0) {
+            if (failures < 4) {
+                std::cerr << label << " recycled row 0 page " << p << " is " << after_rebind[p]
+                          << ", expected 0\n";
+            }
+            ++failures;
+        }
+    }
+    second.unbind_row();
+    second.release();
+    return failures == 0 ? 0 : 1;
+}
+
+// Step 3a of docs/SCR_QUANTIZED_KV_RELOCATION.md: after a reassign that carries a delta
+// plane, the plane must hold the shift for each relocated page and kRopeDeltaNone
+// elsewhere. This is the pool-side half of the writer; the runtime-side half (the loop
+// that computes the deltas from relocated spans) is in program_impl.h and needs a GPU.
+//
+// What this test can prove without a GPU is that `reassign_pages` stores and publishes
+// what it was handed, and that non-relocated pages default to zero.
+int expect_reassign_publishes_deltas(ninfer::PagedKVPool& pool, cudaStream_t stream,
+                                     const char* label) {
+    const ninfer::Tensor& deltas = pool.rope_deltas();
+    const std::int32_t page_count = deltas.ne[0];
+    if (page_count < 4 || pool.table_row_count() < 1) {
+        std::cerr << label << " pool is too small for this test\n";
+        return 1;
+    }
+
+    // Reserve enough distinct pages to map every logical page, then bind to row 0.
+    // Requires page_group_count >= logical_page_capacity (10 for the pool in main).
+    const std::uint32_t entitlement = static_cast<std::uint32_t>(page_count);
+    auto allocation = pool.reserve(entitlement);
+    allocation.materialize_pages(entitlement, stream);
+    allocation.bind_row(0, stream);
+
+    std::vector<std::int32_t> mapping(allocation.page_ids().begin(), allocation.page_ids().end());
+    if (static_cast<std::int32_t>(mapping.size()) != page_count) {
+        std::cerr << label << " materialized " << mapping.size() << " pages, expected " << page_count
+                  << '\n';
+        return 1;
+    }
+
+    // Mark logical pages 1 and 3 as relocated, everything else as not. Two pages with
+    // *different* nonzero deltas, so a bug that writes the same value everywhere is
+    // visible, and one gap between them so an "everything after the first write gets the
+    // same value" bug is visible too.
+    std::vector<std::int32_t> deltas_in(static_cast<std::size_t>(page_count),
+                                         ninfer::kRopeDeltaNone);
+    deltas_in[1] = 17;
+    deltas_in[3] = -42;
+
+    allocation.reassign_pages(mapping, deltas_in, stream);
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << label << " reassign sync failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    // Read back through the pool's own row accessor, the same path a reader would use.
+    ninfer::Tensor row = pool.rope_delta_row(0);
+    std::vector<std::int32_t> after(static_cast<std::size_t>(page_count), 0);
+    err = cudaMemcpy(after.data(), row.data,
+                     static_cast<std::size_t>(page_count) * sizeof(std::int32_t),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::cerr << label << " readback failed: " << cudaGetErrorString(err) << '\n';
+        return 1;
+    }
+
+    int failures = 0;
+    for (std::int32_t p = 0; p < page_count; ++p) {
+        const std::int32_t want = deltas_in[static_cast<std::size_t>(p)];
+        if (after[static_cast<std::size_t>(p)] != want) {
+            if (failures < 4) {
+                std::cerr << label << " page " << p << " is "
+                          << after[static_cast<std::size_t>(p)] << ", expected " << want << '\n';
+            }
+            ++failures;
+        }
+    }
+    allocation.unbind_row();
+    allocation.release();
     return failures == 0 ? 0 : 1;
 }
 
@@ -311,6 +486,9 @@ int main() {
     // row must leave that row zero and the other byte-identical.
     failures += expect_rope_delta_row_clear(paged_pool, 0, ctx.stream, "rope-delta row 0 clear");
     failures += expect_rope_delta_row_clear(paged_pool, 1, ctx.stream, "rope-delta row 1 clear");
+    failures += expect_rope_delta_recycling(paged_pool, ctx.stream, "rope-delta recycling");
+    failures += expect_reassign_publishes_deltas(paged_pool, ctx.stream,
+                                                 "rope-delta reassign publish");
     if (paged_pool.rope_deltas().ne[0] != paged_pool.block_tables().ne[0] ||
         paged_pool.rope_deltas().ne[1] != paged_pool.block_tables().ne[1]) {
         ++failures;
@@ -421,6 +599,37 @@ int main() {
     failures += expect_size(bundle[0].page_entitlement(), 2, "failed resize main entitlement");
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");
     failures += expect_size(bundle[1].page_entitlement(), 2, "failed resize backend entitlement");
+
+    // A Suffix Cache Reuse plan asks for an entitlement below the lane's current mapping, because a
+    // shrinking edit makes the new prompt smaller while the resident pages above the frontier stay
+    // mapped until the page remap publishes. The runtime does not pass that figure through: it asks
+    // for `max(requested, mapped)`. That substitution is only sound if the unclamped request is
+    // refused *before* anything mutates, so this pins both halves -- the refusal and its atomicity,
+    // then the acceptance of the clamped form.
+    const ninfer::PagedKVResize shrink_below_mapping[] = {
+        {.allocation       = &bundle[0],
+         .mapped_pages     = bundle[0].mapped_page_count(),
+         .page_entitlement = 1},
+    };
+    bool shrink_refused = false;
+    try {
+        ninfer::resize_paged_kv_bundle(shrink_below_mapping);
+    } catch (const std::invalid_argument&) { shrink_refused = true; }
+    if (!shrink_refused) {
+        ++failures;
+        std::cerr << "A resize to an entitlement below the mapping was accepted\n";
+    }
+    failures += expect_size(bundle[0].mapped_page_count(), 2, "refused shrink left the mapping");
+    failures += expect_size(bundle[0].page_entitlement(), 2, "refused shrink left the entitlement");
+
+    const ninfer::PagedKVResize clamped_shrink[] = {
+        {.allocation       = &bundle[0],
+         .mapped_pages     = bundle[0].mapped_page_count(),
+         .page_entitlement = std::max<std::uint32_t>(1, bundle[0].mapped_page_count())},
+    };
+    ninfer::resize_paged_kv_bundle(clamped_shrink);
+    failures += expect_size(bundle[0].mapped_page_count(), 2, "clamped shrink mapping");
+    failures += expect_size(bundle[0].page_entitlement(), 2, "clamped shrink entitlement");
 
     return failures == 0 ? 0 : fail("kv cache test failed");
 }

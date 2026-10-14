@@ -22,7 +22,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
+    const std::int32_t* __restrict__ rope_page_deltas, RerotateFreq freq) {
     static_assert(TokenTile >= 1 && TokenTile <= 8);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -69,8 +70,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         input.v += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
-    const std::int32_t* block_table =
-        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+  const std::int32_t* block_table =
+      block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+  const std::int32_t* delta_row = rope_page_deltas == nullptr ? nullptr
+                                : rope_page_deltas + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads * tokens *
                        split_count;
@@ -195,6 +198,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                     smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
     }
     __syncthreads();
+    std::int32_t current_delta = 0;
+    if (delta_row != nullptr) {
+        current_delta = delta_row[first_tile >> kPagedKVPageShift];
+        // No runtime cross-check against pos[]. The doc asks for one, but pos[] holds
+        // absolute positions while delta is a relative shift, and there is no cheap
+        // invariant linking the two at this location. The sign convention is verified
+        // by the delta-plane oracle test (tests/ops/test_gqa_kv_page_delta.cpp) and
+        // the integration test's negative control (tests/ops/test_scr_relocation_
+        // integration.cpp), which are the authorities.
+        if (current_delta != 0) {
+            gqa_rope_counter_rotate_q_bf16(af_q, lid, current_delta, freq);
+        }
+    }
     int physical_page = block_table[first_tile >> kPagedKVPageShift];
     float acc[PVNt][4];
 #pragma unroll
@@ -205,10 +221,49 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
     for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0 = first_tile + kb * Bc;
-        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-            physical_page = block_table[k0 >> kPagedKVPageShift];
+        const int k0 = first_tile + kb * Bc;    if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+      const int new_logical_page = k0 >> kPagedKVPageShift;
+      physical_page = block_table[new_logical_page];
+
+      if (delta_row != nullptr) {
+        const std::int32_t new_delta = delta_row[new_logical_page];
+        if (new_delta != current_delta) {
+          // CRITICAL: The __syncthreads() at the end of the previous iteration guarantees  
+          // qkv_s is drained by the previous PV MMA before we overwrite it with the reloaded Q.
+          
+          for (int idx = tid; idx < Br * D; idx += Threads) {
+            const int row = idx / D;
+            const int d   = idx - row * D;
+            int q_head    = 0;
+            int token     = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+            __nv_bfloat16 value = __float2bfloat16(0.0f);
+            if (row < row_count && gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+              value = q[gqa_q_index<Geometry>(q_head, d, token)];
+            }
+            qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
+          }
+          __syncthreads();
+
+          #pragma unroll
+          for (int k = 0; k < QKKs; ++k) {
+            const int arow = warp_row0 + a_rowoff;
+            const int acol = k * 16 + a_coloff;
+            ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+                        smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
+          }
+
+          if (new_delta != 0) {
+            gqa_rope_counter_rotate_q_bf16(af_q, lid, new_delta, freq);
+          }
+          current_delta = new_delta;
+          // The ldmatrix above moved Q into af_q registers. The K/V staging below
+          // overwrites qkv_s (k_s/v_s are aliases), so all warps must have finished
+          // reading before any thread writes.
+          __syncthreads();
         }
+      }
+    }
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
         // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #pragma unroll 1

@@ -9,6 +9,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ninfer/ops/gqa_kv_rerotate.h"
 
 #include <cuda_bf16.h>
 
@@ -27,15 +28,18 @@ inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) 
 
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
+    const std::int32_t* delta_table;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
     __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+    __device__ __forceinline__ const std::int32_t* delta_table_ptr() const { return delta_table; }
 };
 
 template <bool Masked>
 struct GqaPrefillBatchMetadata {
     const std::int32_t* tables;
+    const std::int32_t* delta_tables;
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
@@ -50,6 +54,9 @@ struct GqaPrefillBatchMetadata {
 
     __device__ __forceinline__ const std::int32_t* block_table() const {
         return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+    __device__ __forceinline__ const std::int32_t* delta_table_ptr() const {
+        return delta_tables == nullptr ? nullptr : delta_tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
 };
 
@@ -87,6 +94,34 @@ __device__ __forceinline__ int gqa_prefill_swz(int row, int col) {
 __device__ __forceinline__ unsigned gqa_prefill_swz_addr(unsigned lane_base, unsigned ck,
                                                          unsigned as, unsigned r) {
     return lane_base + ((ck | as) ^ r);
+}
+
+// Rotate Q in shared memory by R(-delta) in-place. 
+// Iterates ONLY over the first 32 columns to avoid clobbering rotated values.
+__device__ __forceinline__ void gqa_prefill_rotate_q_smem_inplace(
+    __nv_bfloat16* q_s, int Br, int tid, int threads, std::int32_t delta, const RerotateFreq& freq) {
+  constexpr int D = kGqaPrefillHeadDim;
+  if (delta == 0) { return; }
+   
+  for (int idx = tid; idx < Br * 32; idx += threads) {
+    const int row = idx / 32;
+    const int d   = idx - row * 32; // d in [0, 31]
+    
+    const int swz_first  = row * D + gqa_prefill_swz(row, d);
+    const int swz_second = row * D + gqa_prefill_swz(row, d + 32);
+    
+    const float x = __bfloat162float(q_s[swz_first]);
+    const float y = __bfloat162float(q_s[swz_second]);
+    
+    float s, c;
+    // sincosf gives sin/cos of +delta*freq. The R(-θ) formula below applies the
+    // negative angle: cross terms get +, direct terms get -, opposite of R(+θ).
+    sincosf(static_cast<float>(delta) * freq.v[d], &s, &c);
+    
+    // R(-theta) applied in-place
+    q_s[swz_first]  = __float2bfloat16(x * c + y * s);
+    q_s[swz_second] = __float2bfloat16(y * c - x * s);
+  }
 }
 
 } // namespace ninfer::ops

@@ -4,15 +4,35 @@ Companion to `docs/SCR_ROADMAP.md`. That document describes the phases; this one
 concrete ways the runtime can apply a relocation plan, exactly where each attaches, and what has to
 be decided before either is written.
 
-Status: **Path A is written but has never been compiled.** `start_prefill_lane` replaces the common
+Status: **Path A is written and verified on hardware.** `start_prefill_lane` replaces the common
 frontier trim with the page remap, re-rotates the relocated run once the block table is published, and
-stages the plan's two prefilled ranges, which the chunk walk skips the relocated run between. The
-whole change set was prepared without a CUDA toolchain, so none of that is verified. Path B is still
-unimplemented, and any plan without ranges falls back to ordinary prefix reuse.
+stages the plan's prefilled ranges, which the chunk walk skips the relocated run between. The
+integration test routes every byte through `gqa_kv_append` and the real attention kernels, and
+`tools/scr_e2e_check.py` confirms relocated and re-prefilled runs produce the same output.
+
+**Path B (segmented) is written too.** It was never a second runtime: the staged walk has always
+been driven by a list of prefilled ranges (`RequestControl::Prefill::prefill_ranges`, with
+`prefill_range_end`/`skip_relocated_runs` scanning it), the remap and the delta plane are span-driven,
+and `text_kv_valid` already advances across the skipped run. What was missing was on the planning
+side, and is now in place:
+
+- `plan_relocations` applies the same destination limits the tail planner applies -- no span reaches
+  `prompt_tokens - 1` (the final token must be prefilled, because prompt logits can only come from a
+  real forward pass) or the turn-rewrite boundary (the first token whose KV is already stale) -- and
+  trims a span back to the last whole block ending before either rather than dropping it;
+- the prefilled ranges are derived from the spans by `relocation_prefill_ranges`, one range per gap,
+  tiling the suffix with the runs exactly, so both modes reach the runtime in the same shape and the
+  summary's relocated-token count is a count of tokens that are genuinely not prefilled;
+- the service-work projection counts one extra step per further range
+  (`relocation_prefill_splits`), where it previously assumed at most two ranges;
+- a plan that is not expressible is refused rather than half-applied (`relocation_is_expressible`),
+  so a summary can never count reuse the runtime will not perform.
+
+What remains is measurement, not wiring: the per-dtype and MTP end-to-end runs, and the Phase 5.5
+quality sweep. See "Verification that is still owed".
 
 The two open design questions are now settled: Path A is the target, and the 27B's linear layers are
-handled by snapshot/restore. What remains is runtime wiring, which needs a machine with `nvcc` - see
-"Verification that is still owed".
+handled by snapshot/restore.
 
 Already built and pushed:
 
@@ -166,56 +186,68 @@ threshold, the fallback is to disable SCR rather than to silently keep an unmeas
 ## Path B - general segmented prefill
 
 Needed when relocated spans are interleaved anywhere in the prompt, i.e. the general CLM context
-edit. The planner already expresses this; only the runtime cannot consume it.
+edit. The planner has always expressed this; the runtime could not consume it, because the plan
+carried spans and no ranges to prefill around them.
 
-What has to change:
+What it took, against the list this section used to carry:
 
-- the staged prefill carries a **list of segments** rather than one contiguous range, where each
-  segment is `[begin, end)` of tokens to prefill and the gaps are relocated;
-- the scheduler's chunking walks segments in order and carries a `(segment_index, offset)` cursor
-  instead of a single token cursor, so a chunk never straddles a segment boundary arbitrarily - it
-  either stops at the boundary or spans it with a known irregularity;
-- `sequence.text_kv_valid` becomes "KV is valid for every position in `[0, prompt_tokens)`"
-  immediately after relocation, which is true, rather than "prefilled prefix length". Several checks
-  compare `text_kv_valid` against the frontier and would otherwise fire spuriously;
-- `sequence.ledger` has to hold the full new prompt from the start, since relocated positions are
-  never re-appended during prefill;
-- the block table must map the whole prompt before any segment runs, for the same reason as step 1
-  of Path A.
+- ~~the staged prefill carries a **list of segments** rather than one contiguous range~~ **already
+  done**: `prefill_ranges` is a vector and both walk helpers scan it, so a plan with any number of
+  ranges is consumed unchanged. The tail mode simply never produced more than two.
+- ~~the scheduler walks segments in order~~ **already done**: `skip_relocated_runs` resumes at the
+  next range and `prefill_range_end` clamps the chunk to a range boundary, so no chunk straddles a
+  gap. It is expressed over token positions rather than a `(segment_index, offset)` pair, which
+  turns out to need no new state.
+- ~~`sequence.text_kv_valid` becomes "valid for every position" immediately after relocation~~
+  **already done**: the walk sets it across the skipped run, so it was never a prefilled-prefix
+  length once Path A shipped.
+- ~~`sequence.ledger` holds the full new prompt from the start, and the block table maps the whole
+  prompt before any segment runs~~ **already done**, both proven by the shipped tail path's
+  ledger-size check and its pre-walk bind.
+- **the work projection** now counts one extra step per further range. This was the one real trap:
+  a request whose real work exceeded its projection died mid-prefill, which is how the two-range
+  case was originally found, and an interleaved plan would have re-introduced it silently.
 
-Anchor points for that work, all in `src/targets/qwen3_6/impl/runtime/`:
+Anchor points, all in `src/targets/qwen3_6/impl/runtime/`:
 
-- `program_impl.h`, `start_prefill_lane` - the reuse branches around the `AppendAtFrontier` case, and
-  the staged `Prefill` construction at the end of the function (`host_input_consumed_pending`,
-  `.reuse`, `.mtp_bridge`);
-- `program.h` - the staged prefill record (`PrefillStepResult`'s cursor fields) and
-  `RequestPlanImpl::relocated_spans`;
-- the chunking walk further down `program_impl.h` that consumes the staged prefill
-  (`host_input_consumed` / cursor bookkeeping around the `PrefillStepResult` staging and the
-  `text_kv_valid` updates);
-- `request_plan_impl.h`, `projected_service_work` - a segmented prefill changes the quantum
-  accounting because a chunk can now cover less than `prefill_chunk` tokens.
+- `prompt_edit.{h,cpp}` - `plan_relocations` (the selector, now with the same destination limits as
+  the tail planner), `relocation_prefill_ranges`, `relocation_prefill_splits`, and
+  `relocation_is_expressible`. Host-testable, and tested: `tests/targets/qwen3_6/test_prompt_edit.cpp`
+  covers the limits, the range derivation, the split count, and the expressibility check.
+- `request_plan_impl.h`, `plan_request_for_lane` - both modes now end at the same place: spans from
+  the selector, ranges derived from the spans, refusal if the pair is not expressible.
+- `program.h` - `RequestPlanImpl::relocated_prefill_ranges` replaced the head/tail pair, so the plan
+  has one source for the shape the runtime walks.
+- `program_impl.h`, `start_prefill_lane` - `apply_relocation` gates on spans *and* ranges, the GDN
+  zeroing keys off the first span's destination rather than a head range, and the diagnostics read
+  the range list.
 
-Path B dominates the diff size and cannot be validated by reading; it should be written on a machine
-with `nvcc` available.
+Path B is the same arithmetic as Path A with more ranges, and it is covered by the same tests plus
+the new host tests above; what it has not had is a hardware run with interleaved survivors, which
+is part of the verification owed below.
 
 ## Switch for benchmarking
 
 Wired: the choice reaches the plan through `ScrRelocationMode` on `ExecutionOptions`, mirrored into
 `ResolvedExecutionOptions`, `ServeOptions` and `RequestBasePlanImpl`, and surfaced as `--scr-mode
-tail|segmented`. The default is `tail`, and `tail` is the only mode the runtime can act on, so
-`segmented` currently produces a plan the runtime ignores exactly as `tail` does. The remaining items
-below are what still has to happen:
+tail|segmented`. The default is `tail`. Both modes now produce a plan the runtime executes; the
+mode is reported in the server-start record and `prefix_relocated_tokens` in the completion record.
 
-- have the planner reject a plan whose `relocated_spans` do not satisfy the selected mode's
-  condition, falling back to `AppendAtFrontier` rather than relocating partially. `tail` already gets
-  this from `plan_tail_relocation`; `segmented` has no such check yet;
-- report the mode in the server-start record and `prefix_relocated_tokens` in the completion record,
-  which is already wired.
+What still holds the two apart, deliberately:
 
-The planner-side mode check is host-testable (`tests/targets/qwen3_6/test_prompt_edit.cpp` already
-covers `plan_relocations`), so the mode split can be verified without CUDA even though the two
-runtimes cannot.
+- `tail` selects one contiguous run and trims spans back to the turn-rewrite boundary, because a
+  single run is the shape whose approximation is bounded and measurable. It is the default for that
+  reason, not because `segmented` is broken.
+- `segmented` may relocate any interleaved survivor, so one edit can introduce several disjoint
+  approximations at once. Its spans satisfy the same destination limits as the tail planner's, so
+  neither mode can reuse KV that is stale or un-prefillable, but the quality consequence of many
+  small relocations has not been measured -- which is what the Phase 5.5 sweep is for.
+
+A plan that is not expressible -- spans the runtime cannot lay out against the reported ranges --
+is refused with a printed reason rather than applied partially, so a summary never counts reuse the
+runtime will not perform. That check is host-testable
+(`relocation_is_expressible` in `tests/targets/qwen3_6/test_prompt_edit.cpp`), so the mode split is
+verified without CUDA even though the two runtimes' behaviour on hardware is not.
 
 ## SCR produces garbage on both supported models: the GDN layers make it unworkable
 
@@ -264,13 +296,16 @@ rewritten, so it bounds how far a relocated span may reach rather than forbiddin
 block ending before it. Before the fix every e2e run reported `full_reset`; after it, relocation is
 planned and executed.
 
-**The planner has no guard for quantized KV.** `gqa_kv_rerotate` requires an uncompressed BF16 Text
-KV plane, so a quantized `--kv-dtype` plans a relocation that then throws at runtime instead of
-degrading to `AppendAtFrontier`. This is the cheapest outstanding fix and is not done.
+**The planner has no guard for quantized KV.** *(Superseded: `gqa_kv_rerotate` and
+`validate_text_k_cache` are both gone and the planner now consults
+`delta_path_supports_dtype` — see "SCR is no longer limited to BF16 KV" below. Recorded here
+because it was one of the two blockers this section describes.)* `gqa_kv_rerotate` required an
+uncompressed BF16 Text KV plane, so a quantized `--kv-dtype` planned a relocation that then threw at
+runtime instead of degrading to `AppendAtFrontier`.
 
 ## Verification status
 
-Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 88-test suite green):
+Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 84-test suite green):
 
 1. `reassign_pages` against the real pool -- **done**, `tests/test_paged_kv_reassign_pages.cpp`.
    Permutation, grow from the pool, shrink, reclaiming a whole entitlement, the shrink-one-region
@@ -296,7 +331,19 @@ Verified on an RTX 4090 (`sm_89`, CUDA 13.x, MSVC 2022, sm_89 build, 88-test sui
 4. End-to-end relocation wiring in `program_impl.h` -- **wiring defect found and fixed**, see below.
    `tools/scr_e2e_check.py` drives a live server over prompts that share a prefix and a suffix and
    differ in the middle, and refuses to report a pass unless the server logs `reuse=suffix_relocation`.
-5. Phase 5.5 quality harness -- **not started**. `eval/ninfer_eval` has no `--scr` support`.
+5. Phase 5.5 quality harness -- **built and measured**, `apps/scr_quality`
+   (`ninfer-scr-quality.exe`), scored by `evaluate_scr_quality` against the roadmap's thresholds. It
+   runs four phases per prompt (`--flag-control` adds the fourth) and prints an `ATTRIBUTION` table
+   that reads the measurement against both floors it must clear -- the run-to-run control and the
+   flag-only configuration -- never against zero. The 2026-10-08 measurements leave the K=2 sweep
+   point as an unexplained, reproducible signal; `docs/SCR_ROADMAP.md`'s Phase 5.5 records what is
+   measured and what is still owed.
+6. Copied relocation (off-grid source) -- **zero execution**. The device copy is written
+   (`src/core/paged_kv_cache.cu`, `relocate_copied_pages`) and the runtime branch engages it, but the
+   e2e fixture aligns by construction, so no hardware run has reached it: the device oracle in
+   `tests/ops/test_scr_copied_relocation.cpp` does not exist yet.
+   `docs/SCR_COPIED_RELOCATION_HANDOFF.md` specifies it. The interleaved-fixture and per-dtype
+   hardware runs that remain are laddered in `docs/SCR_ALIGNMENT_FREE_RELOCATION.md`.
 
 ### The defect: the chunk's base position was captured before the cursor skipped the relocated run
 
@@ -344,13 +391,25 @@ configurable context reaches that threshold. The defect was real but latent; the
 architectural (the Op no longer depends on mutable module-global state) rather than a correctness
 rescue.
 
-## SCR is currently limited to BF16 KV, and that caps it below useful context
+## SCR is no longer limited to BF16 KV
 
-`gqa_kv_rerotate` requires an uncompressed BF16 Text KV plane. `validate_text_k_cache` rejects every
-quantized layout (`int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), and **the request planner has
-no matching guard**, so a quantized `--kv-dtype` plans a relocation that then throws at runtime
-instead of degrading to `AppendAtFrontier`. A planner-side guard is the cheapest fix and is not
-done yet.
+*(Superseded: this section used to say that `gqa_kv_rerotate` required an uncompressed BF16 Text KV
+plane and that `validate_text_k_cache` rejected every quantized layout, with no matching planner
+guard. All three of those statements are now false of the code — see
+`docs/SCR_QUANTIZED_KV_RELOCATION.md`.)*
+
+Relocation no longer rewrites the stored K. It publishes a **per-page RoPE delta** on a separate
+delta plane, and the attention kernels counter-rotate Q for the page being read, so the codes in the
+cache are never touched and the layout stops mattering. `validate_text_k_cache` and
+`ops::gqa_kv_rerotate` are both gone; `request_plan_impl.h`'s `delta_path_supports_dtype` admits
+BF16 and I8, which covers every quantized layout below, and the planner consults it.
+
+What that leaves open is verification, not availability:
+
+- `tools/scr_e2e_check.py` must be run once per `--kv-dtype` (`bf16`, `int8`, `rk8v4`, `rk4v4`,
+  `rk4v4-e8`) and must report `reuse=suffix_relocation` for each;
+- `rk2v4-e8` is deliberately refused by that check: its K read path is a different codec
+  (`e8_root_decode_8d_int8`) whose oracle is not written, so nothing can attribute a pass there yet.
 
 For `qwen3_8_27b` the arithmetic is: 2 (K and V) x 16 full-attention layers x 4 KV heads x 256
 head_dim, against 16.96 GiB of `groupwise-int` weights on a 23.99 GiB card.
@@ -358,13 +417,18 @@ head_dim, against 16.96 GiB of `groupwise-int` weights on a 23.99 GiB card.
 | kv-dtype | KiB/token | KV @65k | KV @131k | KV @262k | SCR |
 |---|---|---|---|---|---|
 | bf16 | 64 | 4.0 GiB | 8.0 GiB (over) | 16 GiB (over) | yes |
-| int8 | 32 | 2.0 GiB | 4.0 GiB | 8.0 GiB (over) | no |
-| rk4v4-e8 | 16 | 1.0 GiB | 2.0 GiB | 4.0 GiB | no |
-| rk2v4-e8 | 12 | 0.8 GiB | 1.5 GiB | 3.0 GiB | no |
+| int8 | 32 | 2.0 GiB | 4.0 GiB | 8.0 GiB (over) | yes* |
+| rk4v4-e8 | 16 | 1.0 GiB | 2.0 GiB | 4.0 GiB | yes* |
+| rk2v4-e8 | 12 | 0.8 GiB | 1.5 GiB | 3.0 GiB | refused |
 
-So on this card SCR works only up to roughly 65k context, while the quantized formats are what buy
-the 160k-500k configurations in the README. That is backwards for a memory-constrained device: the
-feature is available only in the regime with the least memory pressure to relieve.
+\* The delta-plane path admits every I8 layout (`delta_path_supports_dtype`), and the e2e check
+accepts `bf16, int8, rk8v4, rk4v4, rk4v4-e8`; the per-dtype hardware runs are still owed.
+`rk2v4-e8` is deliberately refused by that check: its K read path is a different codec
+(`e8_root_decode_8d_int8`) whose oracle is not written, so nothing can attribute a pass there yet.
+
+So the binding limit is context length, not dtype: `bf16` caps at roughly 65k on this card, and the
+quantized layouts are what buy the longer configurations. One hardware run at `rk4v4-e8` has engaged
+relocation and produced output identical to `--no-scr`.
 
 ### Why quantized K is the blocker, and why V is not
 
@@ -384,12 +448,11 @@ rotation at all:
   rotated vector, which is generally not the rotation of the original codeword. This is a research
   problem, not an implementation detail, and there is no known cheap encoding. Deferred.
 
-Both need a decision on error accounting before implementation: whether a relocated quantized key is
-allowed to carry more error than a key prefilled at that position, and if so how much, measured
-against the same < 0.05 nat divergence threshold Phase 5.5 already defines.
-
-Recommended order: (1) the planner-side guard so `--scr` is safe to leave enabled across
-config changes, (2) `int8` K re-rotation, (3) the E8 work only if (2) shows the approach pays off.
+Both would need a decision on error accounting before implementation: whether a relocated quantized
+key is allowed to carry more error than a key prefilled at that position, and if so how much,
+measured against the same < 0.05 nat divergence threshold Phase 5.5 already defines. *(Historical:
+the per-dtype analysis above was the case behind the re-rotation approach. The delta plane made it
+moot — relocation never rewrites the codes, so none of this work is owed.)*
 
 ### A note on how SCR is triggered, for anyone writing tests
 

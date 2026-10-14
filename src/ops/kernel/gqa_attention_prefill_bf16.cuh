@@ -120,7 +120,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                                            const __nv_bfloat16* __restrict__ cache_v,
                                            Metadata metadata,
                                            const std::int32_t* __restrict__ positions, float scale,
-                                           __nv_bfloat16* __restrict__ out, std::int32_t width) {
+                                           __nv_bfloat16* __restrict__ out, std::int32_t width,
+                                       RerotateFreq freq) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
     constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
@@ -155,6 +156,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     }
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
+    const std::int32_t* delta_table = metadata.delta_table_ptr();
 
     const int gid = lane >> 2;
     const int lid = lane & 3;
@@ -239,6 +241,49 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const float scale_l2 = scale * Log2E;
     int physical_page    = block_table[0];
 
+    std::int32_t current_delta = 0;
+    auto reload_and_rotate_q = [&](int kb) {
+        if (delta_table != nullptr) {
+            const std::int32_t new_delta = delta_table[kb]; // kb == logical page since Bc=64
+            if (new_delta != current_delta) {
+                const __nv_bfloat16* q_block = q + gqa_prefill_q_index<Geometry>(q_head, 0, q0);
+                constexpr int VecPerRow = D / 8;
+                constexpr int QRowStride = D * Geometry::QHeads;
+                if (q0 + Br <= tokens) {
+                    #pragma unroll
+                    for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                        const int row = chunk >> 5;
+                        const int d   = (chunk & 31) << 3;
+                        __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
+                        cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                        const int row = chunk >> 5;
+                        const int d   = (chunk & 31) << 3;
+                        __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
+                        if (q0 + row < tokens) {
+                            cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
+                        } else {
+                            store_vec(p, make_int4(0, 0, 0, 0));
+                        }
+                    }
+                }
+                ninfer::ops::cp_commit();
+                ninfer::ops::cp_wait<0>();
+                // Wait for the cp.async Q reload to land in q_s before the rotation reads it.
+                __syncthreads();
+                
+                gqa_prefill_rotate_q_smem_inplace(q_s, Br, tid, Threads, new_delta, freq);
+                current_delta = new_delta;
+                // Wait for the in-place rotation writes to q_s to be visible before the
+                // next iteration's ldmatrix reads Q from it.
+                __syncthreads();
+            }
+        }
+    };
+
     // Prologue: commit Q, then kick off K(0).
     ninfer::ops::cp_commit();
     if (n_full_blocks > 0) {
@@ -258,6 +303,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed
         __syncthreads();
+        reload_and_rotate_q(kb);
 
         // Overlap V(kb) load (guaranteed 100% full tile) against QK MMA
         gqa_prefill_stage_kv_full<Geometry>(v_s, cache_v, kv_head, physical_page, tid);
@@ -408,6 +454,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed
         __syncthreads();
+        reload_and_rotate_q(kb);
 
         // Overlap V(kb) load against the QK MMA below.
         gqa_prefill_stage_kv_partial<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs,

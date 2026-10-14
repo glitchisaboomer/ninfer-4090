@@ -11,6 +11,7 @@
 
 #include "ops/kernel/e8_lattice.cuh"
 #include "ops/kernel/e8_root_codec.cuh"
+#include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
 
@@ -368,7 +369,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    std::int32_t width, RerotateFreq freq) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
     constexpr int Bc            = kGqaPrefillI8Bc;
@@ -420,6 +421,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     }
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
+    const std::int32_t* delta_table = metadata.delta_table_ptr();
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
@@ -430,27 +432,41 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int full_k_limit  = (q0 + Br <= tokens) ? (base_pos + q0) : -1;
     const int n_full_blocks = (full_k_limit >= 0) ? min(key_blocks, (full_k_limit + 1) / Bc) : 0;
 
-    // Quantize Q cooperatively. One warp owns one (row, 64-d group) at a time.
-    for (int unit = warp; unit < Br * Groups; unit += kGqaPrefillI8Warps) {
-        const int row = unit / Groups;
-        const int grp = unit - row * Groups;
-        const int d0  = grp * kGqaKvQuantGroup + lane;
-        const int d1  = d0 + 32;
-        float x0      = 0.0f;
-        float x1      = 0.0f;
-        if (row < tile_rows) {
-            x0 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d0, q0 + row)]);
-            x1 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d1, q0 + row)]);
-            if constexpr (RotateK) { gqa_kv_hadamard64(x0, x1, FullMask); }
+    auto stage_and_quantize_q = [&](std::int32_t delta) {
+        // Quantize Q cooperatively. One warp owns one (row, 64-d group) at a time.
+        for (int unit = warp; unit < Br * Groups; unit += kGqaPrefillI8Warps) {
+            const int row = unit / Groups;
+            const int grp = unit - row * Groups;
+            const int d0  = grp * kGqaKvQuantGroup + lane;
+            const int d1  = d0 + 32;
+            float x0      = 0.0f;
+            float x1      = 0.0f;
+            if (row < tile_rows) {
+                x0 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d0, q0 + row)]);
+                x1 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d1, q0 + row)]);
+                // Rotate before Hadamard: since H is applied to both sides,
+                // (H·R·Q)·(H·K) = (R·Q)·K. Applying R after H would not commute.
+                // Only group 0 covers dims [0, 64), the rotary region.
+                if (delta != 0 && grp == 0) {
+                    gqa_rope_counter_rotate_pair_f32(x0, x1, lane, delta, freq);
+                }
+                if constexpr (RotateK) { gqa_kv_hadamard64(x0, x1, FullMask); }
+            }
+            float absmax    = fmaxf(fabsf(x0), fabsf(x1));
+            absmax          = warp_max(absmax, FullMask);
+            const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
+            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
+            gqa_prefill_i8_store_swz(q_i8, row, d0, gqa_kv_quant_code(x0, inv));
+            gqa_prefill_i8_store_swz(q_i8, row, d1, gqa_kv_quant_code(x1, inv));
+            if (lane == 0) { q_scale[row * Groups + grp] = qs; }
         }
-        float absmax    = fmaxf(fabsf(x0), fabsf(x1));
-        absmax          = warp_max(absmax, FullMask);
-        const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
-        const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-        gqa_prefill_i8_store_swz(q_i8, row, d0, gqa_kv_quant_code(x0, inv));
-        gqa_prefill_i8_store_swz(q_i8, row, d1, gqa_kv_quant_code(x1, inv));
-        if (lane == 0) { q_scale[row * Groups + grp] = qs; }
-    }
+    };
+
+    // No zero-fill is needed: the loop above spans Br * Groups, so every row
+    // including the padding rows is written, and padding rows quantize to zeros.
+    const std::int32_t initial_delta = delta_table != nullptr ? delta_table[0] : 0;
+    stage_and_quantize_q(initial_delta);
+    std::int32_t current_delta = initial_delta;
     __syncthreads();
 
     auto issue_kv_tile_full = [&](int tile_k0) {
@@ -600,17 +616,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     // Groups 2/3 reload per key tile; retaining all four creates an 8-byte stack frame.
     float q_scale_r0[Groups - 2];
     float q_scale_r1[Groups - 2];
-    if (warp < ProducerWarps) {
+    auto refresh_q_scale_regs = [&]() {
+        if (warp >= ProducerWarps) { return; }
         const int scale_row0 = warp * 16 + gid;
         const int scale_row1 = scale_row0 + 8;
 #pragma unroll
         for (int grp = 0; grp < Groups - 2; ++grp) {
-            float qs0       = lid == 0 ? q_scale[scale_row0 * Groups + grp] : 0.0f;
-            float qs1       = lid == 0 ? q_scale[scale_row1 * Groups + grp] : 0.0f;
+            float qs0 = (lid == 0) ? q_scale[scale_row0 * Groups + grp] : 0.0f;
+            float qs1 = (lid == 0) ? q_scale[scale_row1 * Groups + grp] : 0.0f;
             q_scale_r0[grp] = __shfl_sync(FullMask, qs0, gid * 4);
             q_scale_r1[grp] = __shfl_sync(FullMask, qs1, gid * 4);
         }
-    }
+    };
+    refresh_q_scale_regs();
 
     float acc[PVNtPerWarp][4];
 #pragma unroll
@@ -626,6 +644,15 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
 
     // Phase 1: Fully Causal Interior Tiles
     for (int kb = 0; kb < n_full_blocks; ++kb) {
+        if (delta_table != nullptr) {
+            const std::int32_t new_delta = delta_table[kb];
+            if (new_delta != current_delta) {
+                stage_and_quantize_q(new_delta);
+                __syncthreads();  // publish all warps' q_i8 / q_scale writes
+                refresh_q_scale_regs();
+                current_delta = new_delta;
+            }
+        }
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
             float score[QKNt][4];
@@ -807,6 +834,15 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     // Phase 2: Boundary / Causal Tiles
     for (int kb = n_full_blocks; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
+        if (delta_table != nullptr) {
+            const std::int32_t new_delta = delta_table[kb];
+            if (new_delta != current_delta) {
+                stage_and_quantize_q(new_delta);
+                __syncthreads();  // publish all warps' q_i8 / q_scale writes
+                refresh_q_scale_regs();
+                current_delta = new_delta;
+            }
+        }
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
             float score[QKNt][4];

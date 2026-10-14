@@ -5,7 +5,7 @@
 #include "targets/qwen3_6/impl/runtime/prompt_lookup.h"
 #include "targets/qwen3_6/impl/runtime/yarn.h"
 #include "ninfer/ops/gdn_replay.h"
-#include "ninfer/ops/gqa_kv_rerotate.h"
+#include "core/paged_kv_delta_layout.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
@@ -245,7 +245,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    // The RoPE table has to be installed before the decoder is constructed: every KV
+    // cache keeps a copy of it so each layer view hands the attention kernels the same
+    // table the forward RoPE used, including the YaRN-scaled table a large capacity
+    // selects. `compute_yarn_config` is a pure host computation over `capacity`, so
+    // hoisting it ahead of the state construction changes nothing else.
+    const auto yarn = compute_yarn_config(capacity);
+    text_rope_inv_freq = yarn.inv_freq;
+    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder,
+                                                         text_rope_inv_freq);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
     }
@@ -327,8 +335,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
-    const auto yarn = compute_yarn_config(capacity);
-    text_rope_inv_freq = yarn.inv_freq;
     ops::set_text_rope_frequencies(yarn.inv_freq.data());
     device.synchronize();
     prepare_graphs();
@@ -485,9 +491,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     // supply one, so a plan without it falls back to ordinary prefix reuse. That keeps generated
     // output identical to the pre-SCR path and lets telemetry report the path actually taken rather
     // than the path the plan requested.
+    // A relocation is expressible when the plan carries spans and the ranges that tile the rest of
+    // the prompt with them; the planner refuses anything else, and this is the last line of defence
+    // that keeps a plan the runtime cannot execute from reaching the staged walk -- or from being
+    // reported as reuse in the summary. Tail mode's ranges are never empty because the tail planner
+    // always prefills the final token; a segmented plan is refused the same way.
     const bool apply_relocation =
         request_plan.reuse == ReusePath::SuffixRelocation &&
-        !request_plan.relocated_spans.empty() && !request_plan.relocated_tail.empty();
+        !request_plan.relocated_spans.empty() && !request_plan.relocated_prefill_ranges.empty();
     const ReusePath applied_reuse =
         request_plan.reuse == ReusePath::SuffixRelocation
             ? (apply_relocation ? ReusePath::SuffixRelocation : ReusePath::AppendAtFrontier)
@@ -787,13 +798,188 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
                 const std::uint32_t prompt_tokens =
                     static_cast<std::uint32_t>(prompt.token_ids.size());
-                const std::vector<std::int32_t> remap = qwen3_6::detail::plan_page_remap(
+                std::vector<std::int32_t> remap = qwen3_6::detail::plan_page_remap(
                     sequence.kv->text.page_ids(), request_plan.relocated_spans, base, prompt_tokens);
+                // The re-pointing path could not express this plan, which is what an off-grid source
+                // looks like: no destination page boundary lines up with a source page boundary, so
+                // a re-pointed page would hold the wrong tokens and the content has to be written
+                // into a fresh page instead. `plan_copied_page_remap` is the same mapping with every
+                // destination page left to acquire, and `relocate_copied_pages` moves the payload.
+                //
+                // Gated rather than automatic, because the copy has to be paid for out of the pool:
+                // the re-pointing path reuses the pages the prompt drops, while this one needs free
+                // pages for destinations whose sources are still mapped. With the flag unset nothing
+                // here runs and this branch's behaviour is what it was before it existed.
+                std::vector<RelocatedCopySpan> copy_spans;
+                if (remap.empty() && qwen3_6::detail::scr_source_shift_enabled()) {
+                    remap = qwen3_6::detail::plan_copied_page_remap(
+                        sequence.kv->text.page_ids(), request_plan.relocated_spans, base, prompt_tokens);
+                    if (!remap.empty()) {
+                        copy_spans.reserve(request_plan.relocated_spans.size());
+                        for (const qwen3_6::detail::RelocatedSpan& span :
+                             request_plan.relocated_spans) {
+                            copy_spans.push_back(RelocatedCopySpan{.source_begin = span.source_begin,
+                                                                   .dest_begin   = span.dest_begin,
+                                                                   .tokens       = span.tokens});
+                        }
+                    }
+                }
                 if (remap.empty()) {
                     throw std::logic_error("suffix relocation has no expressible page remap");
                 }
+                const bool copying = !copy_spans.empty();
                 scr_remap = remap;
-                sequence.kv->text.reassign_pages(remap, device.stream);
+                // The delta plane is parallel to `remap`: one int32 per logical page of the new
+                // prompt, holding that page's RoPE shift or kRopeDeltaNone. It is published in the
+                // same call as the mapping so attention can never read one without the other.
+                //
+                // The arithmetic is `rope_delta_for_span`, not a second copy of `dest - source`.
+                // That helper is host-tested (tests/test_paged_kv_delta_layout.cpp) and lives in a
+                // CUDA-free header; re-deriving the same subtraction here would let the two drift,
+                // and the drift would surface as a silently wrong shift rather than as a failure.
+                std::vector<std::int32_t> deltas(remap.size(), kRopeDeltaNone);
+                if (copying) {
+                    // Destination coordinates, because the plane is indexed by logical page and a
+                    // copied source may start anywhere inside one: a page is inside the span when its
+                    // *destination* range says so. The shift is the same number either way -- it is
+                    // the span's own move -- but a source page index would name the wrong tokens, and
+                    // `rope_delta_for_dest_page` is the containment test on the grid that exists.
+                    for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
+                        for (std::uint32_t offset = 0; offset < span.tokens;
+                             offset += kPagedKVPageSize) {
+                            const std::int32_t dest_page = static_cast<std::int32_t>(
+                                (span.dest_begin + offset) / kPagedKVPageSize);
+                            if (dest_page < 0 ||
+                                static_cast<std::size_t>(dest_page) >= deltas.size()) {
+                                throw std::logic_error(
+                                    "relocated span destination page is outside the mapping");
+                            }
+                            deltas[static_cast<std::size_t>(dest_page)] = rope_delta_for_dest_page(
+                                span.source_begin, span.dest_begin, span.tokens, dest_page);
+                        }
+                    }
+                } else {
+                    for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
+                        // Spans are page-aligned by construction: `diff_prompt_edit` hashes whole
+                        // 64-token blocks and `plan_tail_relocation` trims back to whole blocks. Assert
+                        // it rather than trust it, because a misaligned span would produce a page whose
+                        // delta covers half its content, and that would rotate the wrong half silently.
+                        if (!relocated_span_is_page_aligned(span.source_begin, span.tokens) ||
+                            !relocated_span_is_page_aligned(span.dest_begin, span.tokens)) {
+                            throw std::logic_error("relocated span is not page-aligned");
+                        }
+                        for (std::uint32_t offset = 0; offset < span.tokens;
+                             offset += kPagedKVPageSize) {
+                            const std::int32_t source_page = static_cast<std::int32_t>(
+                                (span.source_begin + offset) / kPagedKVPageSize);
+                            const std::int32_t dest_page = static_cast<std::int32_t>(
+                                (span.dest_begin + offset) / kPagedKVPageSize);
+                            if (dest_page < 0 ||
+                                static_cast<std::size_t>(dest_page) >= deltas.size()) {
+                                throw std::logic_error(
+                                    "relocated span destination page is outside the mapping");
+                            }
+                            deltas[static_cast<std::size_t>(dest_page)] = rope_delta_for_span(
+                                span.source_begin, span.tokens, span.dest_begin, source_page);
+                        }
+                    }
+                }
+                // The speculative backend is a second, independent allocation in its own pool: the MTP
+                // cache holds one KV row per token at the same logical pages as Text, but its physical
+                // pages come from a different pool and are numbered independently. So it is relocated
+                // from the *same spans*, against its own page table, and it carries the *same* delta
+                // plane -- the shift is a property of the token positions, and MTP logical page p
+                // covers exactly the tokens Text logical page p covers. Deriving both mappings before
+                // publishing either keeps the pair from diverging on a refusal: a bundle where Text
+                // moved and MTP did not would have the MTP layer reading pages that hold another
+                // request's KV, and that surfaces as a wrong draft at a plausible rate rather than as
+                // a failure.
+                std::vector<std::int32_t> backend_remap;
+                if (speculative_backend == SpeculativeBackend::Mtp && sequence.kv->backend) {
+                    backend_remap = copying
+                                        ? qwen3_6::detail::plan_copied_page_remap(
+                                              sequence.kv->backend->page_ids(),
+                                              request_plan.relocated_spans, base, prompt_tokens)
+                                        : qwen3_6::detail::plan_page_remap(
+                                              sequence.kv->backend->page_ids(),
+                                              request_plan.relocated_spans, base, prompt_tokens);
+                    if (backend_remap.size() != remap.size()) {
+                        throw std::logic_error(
+                            "the MTP KV relocation does not cover the Text relocation's pages");
+                    }
+                }
+                // Both mappings are derived from the same spans over the same prompt, so they name
+                // the same acquire slots and drop the same surplus, and the pool demand of each is
+                // therefore identical. A refusal from the backend's reassign would land *after* the
+                // Text publish executes, and that is the split the paired derivation exists to
+                // prevent: Text re-pointed at its new positions while MTP still reads pages holding
+                // another request's KV. So price both pools before publishing either, with the
+                // allocation's own arithmetic (`remap_pages_from_pool`). This narrows the window to
+                // a concurrent pool mutation between the check and the publish; closing it needs one
+                // transaction across both allocations, which core does not offer.
+                // The logical pages of the *current* mapping the copies read, which is what the price
+                // has to keep out of the destination slots. Built once so both pools are priced
+                // against the same set: the Text and MTP pools number their pages independently, and
+                // a price computed from one allocation's table would be wrong for the other.
+                //
+                // Derived from the moves the copier will issue rather than re-derived from the
+                // spans. A span reaching `source_begin + tokens` touches the page that holds its last
+                // token, which a loop stepping by whole pages from the source's first page does not
+                // visit when the span does not end on a page boundary -- and an off-grid span never
+                // does. That is a price one page short of the copy's demand, which the allocation's
+                // own check then refuses after the plan was reported as reuse.
+                std::vector<std::uint32_t> relocation_source_pages;
+                if (copying) {
+                    const std::vector<RelocatedPageMove> moves =
+                        plan_relocated_page_moves(copy_spans, remap.size());
+                    relocation_source_pages.reserve(moves.size());
+                    for (const RelocatedPageMove& move : moves) {
+                        relocation_source_pages.push_back(
+                            static_cast<std::uint32_t>(move.source_page));
+                    }
+                    std::sort(relocation_source_pages.begin(), relocation_source_pages.end());
+                    relocation_source_pages.erase(
+                        std::unique(relocation_source_pages.begin(), relocation_source_pages.end()),
+                        relocation_source_pages.end());
+                }
+                const std::uint32_t text_from_pool =
+                    copying ? qwen3_6::detail::shifted_relocation_pages_from_pool(
+                                  sequence.kv->text.page_ids(), remap, relocation_source_pages)
+                            : qwen3_6::detail::remap_pages_from_pool(sequence.kv->text.page_ids(), remap);
+                if (text_from_pool > decoder->text_kv.pool().free_pages()) {
+                    throw std::logic_error(
+                        "suffix relocation cannot afford the pages its Text mapping acquires");
+                }
+                if (!backend_remap.empty()) {
+                    const qwen3_6::PagedKVCache* backend_cache = backend_kv_cache();
+                    const std::uint32_t backend_from_pool =
+                        copying ? qwen3_6::detail::shifted_relocation_pages_from_pool(
+                                      sequence.kv->backend->page_ids(), backend_remap,
+                                      relocation_source_pages)
+                                : qwen3_6::detail::remap_pages_from_pool(
+                                      sequence.kv->backend->page_ids(), backend_remap);
+                    if (backend_cache == nullptr ||
+                        backend_from_pool > backend_cache->pool().free_pages()) {
+                        throw std::logic_error(
+                            "suffix relocation cannot afford the pages its MTP mapping acquires");
+                    }
+                }
+                if (copying) {
+                    // The copies run here, before either mapping is published, and both are published
+                    // in the same pass as before. `relocate_copied_pages` drains the stream before it
+                    // releases the pages it read, so a page handed to the pool is not still being
+                    // copied from when another lane's prefill takes it.
+                    sequence.kv->text.relocate_copied_pages(remap, deltas, copy_spans, device.stream);
+                    if (!backend_remap.empty()) {
+                        sequence.kv->backend->relocate_copied_pages(backend_remap, deltas, copy_spans,
+                                                                    device.stream);
+                    }
+                } else {
+                    sequence.kv->text.reassign_pages(remap, deltas, device.stream);
+                    if (!backend_remap.empty()) {
+                        sequence.kv->backend->reassign_pages(backend_remap, deltas, device.stream);
+                    }
+                }
                 suffix_prefill_ranges.clear();
                 // Diagnostic only: fingerprint the GDN slot across the invalidation below so the
                 // trace says whether the zero ran, not merely that the code path was reached.
@@ -803,40 +989,50 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                         device.stream);
                 }
-                if (!request_plan.relocated_head.empty()) {
-                    suffix_prefill_ranges.push_back(request_plan.relocated_head);
-                    // The linear-attention layers keep one fixed-size recurrent state for the whole
-                    // sequence rather than a per-token cache, so there is nothing to relocate and
-                    // nothing to re-rotate. The state left over from the previous prompt was
-                    // summarised over the *old* token sequence, including the region this edit just
-                    // deleted, so leaving it in place has 48 of 64 layers asserting that content the
-                    // prompt no longer contains. That is a contradiction rather than an
-                    // approximation, and it is what made the relocated run emit degenerate output.
-                    //
-                    // Zeroing is sufficient and needs no snapshot. The head range pushed just above
-                    // is prefilled from this point on, and feeding the new prefix into a zeroed
-                    // recurrence yields exactly the state a cold prefill of that prefix would
-                    // produce, which is what the paper's "snapshot the recurrent state before the
-                    // edit" recovers. The relocated run then contributes nothing to these layers,
-                    // which is the approximation the paper describes and measures as robust.
-                    //
-                    // Only when a head range exists to rebuild from. With an empty head the resident
-                    // prompt is a strict prefix of the new one, nothing was deleted, and the existing
-                    // state is already a valid state for the reused prefix.
+                // Every range the plan reports, in prompt order, with the relocated runs as the gaps
+                // between them. One range is the ordinary contiguous shape; more than one is what
+                // interleaved survivors produce, and the staged walk consumes either without change
+                // because it is driven by this list.
+                for (const qwen3_6::detail::PrefillRange& range :
+                     request_plan.relocated_prefill_ranges) {
+                    suffix_prefill_ranges.push_back(range);
+                }
+                // The linear-attention layers keep one fixed-size recurrent state for the whole
+                // sequence rather than a per-token cache, so there is nothing to relocate and
+                // nothing to re-rotate. The state left over from the previous prompt was
+                // summarised over the *old* token sequence, including the region this edit just
+                // deleted, so leaving it in place has 48 of 64 layers asserting that content the
+                // prompt no longer contains. That is a contradiction rather than an
+                // approximation, and it is what made the relocated run emit degenerate output.
+                //
+                // Zeroing is sufficient and needs no snapshot. The ranges pushed just above are
+                // prefilled from this point on, and feeding the new content into a zeroed
+                // recurrence yields exactly the state a cold prefill of it would produce, which is
+                // what the paper's "snapshot the recurrent state before the edit" recovers. The
+                // relocated run then contributes nothing to these layers, which is the
+                // approximation the paper describes and measures as robust.
+                //
+                // Only when the first relocated destination does not start at the frontier, which
+                // is exactly when a range exists between the frontier and it to rebuild from. When
+                // the first survivor starts at the frontier, the resident prompt is a strict
+                // prefix of the new one, nothing was deleted ahead of the run, and the existing
+                // state is already a valid state for the reused prefix.
+                const bool rebuild_linear_state =
+                    request_plan.relocated_spans.front().dest_begin > base;
+                if (rebuild_linear_state) {
                     decoder->linear_attention.zero_slot(
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                         device.stream);
                 }
                 if (scr_diagnostics_enabled()) {
-                    log_scr_gdn_state("invalidate", !request_plan.relocated_head.empty(),
-                                      request_plan.relocated_head.empty(), gdn_before,
+                    log_scr_gdn_state("invalidate", rebuild_linear_state, !rebuild_linear_state,
+                                      gdn_before,
                                       decoder->linear_attention.fingerprint_slot(
                                           LinearStateSlots::current_state_slot(sequence.lane,
                                                                                max_concurrency),
                                           device.stream),
                                       device.stream);
                 }
-                suffix_prefill_ranges.push_back(request_plan.relocated_tail);
             } else {
                 trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             }
@@ -914,18 +1110,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     }
                 }
             }
-            for (const RelocatedSpan& span : request_plan.relocated_spans) {
-                const auto delta = static_cast<std::int32_t>(
-                    static_cast<std::int64_t>(span.dest_begin) -
-                    static_cast<std::int64_t>(span.source_begin));
-                for (int full_layer = 0; full_layer < TextConfig::full_attention_layers();
-                     ++full_layer) {
-                    ops::gqa_kv_rerotate_run(static_cast<std::int32_t>(span.dest_begin),
-                                             static_cast<std::int32_t>(span.tokens), delta,
-                                             text_rope_inv_freq, relocation_kv.layer_view(full_layer),
-                                             device.stream);
-                }
-            }
+            // Relocation is expressed entirely on the delta plane: the block-table
+            // row was re-pointed and the per-page deltas published by
+            // `sequence.kv->text.reassign_pages(remap, deltas, device.stream)`
+            // above. The attention kernels counter-rotate Q per page from the
+            // delta plane, so the physical K bytes are left exactly as the
+            // original prefill wrote them; there is no in-place K rewrite here.
             if (scr_diagnostics_enabled()) {
                 // Fingerprint the relocated destination pages as the prefill will find them, so the
                 // post-prefill check can prove they survived it. Resolved through the published block
@@ -1360,16 +1550,26 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
     }
     std::array<PagedKVResize, 2> changes{};
     std::size_t count = 0;
-    changes[count++]  = PagedKVResize{
-         .allocation       = &sequence.kv->text,
-         .mapped_pages     = sequence.kv->text.mapped_page_count(),
-         .page_entitlement = text_pages,
+    // An entitlement is a ceiling, and `resize_paged_kv_bundle` refuses to put one below what the
+    // allocation already has mapped. A Suffix Cache Reuse plan legitimately asks for less than the
+    // lane currently holds: the edit *deleted* a region, so the new prompt's entitlement is smaller,
+    // while the pages above the frontier are deliberately left mapped because the surviving run is
+    // remapped out of them. Passing the requested figure straight through made every shrinking edit
+    // fail with "Paged KV resize extents are inconsistent" (a 500) before the remap could run, which
+    // is the one prompt shape the feature exists for. Raising the ceiling to cover what is mapped is
+    // the honest encoding of that state: the relocation returns the surplus through its `reassign`,
+    // and `release_sequence_growth_entitlement` collapses the entitlement onto the mapping at the
+    // end of the request, so nothing is retained past its use.
+    changes[count++] = PagedKVResize{
+        .allocation       = &sequence.kv->text,
+        .mapped_pages     = sequence.kv->text.mapped_page_count(),
+        .page_entitlement = std::max(text_pages, sequence.kv->text.mapped_page_count()),
     };
     if (sequence.kv->backend) {
         changes[count++] = PagedKVResize{
             .allocation       = &*sequence.kv->backend,
             .mapped_pages     = sequence.kv->backend->mapped_page_count(),
-            .page_entitlement = backend_pages,
+            .page_entitlement = std::max(backend_pages, sequence.kv->backend->mapped_page_count()),
         };
     }
     resize_paged_kv_bundle(std::span<PagedKVResize>(changes.data(), count));
@@ -1526,9 +1726,10 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
             << span.dest_begin / kPagedKVPageSize << ".."
             << (span.dest_end() - 1) / kPagedKVPageSize << "}";
     }
-    out << " head{" << request_plan.relocated_head.begin << "," << request_plan.relocated_head.end
-        << "} tail{" << request_plan.relocated_tail.begin << "," << request_plan.relocated_tail.end
-        << "}";
+    out << " ranges=" << request_plan.relocated_prefill_ranges.size();
+    for (const qwen3_6::detail::PrefillRange& range : request_plan.relocated_prefill_ranges) {
+        out << " [" << range.begin << "," << range.end << ")";
+    }
     out << " remap[";
     for (std::size_t i = 0; i < remap.size(); ++i) { out << (i ? "," : "") << remap[i]; }
     out << "]";
@@ -1608,10 +1809,16 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
                 out << (page == first ? "" : ",") << table[page];
             }
         }
-        const std::size_t tail_first = request_plan.relocated_tail.begin / kPagedKVPageSize;
-        out << " tail_row[" << tail_first << "]=";
-        for (std::size_t page = tail_first; page < rows && page < tail_first + 4; ++page) {
-            out << (page == tail_first ? "" : ",") << table[page];
+        // The last range is the one that ends the prompt, so its first page is where the tail of
+        // the block table starts: the entries a vacuous relocation would leave naming stale pages.
+        if (!request_plan.relocated_prefill_ranges.empty()) {
+            const qwen3_6::detail::PrefillRange& last =
+                request_plan.relocated_prefill_ranges.back();
+            const std::size_t tail_first = last.begin / kPagedKVPageSize;
+            out << " tail_row[" << tail_first << "]=";
+            for (std::size_t page = tail_first; page < rows && page < tail_first + 4; ++page) {
+                out << (page == tail_first ? "" : ",") << table[page];
+            }
         }
     }
     std::cerr << out.str() << '\n';

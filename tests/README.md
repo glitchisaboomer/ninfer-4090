@@ -34,6 +34,15 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
+- `test_scr_e2e_shape.py` — the Suffix Cache Reuse end-to-end script's relocation fixtures and
+  plan-shape assertions: the interleaved shape's two separated survivors, the tail/segmented
+  selection difference, the span cap, and the parser and tiling checks the `--scr-diag` plan is
+  read back through. Host-only, with a stand-in tokenizer, so it runs anywhere;
+- `ops/test_scr_copied_relocation.cpp` — the copied relocation's device oracle: an off-grid source
+  relocated by payload copy inside a real `PagedKVPool`, held bit-for-bit against the pages it was
+  copied from, with the published mapping, delta plane, pool accounting, the tight-pool aliasing
+  configuration, the never-half-publish refusals, and attention equivalence through the public entry
+  points. Device-only, so CTest skips it without a GPU;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
@@ -97,8 +106,12 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
-  tests/test_bench_matrix.py tests/test_serve_corpus.py
+  tests/test_bench_matrix.py tests/test_serve_corpus.py tests/test_scr_e2e_shape.py
 ```
+
+`tests/test_scr_e2e_shape.py` imports the fixture builders out of `tools/scr_e2e_check.py`, so it
+needs the repository root on `sys.path` (pytest inserts it when the suite is invoked from the repo
+root, as above). It needs no server, no GPU, and no artifact.
 
 The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
 `out/qwen3_6_27b.ninfer`. They report a pytest skip when neither path provides the real

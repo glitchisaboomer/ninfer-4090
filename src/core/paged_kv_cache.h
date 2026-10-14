@@ -6,6 +6,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -35,6 +36,8 @@ struct PagedKVLayerView {
     bool packed_k             = false;
     bool e8_lattice           = false;
     bool e8_root              = false;
+    Tensor rope_deltas;          // [logical_pages] int32, or empty (data==nullptr)
+    std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
 };
 
 /**
@@ -50,6 +53,8 @@ struct PagedKVBatchLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_tables;
+    Tensor rope_deltas;          // [table_rows, logical_pages] int32, or empty
+    std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
@@ -129,6 +134,11 @@ public:
     // existing route. Reading this is what makes a quantized K plane relocatable without rewriting it.
     [[nodiscard]] const Tensor& rope_deltas() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
+    [[nodiscard]] Tensor rope_delta_row(std::int32_t row) const;
+    // Given a single-row block-table slice (as returned by `block_table_row`), return the
+    // matching rope-delta row. Pointer-range matching: the block_table tensor's data pointer
+    // must lie inside `block_tables_`. Throws if it does not.
+    [[nodiscard]] Tensor rope_delta_row_for_block_table(Tensor block_table) const;
 
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
@@ -231,7 +241,54 @@ public:
     // pages without copying KV and without a second allocator.
     //
     // The republished block-table row is updated when the allocation is bound.
-    void reassign_pages(std::span<const std::int32_t> mapping, cudaStream_t stream = nullptr);
+    // Replaces the whole logical-to-physical mapping with `mapping`, which describes exactly the
+    // pages this allocation should map afterwards in logical order. Each entry is either a page the
+    // allocation already owns or kPagedKVAquirePage for a page acquired from the pool. Owned pages
+    // named more than once, or not owned at all, are rejected. Owned pages the mapping does not name
+    // are returned to the pool, except that as many of them as there are acquire slots are reused as
+    // the new physical pages instead, so a remap that shrinks one region while growing another does
+    // not need free pool pages for the growth.
+    //
+    // `deltas` is parallel to `mapping`: `deltas[i]` is the RoPE delta for logical page `i`, or
+    // `kRopeDeltaNone` (zero) for a page that was not relocated. The two planes are stored together
+    // and published together, so a reader can never observe the block table without the delta plane
+    // that describes it.
+    void reassign_pages(std::span<const std::int32_t> mapping,
+                        std::span<const std::int32_t> deltas,
+                        cudaStream_t stream);
+
+    // Temporary shim: the pre-Step-3 caller in program_impl.h does not yet supply deltas. Fills
+    // all-zero deltas and delegates to the overload above. Step 3 removes this overload together with
+    // that call site. Do not use this from new code.
+    void reassign_pages(std::span<const std::int32_t> mapping,
+                        cudaStream_t stream = nullptr);
+
+    // Relocate runs whose *source* is not page aligned, by copying their payload instead of
+    // re-pointing the destination page at the page that already holds it.
+    //
+    // With an off-grid source no destination page boundary lines up with a source page boundary, so a
+    // re-pointed page would hold the wrong tokens and `plan_page_remap` correctly refuses to build
+    // such a mapping. `mapping` here is the one `plan_copied_page_remap` builds instead: the copied
+    // destinations are acquire slots and the sources are simply not named, which is what drops them.
+    //
+    // Owning the pool is why this lives on the allocation rather than beside the planner:
+    //
+    //   * The pages the copies read must not become destinations. `reassign_pages` fills acquire slots
+    //     from the pages the mapping drops first, so the sources have to be kept out of that
+    //     substitution -- they are copied *from* while they are being handed back otherwise, and a
+    //     device copy of overlapping ranges is undefined. `shifted_relocation_pages_from_pool` is the
+    //     matching price, and the planner refuses a plan the pool cannot afford.
+    //   * The sources stay mapped until the copies have run, and the stream is drained before they are
+    //     released, because the pool is shared: without the drain another lane's prefill can be handed
+    //     a page this allocation is still reading, on its own stream and with no ordering between
+    //     them. The drain costs the copy, which is bandwidth-bound and small next to the prefill it
+    //     replaces; an event handoff would remove it and is the obvious follow-up.
+    //
+    // Throws `std::bad_alloc` when the pool cannot supply the pages the copies need, before anything
+    // is published, so a caller that priced the relocation first can fall back safely.
+    void relocate_copied_pages(std::span<const std::int32_t> mapping,
+                               std::span<const std::int32_t> deltas,
+                               std::span<const RelocatedCopySpan> spans, cudaStream_t stream);
 
     void bind_row(std::int32_t row, cudaStream_t stream = nullptr);
     void publish_mapping(cudaStream_t stream = nullptr) const;
@@ -250,14 +307,14 @@ private:
 
     PagedKVPool* pool_ = nullptr;
     std::vector<std::int32_t> page_ids_;
+    std::vector<std::int32_t> rope_deltas_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
 };
 
-// Sentinel for one logical page in PagedKVAllocation::reassign_pages that must be filled with a
-// physical page acquired from the pool. Every real physical page id is non-negative, so -1 cannot
-// collide with an owned page.
-inline constexpr std::int32_t kPagedKVAquirePage = -1;
+// `kPagedKVAquirePage` and `kPagedKVPageSize`, both named by the page arithmetic in
+// `core/paged_kv_delta_layout.h`, are declared there: the layout header cannot include this one, and
+// the two must not both define them. This header includes it, so every consumer here still sees both.
 
 struct PagedKVReservation {
     PagedKVPool* pool              = nullptr;

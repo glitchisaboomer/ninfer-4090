@@ -490,10 +490,40 @@ this section has to be rewritten. The switch is off by default so the shipped sc
 it prints one `[q5] linear_add residual: 1 K-split` line when it is on, so a log cannot be misread about
 which schedule produced it.
 
-**Not verified here.** The path from that switch to a fixed engine: it needs a build, a GPU run, and the
-benchmark that decides between options 1 and 2. The numerical oracle for the op is likewise unrun — a
-deterministic schedule still has to match `LinearAdd` against its FP32 reference, and that is the check
-that would catch a wrong merge order in option 2.
+**Confirmed on hardware (2026-10-11).** `NINFER_Q5_RESIDUAL_SPLITS=1` on the k2 fixture: three prefills
+of one prompt returned bit-identical logprobs (`repeat: p1=p2=p3`, `d12=d23=d13=0`), and every trace
+chunk — including the 2-token tail that had diverged at all 64 layers — read `divergent_layers=0`.
+The diagnosis is settled: this epilogue is the sole cause of the prefill divergence, and the switch is
+a working fix. What that run did not settle is the default: halving the K-CTAs at `t <= 16` still
+needs its benchmark (option 1 against option 2), and the op's numerical oracle is still unrun — a
+deterministic schedule has to match `LinearAdd` against its FP32 reference, which is the check that
+would catch a wrong merge order in option 2.
+
+## The second source: w8 split-K atomics in the MTP decode path
+
+The q5 band was the whole prefill story and the flag proves it. It is not the whole engine: an MTP
+decode round is nondeterministic through a different op.
+
+`src/ops/linear/w8/w8_small_t_mma.cuh:316-317` accumulates with `atomicAdd` on `__nv_bfloat16`
+under `KSplits > 1` — the same shape as the q5 epilogue, two CTAs adding into one bf16 output element
+with nothing fixing the order. The audit above already found it and set it aside with the right
+reason: at the time, speculation was off in the measured configuration, so it could not have caused
+the 661-token divergence. It is nonetheless live on the paths speculation reaches —
+`w8_small_t.cu` registers its split-K launchers for the MTP input, attention and attention-output
+geometries only (`w8_config.h:73-80`), so with `--spec mtp` every decode round's projections run
+through a nondeterministic write.
+
+The 2026-10-11 MTP quality run is the evidence. With the q5 flag set, prefills were bit-identical,
+yet the control phase — two servers, identical flags, both cold, relocation off — chose a different
+token than itself on four of six prompts, and two of its flips sat at an exact 0.000000-nat margin,
+which is an order-dependent write's fingerprint rather than a prompted decision. Plain decode
+registers no split-K launcher on any geometry it runs, which is why its control was token-clean
+before the flag and should be bit-identical with it.
+
+The fix shape is q5's three options; unlike q5's, this one is decode-side and MTP-only, so its cost
+is per-round rather than per-chunk and it stays invisible until speculation is switched on. It costs
+reproducibility, not correctness: drafts are verified against the base model, so a re-ordered
+partial sum can only change the pacing, never a delivered token.
 
 ## Caveats on everything above
 

@@ -347,6 +347,11 @@ private:
         std::uint32_t service_work_reusable_tokens    = 0;
         std::uint32_t service_work_relocated_tokens   = 0;
         std::uint32_t service_work_output_tokens      = 0;
+        // Prompt tokens this request's prefill actually computed, summed over its steps. The plan's
+        // relocated tokens are served from resident KV and contribute nothing here; a relocation
+        // that re-prefilled its run anyway would show up as the full prompt, which is the
+        // observation that makes such a regression visible at all.
+        std::uint32_t computed_prefill_tokens         = 0;
         std::uint64_t backfill_epoch         = 0;
         BackfillClass backfill_class         = BackfillClass::None;
 
@@ -480,6 +485,7 @@ private:
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
         result.timings.prepare_seconds = request->prepare_seconds;
+        result.computed_prefill_tokens = request->computed_prefill_tokens;
         if (request->begin) {
             result.reused_prompt_tokens    = request->begin->reused_prompt_tokens;
             result.relocated_prompt_tokens = request->begin->relocated_prompt_tokens;
@@ -710,6 +716,7 @@ private:
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
+        request->computed_prefill_tokens += step.processed_prompt_tokens;
         consume_service_work(request, 1, ServiceWorkConsumer::Prefill);
         if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (cancel_at_boundary) {
@@ -1143,9 +1150,15 @@ private:
             throw std::logic_error("decode batch returned an invalid ragged layout");
         }
         // Logprobs are optional, but when present they must cover exactly the licensed tokens, or
-        // the two delivered vectors would describe different tokens.
+        // the two delivered vectors would describe different tokens. Margins are checked the same
+        // way: a margins array of a different length would desynchronise the per-token record from
+        // its tokens, and the only place that mismatch was ever caught was the log parser, four
+        // phases into a quality run.
         if (!round.logprobs.empty() && round.logprobs.size() != round.tokens.size()) {
             throw std::logic_error("decode batch logprobs do not match its licensed tokens");
+        }
+        if (!round.margins.empty() && round.margins.size() != round.tokens.size()) {
+            throw std::logic_error("decode batch margins do not match its licensed tokens");
         }
 
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
@@ -1195,9 +1208,6 @@ private:
                     request->generated_logprobs.insert(
                         request->generated_logprobs.end(), accepted[row],
                         std::numeric_limits<float>::quiet_NaN());
-                    request->generated_margins.insert(
-                        request->generated_margins.end(), accepted[row],
-                        std::numeric_limits<float>::quiet_NaN());
                 } else {
                     const auto row_logprobs =
                         round.logprobs.subspan(row * round.row_stride,
@@ -1205,6 +1215,13 @@ private:
                     request->generated_logprobs.insert(request->generated_logprobs.end(),
                                                        row_logprobs.begin(), row_logprobs.end());
                 }
+                // Margins are appended here and only here. An earlier revision also appended them
+                // inside the logprobs-empty branch above, which doubled the array whenever a round
+                // carried no logprobs -- exactly the MTP/DFlash shape, whose licensed tokens emit no
+                // logprob. The request log then held 2N-1 margins for N tokens, the quality harness
+                // refused to parse it, and an MTP quality run died after all its phases on a length
+                // mismatch that read like a crash. The two blocks stay separate on purpose: a round
+                // may measure a logprob and no margin, or the reverse.
                 if (round.margins.empty()) {
                     request->generated_margins.insert(request->generated_margins.end(), accepted[row],
                                                       std::numeric_limits<float>::quiet_NaN());

@@ -99,13 +99,16 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-prefix-reuse           Disable KV prefix cache reuse across requests (prefix reuse enabled by default)\n"
            "  --scr                       Enable Suffix Cache Reuse: after an in-the-middle context\n"
            "                              edit, reuse resident KV for the surviving suffix instead\n"
-           "                              of re-prefilling it (experimental; off by default)\n"
+           "                              of re-prefilling it (experimental; off by default; applies\n"
+           "                              with the plain decode backend and with --spec mtp, not\n"
+           "                              with --spec dflash)\n"
            "  --scr-max-spans <N>         Maximum surviving spans relocated per edit (default: " +
                std::to_string(kDefaultSuffixReuseMaxSpans) +
                "; 0 keeps --scr set and\n"
                "                              relocates nothing, for a configuration control)\n"
            "  --scr-mode <tail|segmented> Relocation shape to plan for: 'tail' uses one contiguous\n"
-           "                              surviving run, 'segmented' the general case (default: tail)\n"
+           "                              surviving run, 'segmented' relocates every interleaved\n"
+           "                              survivor (default: tail)\n"
            "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
            "Persistent Prompt Cache (DirectStorage DMA):\n"
            "  --disk-cache / --prompt-cache     Enable persistent multi-turn prompt caching to disk via DirectStorage DMA\n"

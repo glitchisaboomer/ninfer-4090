@@ -18,7 +18,7 @@ falsified an earlier draft of this document.
 | `RerotateFreq` is a by-value 32-float struct | **verified** (`include/ninfer/ops/gqa_kv_rerotate.h`) |
 | `RelocatedSpan` carries the old and new positions | **verified** — fields are `source_begin`, `dest_begin`, `tokens` (`prompt_edit.h:87-93`). An earlier draft of this doc wrote `src_begin`, which does not exist |
 | `reassign_pages` rejects in four ways, all before any mutation | **verified** (`paged_kv_cache.cu:547-573`: invalid allocation, empty mapping, exceeds entitlement, names an unowned page) |
-| SCR is gated to `SpeculativeBackend::None` | **verified** (`request_plan_impl.h:259`) |
+| SCR is gated to `SpeculativeBackend::None` | **was verified** (`request_plan_impl.h:259`), and is no longer true: the gate now admits `SpeculativeBackend::Mtp` as well, because the runtime relocates the backend allocation from the same spans (see Step 3). DFlash remains gated |
 | YaRN only rescales above 1048576 | **verified** (`yarn.h:16-26`) |
 | The three tests this plan extends all exist | **verified** |
 | Delta-plane memory cost is negligible | **verified by arithmetic** — see §5, 0.5–256 KiB |
@@ -28,10 +28,12 @@ falsified an earlier draft of this document.
 
 ## 0. Why this exists
 
-`SCR_RELOCATION_PATHS.md` currently limits SCR to an uncompressed BF16 Text K plane, because the one
-relocation primitive it has, `ops::gqa_kv_rerotate`, requires one: `validate_text_k_cache`
-(`src/ops/wrapper/gqa_kv_rerotate.cpp:33`) rejects every quantized layout, and the request planner has
-no matching guard, so `--kv-dtype rk4v4-e8 --scr` *throws* instead of degrading.
+*Motivation, as of the start of this work. `SCR_RELOCATION_PATHS.md` then limited SCR to an
+uncompressed BF16 Text K plane, because the one relocation primitive it had, `ops::gqa_kv_rerotate`,
+required one: `validate_text_k_cache` (`src/ops/wrapper/gqa_kv_rerotate.cpp:33`) rejected every
+quantized layout, and the request planner had no matching guard, so `--kv-dtype rk4v4-e8 --scr`
+threw instead of degrading. All of that is now gone from the code — see Step 3's **Landed** note and
+Step 5's audit status — and this section is kept as the record of why the change was made.*
 
 The consequence, from that document's own table, is that SCR is available only where it matters least:
 
@@ -300,6 +302,27 @@ plumbing for it).
 3. Remove the BF16-only gate: `validate_text_k_cache` and add the planner-side guard the handoff notes
    is missing (`request_plan_impl.h:254` does not check the KV dtype), so a quantized `--kv-dtype`
    plans a relocation it can honour instead of one that throws.
+   **Landed.** `validate_text_k_cache` and `ops::gqa_kv_rerotate` are gone, the runtime writes the
+   delta plane per span (`program_impl.h`, `rope_delta_for_span`) with no dtype condition, and
+   `request_plan_impl.h`'s `delta_path_supports_dtype` admits `BF16` and `I8` — which is every
+   quantized layout. `tools/scr_e2e_check.py` carried the stale BF16-only claim and now accepts
+   `bf16 / int8 / rk8v4 / rk4v4 / rk4v4-e8` and refuses `rk2v4-e8`; the per-dtype runs are owed.
+
+   **Also landed — the second allocation (MTP).** Text is not the only KV a served run reads. An MTP
+   run keeps a second allocation in its own pool (`sequence.kv->backend`, `decoder->mtp_cache()`),
+   whose logical pages cover the same tokens as Text's while its physical pages are numbered
+   independently. `start_prefill_lane` now derives a second `plan_page_remap` from the *same* spans,
+   against that allocation's own page table, and publishes the **same** `deltas` vector — the shift
+   is a function of the token positions, and MTP logical page `p` covers exactly the tokens Text
+   logical page `p` covers. The planner admits `SpeculativeBackend::Mtp` and asserts the staged MTP
+   prefill that extends the relocated prefix over the two prefilled ranges. **Nothing in `src/ops/`
+   changed**: MTP attention is the same public `ops::gqa_attention` entry the A1 case already covers,
+   reached through `batch_layer_view`/`layer_view`, and both attach the pool's own delta row
+   (`decoder_state.cpp:145,161`). DFlash stays gated (its context frontier is carried separately and
+   its cache is filled through `kv_cache_append_prefix`). **Owed:** the two-block relocation test for
+   the second allocation (`tests/targets/qwen3_6/test_prompt_edit.cpp`,
+   `test_plan_page_remap_second_allocation` checks the mapping half on the host; the page-level half
+   and the draft-acceptance comparison need hardware).
 
 **Verify:** the existing `tests/ops/test_scr_relocation_integration.cpp` routes writes through
 `gqa_kv_append` and reads through the real attention kernels; run it once per KV dtype, not just BF16.
@@ -329,6 +352,16 @@ not go looking for an interaction that does not exist.
 **Verify:** the oracle test in §3, plus `compute-sanitizer --tool racecheck` and `--tool initcheck`,
 because the delta plane is a new read that most readers do not yet know about.
 
+**Phase 4a Completion Gate (Must pass before starting 4b):**
+1. **Spill Check:** Run `ptxas -v` on `gqa_attention_prefill_bf16_kernel`. The nested `cp.async` Q reload inside the phase loop must not push register pressure past the spilling threshold. If it spills, the common case (no relocation) regresses to pay for the rare case.
+2. **Regression Gate:** Run `test_scr_relocation_integration`. It must pass unchanged. This proves the `nullptr` delta path is perfectly neutral and introduces no silent data corruption.
+
+**Phase 4b Execution Sequence:**
+1. Write `test_gqa_kv_page_delta.cpp` with the strict non-zero delta scenario described in §3.
+2. Run it against the current unwired (`nullptr`) launchers. **It must fail with massive L2 error.**
+3. Wire the runtime delta plane (e.g., `cache.rope_deltas().data`) into the launchers in `gqa_attention_decode.cu` and `gqa_attention_prefill.cu`.
+4. Run the oracle test again. **It must now pass.**
+
 ### Step 5 — readers that are not decode attention
 
 Anything that reads the K plane must honour the delta or it will produce silently wrong scores with no
@@ -336,13 +369,32 @@ type error to catch it:
 
 - prefill attention (`gqa_attention_prefill_bf16.cuh`, `gqa_attention_prefill_i8.cuh`
   `gqa_attention_prefill_common.cuh`);
-- the MTP and DFlash attention paths, if a relocated sequence ever reaches them — note SCR is gated to
-  `SpeculativeBackend::None` (`request_plan_impl.h:257`), but that gate is a condition, not a
-  guarantee;
+- the MTP attention path, which a relocated sequence now reaches: it is the same public
+  `ops::gqa_attention` entry the A1 case covers, and its views attach the pool's own delta row, so it
+  counter-rotates per key page exactly like Text. What no test here covers is the *pairing* — that the
+  Text and backend allocations were relocated from the same spans;
+- the DFlash attention path, still unreachable: SCR requires `SpeculativeBackend::None` or `Mtp`;
 - `prepare_ragged_prefix` / `kv_cache_append_prefix`, which read previously written K;
 - any diagnostic that fingerprints the K plane — reusing the existing `[scr-diag]` page fingerprints is
   the right instinct, but they must be taken *after* the operations that consume the pages, which is
-  the lesson `SCR_PHASE_5_5_HANDOFF.md` §4 records.
+  the lesson `docs/maintainer/op-development.md` §6.4 records.
+
+**Audit status.** Every reader above was checked against the code rather than assumed:
+
+| reader | state |
+|---|---|
+| decode attention, i8 and bf16 | honours the delta, and the delta anchor equals the reference anchor to 1e-5 |
+| prefill attention, i8 and bf16 | honours it. The A1 oracle proves it rather than inspecting it: there the relocated page carries `delta = -384` while the *query* page carries none, so the check can only pass if the delta is read per key page |
+| MTP attention | reachable since the second-allocation relocation landed, and honours the delta for free (same Op, delta row attached by the view). **No cell in the ladder runs MTP with SCR**, so this is reasoned from the call shape, not measured |
+| DFlash attention | unreachable — the planner requires `SpeculativeBackend::None` or `SpeculativeBackend::Mtp` (`request_plan_impl.h`) |
+| `prepare_ragged_prefix`, `kv_cache_append_prefix` | DFlash-only call sites (`dflash_impl.h`), so unreachable with a relocated page for the same reason |
+| `[scr-diag]` fingerprints | present; the ordering rule above still needs confirming against the emit sites |
+
+So the wiring this step asks for is done by the earlier steps, and the speculative-backend gate is no
+longer the mechanism that keeps a relocated sequence away from a second cache: the runtime derives both
+mappings from the same spans and throws if the second cannot be expressed, rather than relying on the
+planner to have excluded it. What is left is hardening — the fingerprints' ordering — and measurement:
+the MTP e2e comparison below.
 
 ---
 
@@ -361,6 +413,9 @@ control in which skipping the re-rotation registers 2.3e-1 relative L2 versus 7.
    direct prefill at the destination. Negative control: delta ignored by the kernel must show a large
    error, or the test is blind. Run it for **every dtype**, with `rk4v4-e8` first — that is the
    configuration this change exists for and the one nobody has ever executed.
+
+**The Phase 4b Oracle Test Trap:**
+Because the unwired Phase 4a path passes `nullptr` for the delta plane, and `nullptr` is the mathematically correct behavior for a *non-relocated* sequence, a naive oracle test might accidentally pass against the unwired kernel. The test scenario *must* explicitly construct a sequence that requires a non-zero delta on at least one page (e.g., a relocated span). The test must assert that the L2 error against the FP64 oracle exceeds a threshold that a working null path cannot reach. If the test does not fail loudly and unambiguously on the unwired `nullptr` path, the harness is blind and will silently accept a broken wiring in Phase 4b.
 2. **Delta-plane lifecycle test.** Acquire a row, relocate, release, re-acquire, and assert the row's
    deltas are zero before anything writes them. This is the recycling trap, and it is the failure mode
    most likely to ship silently.

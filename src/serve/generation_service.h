@@ -62,6 +62,11 @@ struct GenerationOutcome {
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;
     std::size_t streamed_content_bytes = 0;
+    // Prompt tokens the prefill actually computed for this request, from the engine's chunk
+    // accounting. Not derived from `prompt_tokens` minus the cache hit: that proxy ignores
+    // relocation, so an in-the-middle edit reports its whole prompt as computed even though the
+    // relocated run was served from resident KV.
+    int computed_prefill_tokens        = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
 };

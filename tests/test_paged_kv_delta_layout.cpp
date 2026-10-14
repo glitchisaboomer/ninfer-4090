@@ -18,11 +18,14 @@
 
 #include "core/paged_kv_delta_layout.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
-#include <vector>
 #include <limits>
+#include <span>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -37,6 +40,12 @@ using ninfer::rope_delta_for_span;
 using ninfer::rope_delta_layout_is_supported;
 using ninfer::rope_delta_logical_pages;
 using ninfer::rope_delta_plane_bytes;
+using ninfer::kPagedKVAquirePage;
+using ninfer::plan_relocated_page_moves;
+using ninfer::plan_relocated_page_substitution;
+using ninfer::RelocatedCopySpan;
+using ninfer::RelocatedPageMove;
+using ninfer::RelocatedPageSubstitution;
 
 int g_failures = 0;
 
@@ -301,6 +310,321 @@ void test_row_span_tiles_the_plane() {
     static_assert(rope_delta_row_span_i32(10, 2, 1).offset == 40);
 }
 
+// A copied relocation moves a run whose *source* need not be page aligned into a destination that is.
+// Two things about the decomposition can be wrong in ways a GPU run would report as "the relocated
+// pages hold the wrong tokens" long after the fact: the number of moves per destination page, and the
+// split of a destination page across the source page boundary. Both are checked here by rebuilding the
+// source token each destination token came from and comparing it to the arithmetic that defines the
+// move, over every offset instead of a hand-picked pair.
+void test_copied_span_moves() {
+    std::printf("copied spans decompose into whole destination pages, split at source page ends\n");
+
+    const auto moves_of = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens,
+                             std::size_t pages) {
+        const RelocatedCopySpan span{source, dest, tokens};
+        return plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1), pages);
+    };
+
+    // An aligned source is one move per destination page: the 64 tokens fit inside one source page.
+    {
+        const std::vector<RelocatedPageMove> moves = moves_of(448, 320, 192, 16);
+        check(moves.size() == 3, "three aligned destination pages are three moves");
+        for (std::size_t index = 0; index < moves.size() && index < 3; ++index) {
+            check(moves[index].dest_page == static_cast<std::int32_t>(5 + index),
+                  "the aligned destination pages ascend from the first");
+            check(moves[index].source_page == static_cast<std::int32_t>(7 + index),
+                  "the aligned source pages ascend with them");
+            check(moves[index].dest_token == 0 && moves[index].source_token == 0,
+                  "an aligned move starts at both page origins");
+            check(moves[index].tokens == 64, "an aligned move carries a whole page");
+        }
+    }
+
+    // Off the grid: the source starts 17 tokens into its page, so every destination page is split --
+    // the head of it in one source page and the tail in the next.
+    {
+        const std::vector<RelocatedPageMove> moves = moves_of(465, 320, 128, 16);
+        check(moves.size() == 4, "two off-grid destination pages are four moves");
+        if (moves.size() == 4) {
+            check(moves[0].dest_page == 5 && moves[0].dest_token == 0 && moves[0].tokens == 47,
+                  "the first destination page opens with the 47 tokens left in its source page");
+            check(moves[1].dest_page == 5 && moves[1].dest_token == 47 && moves[1].tokens == 17,
+                  "and closes with the 17 from the next source page");
+            check(moves[2].dest_page == 6 && moves[2].dest_token == 0 && moves[2].tokens == 47,
+                  "the second destination page is split the same way");
+            check(moves[3].dest_page == 6 && moves[3].dest_token == 47 && moves[3].tokens == 17,
+                  "including its tail");
+            check(moves[1].source_page == moves[0].source_page + 1 && moves[1].source_token == 0,
+                  "the tail comes from the start of the next source page");
+        }
+    }
+
+    // The property, over every source offset in a page and lengths from one page to four: each
+    // destination token in the run is carried exactly once, from the source token that the run itself
+    // says it came from. Nothing here re-states the decomposition; it rebuilds the run from the moves
+    // and compares against `source_begin + (dest - dest_begin)`.
+    for (std::uint32_t offset = 0; offset < kPagedKVPageSize; ++offset) {
+        for (std::uint32_t tokens : {64u, 128u, 192u, 256u}) {
+            for (std::uint32_t dest_begin : {0u, 64u, 704u}) {
+                const std::uint32_t source_begin = 448u + offset;
+                const std::uint32_t dest_end     = dest_begin + tokens;
+                const std::vector<RelocatedPageMove> moves =
+                    moves_of(source_begin, dest_begin, tokens, 32);
+
+                std::vector<bool> carried(dest_end, false);
+                for (const RelocatedPageMove& move : moves) {
+                    for (std::uint32_t i = 0; i < move.tokens; ++i) {
+                        const std::uint32_t dest_token = move.dest_token + i;
+                        const std::uint32_t source_token = move.source_token + i;
+                        const std::size_t dest_position =
+                            static_cast<std::size_t>(move.dest_page) *
+                                static_cast<std::size_t>(kPagedKVPageSize) +
+                            dest_token;
+                        const std::size_t source_position =
+                            static_cast<std::size_t>(move.source_page) *
+                                static_cast<std::size_t>(kPagedKVPageSize) +
+                            source_token;
+                        if (dest_position < dest_begin || dest_position >= dest_end) {
+                            std::printf("  FAIL: offset=%u tokens=%u dest_begin=%u moves outside the "
+                                        "destination run (%zu)\n",
+                                        offset, tokens, dest_begin, dest_position);
+                            ++g_failures;
+                            continue;
+                        }
+                        if (source_position != source_begin + (dest_position - dest_begin)) {
+                            std::printf("  FAIL: offset=%u tokens=%u dest_begin=%u dest token %zu "
+                                        "came from %zu, not %zu\n",
+                                        offset, tokens, dest_begin, dest_position, source_position,
+                                        source_begin + (dest_position - dest_begin));
+                            ++g_failures;
+                        }
+                        if (carried[dest_position]) {
+                            std::printf("  FAIL: offset=%u tokens=%u dest_begin=%u dest token %zu "
+                                        "carried twice\n",
+                                        offset, tokens, dest_begin, dest_position);
+                            ++g_failures;
+                        }
+                        carried[dest_position] = true;
+                    }
+                }
+                for (std::uint32_t position = dest_begin; position < dest_end; ++position) {
+                    if (!carried[position]) {
+                        std::printf("  FAIL: offset=%u tokens=%u dest_begin=%u dest token %u "
+                                    "carried by no move\n",
+                                    offset, tokens, dest_begin, position);
+                        ++g_failures;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Rejections. Each of these is a span the copier must not act on: a partial destination page would
+    // need a delta for a page it only half owns, and either end reaching past the mapping would read or
+    // write a page that is not in it.
+    const auto rejected = [&](const char* what, std::uint32_t source, std::uint32_t dest,
+                              std::uint32_t tokens, std::size_t pages) {
+        const RelocatedCopySpan span{source, dest, tokens};
+        try {
+            (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1), pages);
+            std::printf("  FAIL: accepted %s\n", what);
+            ++g_failures;
+        } catch (const std::invalid_argument&) {
+        }
+    };
+    rejected("a run starting inside a destination page", 448, 1, 64, 16);
+    rejected("a run ending inside a destination page", 448, 0, 100, 16);
+    rejected("an empty run", 448, 0, 0, 16);
+    rejected("a run past the destination mapping", 448, 1024, 64, 16);
+    rejected("a source past the current mapping", 1024, 0, 64, 16);
+    rejected("a source that runs off the end of the mapping", 960, 0, 128, 16);
+
+    // A relocation of nothing is not a relocation: the caller has to learn that rather than publish an
+    // empty move list as success.
+    try {
+        (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(), 16);
+        std::printf("  FAIL: accepted a relocation with no spans\n");
+        ++g_failures;
+    } catch (const std::invalid_argument&) {
+    }
+}
+
+// The ownership half: a copied relocation must never hand a page it is reading straight back as the
+// destination it is writing, and must not drop a page before the copy that reads it has run. The first
+// is an overlapping device copy, whose behaviour the CUDA runtime does not define; the second hands a
+// page to another lane's prefill while it is still being read.
+void test_relocated_page_substitution() {
+    std::printf("a copied relocation never reuses a page it is reading\n");
+
+    // Two pages dropped, both read: neither can be a destination, so both come from the pool and both
+    // are held until the copies have run.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        const std::vector<std::int32_t> protected_pages{12, 13};
+        const RelocatedPageSubstitution out =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        check(out.final_ids.size() == 4 && out.final_ids[0] == 10 && out.final_ids[1] == 11,
+              "the pages the mapping keeps are kept");
+        check(out.final_ids[2] == kPagedKVAquirePage && out.final_ids[3] == kPagedKVAquirePage,
+              "a page the copies read is not proposed as a destination");
+        check(out.from_pool == 2, "both destinations have to come from the pool");
+        check(out.held_for_copy.size() == 2, "both sources are held until the copies have run");
+    }
+
+    // The same shape with only one page read: the other dropped page is free to be a destination, and
+    // it is exactly one, so the pool is asked for one page rather than two.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        const std::vector<std::int32_t> protected_pages{12};
+        const RelocatedPageSubstitution out =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        check(out.from_pool == 1, "one unread dropped page pays for one of the two destinations");
+        check(out.final_ids[2] == 13, "the unread dropped page becomes a destination");
+        check(out.final_ids[3] == kPagedKVAquirePage, "the remaining one comes from the pool");
+        check(out.held_for_copy.size() == 1 && out.held_for_copy[0] == 12,
+              "and only the page that is read is held");
+    }
+
+    // Nothing read and exactly as many dropped pages as destinations: the pool is never asked.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        const RelocatedPageSubstitution out = plan_relocated_page_substitution(current, mapping, {});
+        check(out.from_pool == 0, "dropped pages the copies do not read pay for the destinations");
+        check(out.held_for_copy.empty(), "and nothing is left to release late");
+        check(out.final_ids[2] == 12 && out.final_ids[3] == 13,
+              "the reuse is the pages the mapping dropped, in ascending order");
+    }
+
+    // A page the mapping still names stays mapped, so reading it is not a reason to hold it: the copy
+    // reads it where it already is, and the pool never has to supply a replacement for it either.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13};
+        const std::vector<std::int32_t> mapping{10, 11, 12, kPagedKVAquirePage};
+        const std::vector<std::int32_t> protected_pages{12, 13};
+        const RelocatedPageSubstitution out =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        check(out.from_pool == 1, "the kept source page is not a destination and not a saving");
+        check(out.held_for_copy.size() == 1 && out.held_for_copy[0] == 13,
+              "the dropped source page is held for the copy");
+        check(out.final_ids[2] == 12, "the kept source page is still mapped");
+    }
+
+    // Determinism, because the pages chosen become the published block table: the same inputs must give
+    // the same physical pages, which an iteration over an unordered container would not guarantee.
+    {
+        const std::vector<std::int32_t> current{40, 7, 19, 3, 12, 25};
+        const std::vector<std::int32_t> mapping{40, kPagedKVAquirePage, 19, 3, kPagedKVAquirePage,
+                                                kPagedKVAquirePage};
+        const std::vector<std::int32_t> protected_pages{7};
+        const RelocatedPageSubstitution first =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        for (int repeat = 0; repeat < 8; ++repeat) {
+            const RelocatedPageSubstitution again =
+                plan_relocated_page_substitution(current, mapping, protected_pages);
+            if (again.final_ids != first.final_ids || again.from_pool != first.from_pool ||
+                again.held_for_copy != first.held_for_copy) {
+                std::printf("  FAIL: the substitution is not deterministic\n");
+                ++g_failures;
+                break;
+            }
+        }
+    }
+
+    // Conservation, over a sweep of shapes: every page the allocation owned is either named by the
+    // mapping or accounted for as held for the copy, exactly as many times as it was owned. A leak here
+    // is a page the pool believes is free while the allocation still believes it owns it; a duplicate
+    // is two logical pages aliasing one physical page.
+    for (std::size_t protected_count = 0; protected_count <= 4; ++protected_count) {
+        for (std::uint32_t acquires = 1; acquires <= 4; ++acquires) {
+            std::vector<std::int32_t> current{10, 11, 12, 13, 14, 15};
+            std::vector<std::int32_t> mapping{10, 11};
+            mapping.resize(2 + acquires, kPagedKVAquirePage);
+            std::vector<std::int32_t> protected_pages{12, 13, 14, 15};
+            protected_pages.resize(protected_count);
+
+            const RelocatedPageSubstitution out =
+                plan_relocated_page_substitution(current, mapping, protected_pages);
+
+            std::vector<std::int32_t> accounted = out.held_for_copy;
+            std::size_t acquire_slots = 0;
+            for (const std::int32_t page_id : out.final_ids) {
+                if (page_id == kPagedKVAquirePage) {
+                    ++acquire_slots;
+                } else {
+                    accounted.push_back(page_id);
+                }
+            }
+            if (acquire_slots != out.from_pool) {
+                std::printf("  FAIL: protected=%zu acquires=%u leaves %zu slots for %u pool pages\n",
+                            protected_count, acquires, acquire_slots, out.from_pool);
+                ++g_failures;
+            }
+            std::sort(accounted.begin(), accounted.end());
+            std::sort(current.begin(), current.end());
+
+            // The pool supplies `from_pool` pages of its own, so they are the one part of the ledger
+            // that is not in `accounted`; every other owned page has to be, exactly once.
+            std::vector<std::int32_t> owned_still_held(accounted);
+            std::vector<std::int32_t> expected(current);
+            // `accounted` is the mapping's kept pages plus the held ones; `current` is everything that
+            // was owned. The difference is what was dropped and reused as a destination, which the
+            // acquire slots above do not name because the substituted ids are already in `final_ids`.
+            if (owned_still_held != expected) {
+                std::printf("  FAIL: protected=%zu acquires=%u accounts for %zu of %zu owned pages\n",
+                            protected_count, acquires, owned_still_held.size(), expected.size());
+                ++g_failures;
+            }
+            for (const std::int32_t page_id : out.final_ids) {
+                if (page_id == kPagedKVAquirePage) { continue; }
+                if (std::count(out.final_ids.begin(), out.final_ids.end(), page_id) != 1) {
+                    std::printf("  FAIL: protected=%zu acquires=%u maps page %d more than once\n",
+                                protected_count, acquires, page_id);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+
+    // Rejections: a mapping that names a page the allocation does not own, and a copy that reads one,
+    // are both caller errors. Silently ignoring either would leave the caller believing a relocation
+    // happened against a page that was never its to relocate.
+    const auto rejected = [&](const char* what, const std::vector<std::int32_t>& current,
+                              const std::vector<std::int32_t>& mapping,
+                              const std::vector<std::int32_t>& protected_pages) {
+        try {
+            (void)plan_relocated_page_substitution(current, mapping, protected_pages);
+            std::printf("  FAIL: accepted %s\n", what);
+            ++g_failures;
+        } catch (const std::invalid_argument&) {
+        }
+    };
+    rejected("a mapping naming a page the allocation does not own", {10, 11}, {10, 99}, {});
+    rejected("a mapping naming the same owned page twice", {10, 11}, {10, 10}, {});
+    rejected("a copy reading a page the allocation does not own", {10, 11}, {10, 11}, {99});
+
+    // Reading one page from two moves is not an error, it is the ordinary shape of an off-grid span:
+    // the destination page that starts inside a source page reads its head from that page, and the
+    // destination page after it reads that same page's tail. What matters is that the page is read at
+    // all, so both occurrences are stripped of their surplus in one go and nothing is handed back
+    // while the copies are still reading it.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12};
+        const std::vector<std::int32_t> mapping{10, kPagedKVAquirePage, kPagedKVAquirePage};
+        const std::vector<std::int32_t> protected_pages{11, 11};
+        const RelocatedPageSubstitution out =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        check(out.from_pool == 1, "a page read twice still cannot take a destination slot");
+        check(out.held_for_copy.size() == 1 && out.held_for_copy[0] == 11,
+              "and it is held once, as the page it is");
+        check(out.final_ids[1] == 12 && out.final_ids[2] == kPagedKVAquirePage,
+              "so the other dropped page pays for one destination and the pool for the other");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -321,6 +645,8 @@ int main() {
     test_per_page_delta();
     test_implied_context_round_trip();
     test_row_span_tiles_the_plane();
+    test_copied_span_moves();
+    test_relocated_page_substitution();
 
     if (g_failures != 0) {
         std::printf("FAILED: %d check(s)\n", g_failures);

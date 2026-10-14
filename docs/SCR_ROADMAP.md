@@ -346,6 +346,41 @@ If the threshold is exceeded:
 - reduce `K`, or
 - disable SCR for that session
 
+#### Measured status (2026-10-08)
+
+The harness is `build-ninja/apps/ninfer-scr-quality.exe` (`apps/scr_quality/`). Four phases per prompt:
+`scr` (`--scr`), `baseline` (`--no-scr --no-prefix-reuse`), `control` (the baseline repeated), and, with
+`--flag-control`, a fourth phase running the SCR flags with relocation off (`--scr-max-spans 0`).
+Scoring is `evaluate_scr_quality`, so the two thresholds above exist in exactly one place. The
+`ATTRIBUTION` table prints the measurement against both floors — the run-to-run control and the
+flag-only configuration — and the run exits non-zero when the control is dirty.
+
+What the first controlled run established:
+
+- The token stream is reproducible: the control agreed with itself on every token at every position
+  (`parted@ = 64`, agreement 1.0, all six prompts), so the early splits at token 6-8 belong to the
+  reuse path, not to run-to-run noise.
+- The logprobs are not. The control's own `d(first)` ran 3e-4 to 1.8e-3 nats, so a divergence is only
+  attributable against the floor, never against zero.
+- Subtracting the floor leaves two signals that reproduce across independent runs: `K=2` (192
+  relocated tokens) at 0.0747/0.0733, about 178x the floor, and `K=6` (576 relocated) at
+  0.0201/0.0213, about 40x. `K=3`'s signal changes sign between runs, which is what noise does.
+- `K=2` is unexplained. It relocates the *least* context and shows the *most* perturbation, the
+  signature of a near-tie being tipped rather than of accumulated staleness. `ops::logprob_of_choice`
+  now also emits the decision margin, so a large `d(first)` beside a small margin is a coin flip and
+  a large margin is a moved decision. Do not call `K=2` a defect until the margin says what the
+  competing logits were.
+
+Note the tension the numbers expose, whichever way `K=2` resolves: the thresholds are a mean
+divergence under 0.05 nats and greedy agreement over 95% of 64 tokens. If the `K=2` signal is real,
+the second bound is already violated by a perturbation the first permits — a finding about the
+thresholds, not about SCR.
+
+Still owed: the 50-prompt run on the chat-shaped suite (a real system prompt plus multi-turn history,
+not the e2e filler, which measures SCR where it does nothing useful), a regime with a long reused
+prefix rather than `base=0/cache_hit=0`, the per-dtype runs laddered in
+`docs/SCR_ALIGNMENT_FREE_RELOCATION.md`, and the `K=2` margin investigation.
+
 ### Phase 6: metrics, fallback, and caps
 - Add SCR-specific reuse reporting.
 - Add fallback to full prefill if staging fails or reuse precondition fails.
@@ -354,6 +389,11 @@ If the threshold is exceeded:
     `K in {1,2,3,6,12,64}` and cache-reuse gains saturate by `K=6`.
   - Make `K` configurable via `serve_options`.
   - Do not expose tuning until correctness validation passes.
+
+  *(Done: `--scr-max-spans <N>`, default 6 — `serve_options`' `suffix_reuse_max_spans`. It caps the
+  number of spans, not the relocated token count; the paper's K is a token count, so a token cap is
+  still unbuilt. `--scr-max-spans 0` leaves `--scr` set while switching relocation off, which is what
+  the quality harness's configuration control uses.)*
 
 --------------------------------------------------------------------------------
 ## 5. Concrete anchor points in current code
