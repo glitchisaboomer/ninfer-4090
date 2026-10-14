@@ -1039,6 +1039,40 @@ void test_shifted_detector_finds_a_run_off_the_block_grid() {
            "reuse is counted over both runs");
 }
 
+void test_segmented_plan_needs_the_shifted_detector() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::plan_shifted_relocations;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+
+    // The wiring rather than the arithmetic: the runtime builds one diff and hands it to whichever
+    // selector the mode names, so a detector that cannot see the edit's survivors empties every plan
+    // built from it. That is the failure this pins -- an off-grid edit looked exactly like SCR
+    // declining to engage, when in fact nothing downstream was ever given anything to keep.
+    Tokens previous;
+    Tokens current;
+    shifted_scenario(previous, current);
+
+    const PromptEditDiff aligned = diff_prompt_edit(previous, current);
+    const PromptEditDiff shifted = diff_prompt_edit_shifted(previous, current);
+    const auto resident = static_cast<std::uint32_t>(previous.size());
+    const auto prompt   = static_cast<std::uint32_t>(current.size());
+
+    expect(plan_relocations(aligned, resident, 0, prompt, std::nullopt, 6).empty(),
+           "the segmented selector keeps nothing from the aligned diff: its only survivor was the "
+           "leading prefix, which is ordinary prefix reuse");
+    expect(plan_shifted_relocations(aligned, resident, 0, prompt, std::nullopt, 6, true).empty(),
+           "and the shifted fallback cannot recover what that detector never found");
+
+    const auto spans =
+        plan_shifted_relocations(shifted, resident, 0, prompt, std::nullopt, 6, true);
+    expect(!spans.empty(), "the all-offset diff hands the fallback the run the edit moved");
+    const auto ranges = relocation_prefill_ranges(spans, 0, prompt);
+    expect(relocation_is_expressible(spans, ranges, 0, prompt, true),
+           "and the plan built from it is one the copied route can execute");
+}
+
 void test_shifted_selector_quantizes_only_the_destination() {
     using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
     using ninfer::targets::qwen3_6::detail::plan_shifted_relocations;
@@ -1288,6 +1322,7 @@ int main() {
     test_plan_page_remap_second_allocation();
     test_remap_pages_from_pool();
     test_shifted_detector_finds_a_run_off_the_block_grid();
+    test_segmented_plan_needs_the_shifted_detector();
     test_shifted_selector_quantizes_only_the_destination();
     test_plan_copied_page_remap_acquires_every_relocated_page();
     test_shifted_pricing_excludes_the_copy_sources();

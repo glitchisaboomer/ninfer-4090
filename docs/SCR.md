@@ -59,6 +59,8 @@ Keys aren't re-written with new rotations; they keep their original source rotat
 * Planes publish/clear together (one relocation or none per page).
 * Spans never share a logical destination page. Understating the delta plane silently acts like no relocation happened.
 
+**Planner gate.** The gate builds one diff per request and feeds it to whichever selector the mode names, so the detector bounds every plan. `diff_prompt_edit` matches whole 64-token blocks and sees only content on the same page grid in both prompts, so an off-grid edit leaves it nothing but the leading prefix. With `NINFER_SCR_SOURCE_SHIFT` set the gate uses `diff_prompt_edit_shifted` (all-offset) instead, and `Segmented` falls back to `plan_shifted_relocations` after an inexpressible plan rather than dropping to a cold prefill; unset, the gate is byte-identical to the aligned code. `NINFER_SCR_DIAG` adds one `[scr-diag] segmented … survivors=… plan_spans=… shift=…` line per request, so segmented can no longer decline silently. The shifted detector anchors at the page size, so survivals shorter than a page stay invisible to it.
+
 ---
 
 ## 4. Relocation Routes
@@ -108,5 +110,6 @@ INT8 destinations aren't restricted to whole pages anymore.
 | `tests/ops/test_gqa_kv_page_delta_rotated.cpp` | Rotated variants (`rk8v4`, `rk4v4`, `rk4v4-e8`). |
 | `tests/ops/test_scr_relocation_integration.cpp` | End-to-end cache bytes check. |
 | `tests/test_paged_kv_delta_layout.cpp` | Packed range encoding & planner math. |
+| `tests/targets/qwen3_6/test_prompt_edit.cpp` | Detector/selector planning, including the off-grid planner gate. |
 | `tests/ops/test_scr_copied_relocation.cpp` | Copied-relocation oracle. |
 | `tests/targets/qwen3_6_27b/test_engine_prefill_determinism.cpp` | Prefill reproducibility (needs weights). |

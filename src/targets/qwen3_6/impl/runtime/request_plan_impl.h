@@ -279,9 +279,18 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         prompt.identity.reusable &&
         delta_path_supports_dtype(kv_dtype) &&
         (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier)) {
-        const qwen3_6::detail::PromptEditDiff diff = qwen3_6::detail::diff_prompt_edit(
-            sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
-
+        // A relocation whose source is off the page grid cannot be re-pointed at all, only copied, so
+        // both the detector and the selector/expressibility rules it feeds have to know which grid
+        // they are planning against. Off by default: with the flag unset this block is the code it was
+        // before the copying path existed, and the runtime's copied branch stays unreachable.
+        //
+        // The detector must match: the aligned detector only indexes 64-token block boundaries, so an
+        // off-grid edit (the shape of essentially every edit a user types) yields no surviving spans
+        // and every selector below plans nothing. With the copied path enabled the all-offset
+        // detector feeds both selectors: the re-pointing one keeps nothing it could re-point that is
+        // not already on the grid, the shifted one keeps the rest, and the aligned plan is
+        // byte-identical to the pre-copy code whenever an aligned survivor exists.
+        //
         // Selection rules live with the detector so they stay unit-testable on the host. `reuse_base`
         // is the prefix-reuse frontier, so a destination below it is already covered by ordinary
         // prefix reuse. Both modes produce spans; the prefilled ranges are then derived from the
@@ -289,17 +298,36 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // contiguous run, so the derivation reproduces exactly the head and tail that mode has
         // always reported; segmented mode may interleave survivors anywhere, which yields one range
         // per gap and is the only structural difference.
-        // A relocation whose source is off the page grid cannot be re-pointed at all, only copied, so
-        // both the selector below and the expressibility rule it is judged by have to know which grid
-        // they are planning against. Off by default: with the flag unset this block is the code it was
-        // before the copying path existed, and the runtime's copied branch stays unreachable.
         const bool source_may_shift = qwen3_6::detail::scr_source_shift_enabled();
+        const qwen3_6::detail::PromptEditDiff diff =
+            source_may_shift
+                ? qwen3_6::detail::diff_prompt_edit_shifted(
+                      sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens)
+                : qwen3_6::detail::diff_prompt_edit(
+                      sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
         std::vector<RelocatedSpan> plan_spans;
         if (base.scr_mode == ninfer::ScrRelocationMode::Segmented) {
             plan_spans = qwen3_6::detail::plan_relocations(
                 diff, sequence.text_kv_valid, plan->reuse_base,
                 static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
                 base.suffix_reuse_max_spans);
+            // Segmented has no per-candidate trace, and `plan_relocations` reports a decline the same
+            // way it reports having nothing to do, so a run that relocates no span out of many is
+            // indistinguishable from one the detector never fed. Print the two counts that tell them
+            // apart -- behind the same flag as the tail trace, and one line per request.
+            if (scr_diagnostics_enabled()) {
+                std::ostringstream seg;
+                seg << "[scr-diag] segmented prompt_tokens="
+                    << static_cast<std::uint32_t>(prompt.token_ids.size())
+                    << " reuse_base=" << plan->reuse_base
+                    << " resident_kv=" << sequence.text_kv_valid
+                    << " max_spans=" << base.suffix_reuse_max_spans
+                    << " survivors=" << diff.spans.size()
+                    << " shift=" << (source_may_shift ? "on" : "off")
+                    << " plan_spans=" << plan_spans.size();
+                std::cerr << seg.str() << '\n';
+                std::cerr.flush();
+            }
         } else {
             qwen3_6::detail::TailRelocationTrace trace;
             const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
@@ -373,6 +401,26 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                           << " prompt_tokens=" << prompt_tokens_count << '\n';
                 plan_spans.clear();
                 plan_ranges.clear();
+                // Segmented mode gets no fallback in its own branch above (tail mode has one there):
+                // when the all-offset detector feeds the re-pointing selector, a span it keeps may be
+                // expressible only as a copy. Try the shifted selector before giving up, or the plan
+                // degrades to a silent full_reset on exactly the off-grid edits the copied path
+                // exists for.
+                if (base.scr_mode == ninfer::ScrRelocationMode::Segmented && source_may_shift) {
+                    plan_spans = qwen3_6::detail::plan_shifted_relocations(
+                        diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
+                        base.turn_rewrite_boundary, base.suffix_reuse_max_spans,
+                        /*destination_may_shift=*/true);
+                    plan_ranges = qwen3_6::detail::relocation_prefill_ranges(
+                        plan_spans, plan->reuse_base, prompt_tokens_count);
+                    if (!plan_spans.empty() &&
+                        !qwen3_6::detail::relocation_is_expressible(
+                            plan_spans, plan_ranges, plan->reuse_base, prompt_tokens_count,
+                            source_may_shift)) {
+                        plan_spans.clear();
+                        plan_ranges.clear();
+                    }
+                }
             }
         }
         if (!plan_spans.empty()) {
