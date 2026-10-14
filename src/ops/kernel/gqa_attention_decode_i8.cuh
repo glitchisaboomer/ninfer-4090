@@ -46,6 +46,15 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
     tile[off]     = code;
 }
 
+// Dynamic staging the partial-page boundary path adds on top of the K/V arena: the shifted rotary
+// group tile (kGqaKvShiftB16PerRow b16 lanes per row) plus its one scale per row. The launcher sizes
+// its dynamic-smem request with this, so the arena layout below and the launch stay in step.
+template <typename Geometry, int TokenTile>
+inline constexpr std::size_t gqa_attention_decode_i8_shift_bytes() {
+    constexpr int Br = ((TokenTile * Geometry::GroupSize + 15) / 16) * 16;
+    return static_cast<std::size_t>(Br) * (kGqaKvShiftB16PerRow * 2 + sizeof(float));
+}
+
 // Decode-specialized producer/consumer kernel for T=1..6. One producer warp per
 // m16 row tile computes QK + online softmax, while all CTA warps partition the
 // tile's 256-wide PV output. This keeps each thread's PV accumulator at 16, 32,
@@ -67,7 +76,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
         __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
-        const std::int32_t* __restrict__ rope_page_deltas, RerotateFreq freq) {
+        const std::int32_t* __restrict__ rope_page_deltas,
+        const std::uint32_t* __restrict__ rope_page_delta_ranges, RerotateFreq freq) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -78,6 +88,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int Threads              = Wc * 32;
     constexpr int Groups               = kGqaKvQuantGroups;
     constexpr int GroupKc              = kGqaKvQuantGroup / 32;
+    constexpr int ShiftBytes           = Br * kGqaKvShiftB16PerRow * 2;
     constexpr int QKKs                 = D / 32;
     constexpr int QKNt                 = Bc / 8;
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
@@ -105,7 +116,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     std::int8_t* r_s      = DynamicArena ? dynamic_r_s : static_r_s;
     std::int8_t* q_i8     = q_s;
     std::int8_t* k_i8     = r_s;
+    // The shifted rotary group rides in the dynamic arena: after the K/V arena when there is one,
+    // otherwise it is the whole request. A partial page needs group 0 in both frames at once, and
+    // the arena is where staging that exceeds the static tiles belongs.
+    std::int8_t* q_shift_i8 = DynamicArena ? dynamic_r_s + 4 * Bc * D : dynamic_r_s;
+    float* q_shift_scale    = reinterpret_cast<float*>(q_shift_i8 + ShiftBytes);
     __nv_bfloat16* q_b16  = reinterpret_cast<__nv_bfloat16*>(q_i8);
+    __nv_bfloat16* q_shift_b16 = reinterpret_cast<__nv_bfloat16*>(q_shift_i8);
     __nv_bfloat16* k_b16  = reinterpret_cast<__nv_bfloat16*>(k_i8);
     std::int8_t* v_i8     = r_s + Bc * D;
     __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * D);
@@ -143,6 +160,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                         ? nullptr
                                         : rope_page_deltas + static_cast<std::int64_t>(table_row) *
                                                                  table_stride;
+    const std::uint32_t* delta_range_row =
+        rope_page_delta_ranges == nullptr
+            ? nullptr
+            : rope_page_delta_ranges +
+                  static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads *
                        TokenTile * split_count;
@@ -412,6 +434,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         store_vec(reinterpret_cast<int4*>(q_i8) + i, make_int4(0, 0, 0, 0));
     }
     for (int i = tid; i < Br * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
+    // The shifted rotary group gets the same treatment, so a page without a delta plane -- or a
+    // padding row -- reads zeros instead of whatever the previous tile left in the arena.
+    for (int i = tid; i < ShiftBytes / 16; i += Threads) {
+        store_vec(reinterpret_cast<int4*>(q_shift_i8) + i, make_int4(0, 0, 0, 0));
+    }
+    for (int i = tid; i < Br; i += Threads) { q_shift_scale[i] = 0.0f; }
 
     auto stage_and_quantize_q = [&](std::int32_t delta) {
         for (int unit = warp; unit < RowCount * Groups; unit += Wc) {
@@ -443,11 +471,53 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
     };
 
-    std::int32_t current_delta = 0;
+    // Group 0 quantized in the frame of the position the page's relocated keys were computed at.
+    // Rotation touches only the rotary region, which is exactly this one 64-dimension group, so the
+    // frame a partial page's interval reads is one group wide rather than a second Q tile -- and the
+    // base tile is left alone rather than rotated and rolled back.
+    auto stage_shift_group0 = [&](std::int32_t delta) {
+        for (int row = warp; row < RowCount; row += Wc) {
+            int q_head = 0;
+            int token  = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            float x0        = __bfloat162float(q[gqa_q_index<Geometry>(q_head, lane, token)]);
+            float x1        = __bfloat162float(q[gqa_q_index<Geometry>(q_head, lane + 32, token)]);
+            gqa_rope_counter_rotate_pair_f32(x0, x1, lane, delta, freq);
+            if constexpr (RotateK) { gqa_kv_hadamard64(x0, x1, FullMask); }
+            float absmax    = fmaxf(fabsf(x0), fabsf(x1));
+            absmax          = warp_max(absmax, FullMask);
+            const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
+            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
+            gqa_kv_shift_store_i8(q_shift_i8, row, lane, gqa_kv_quant_code(x0, inv));
+            gqa_kv_shift_store_i8(q_shift_i8, row, lane + 32, gqa_kv_quant_code(x1, inv));
+            if (lane == 0) { q_shift_scale[row] = qs; }
+        }
+    };
+
+    // The two frames a page is read in. `current_delta` is the frame of the base Q tile and
+    // `current_shift` the frame the shifted group tile holds; both are what the loop below compares
+    // against, so a page transition re-stages only what actually changed. A partial page's base
+    // frame is the unrotated one -- the keys outside its interval never moved -- and its interval's
+    // keys carry the page delta.
+    std::int32_t current_delta      = 0;
+    std::int32_t current_shift      = 0;
+    std::int32_t current_page_delta = 0;
+    std::uint32_t current_range     = kRopeDeltaRangeEmpty;
     if (delta_row != nullptr) {
-        current_delta = delta_row[first_tile >> kPagedKVPageShift];
+        const int first_page = first_tile >> kPagedKVPageShift;
+        current_page_delta   = delta_row[first_page];
+        if (delta_range_row != nullptr) { current_range = delta_range_row[first_page]; }
+        if (rope_delta_page_range_is_partial(current_range)) {
+            current_shift = current_page_delta;
+        } else {
+            current_delta = current_page_delta;
+        }
     }
+    // Staged unconditionally: the base tile has to be filled whether or not a delta plane is
+    // attached, and for a partial page `current_delta` is already the frame its unrelocated keys
+    // are read in.
     stage_and_quantize_q(current_delta);
+    if (current_shift != 0) { stage_shift_group0(current_shift); }
 
     ninfer::ops::cp_wait<0>();
     __syncthreads();
@@ -495,13 +565,27 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
         if (delta_row != nullptr && kb != 0) {
-            const std::int32_t new_delta = delta_row[k0 >> kPagedKVPageShift];
-            if (new_delta != current_delta) {
-                stage_and_quantize_q(new_delta);
-                __syncthreads();  // publish all warps' q_i8 / q_scale writes
+            const int page                = k0 >> kPagedKVPageShift;
+            const std::int32_t page_delta = delta_row[page];
+            const std::uint32_t range =
+                delta_range_row == nullptr ? kRopeDeltaRangeEmpty : delta_range_row[page];
+            const bool partial   = rope_delta_page_range_is_partial(range);
+            const std::int32_t base  = partial ? 0 : page_delta;
+            const std::int32_t shift = partial ? page_delta : 0;
+            if (base != current_delta || shift != current_shift) {
+                if (base != current_delta) {
+                    stage_and_quantize_q(base);
+                    current_delta = base;
+                }
+                if (shift != current_shift) {
+                    stage_shift_group0(shift);
+                    current_shift = shift;
+                }
+                __syncthreads();  // publish all warps' q_i8 / q_shift_i8 / scale writes
                 refresh_q_scale_regs();
-                current_delta = new_delta;
             }
+            current_page_delta = page_delta;
+            current_range      = range;
         }
 
         // One warp per row tile produces P and alpha while the remaining warps
@@ -509,6 +593,17 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (warp < RowTiles) {
             const int producer_row_base = warp * 16;
             __nv_bfloat16* p_sw         = &p_s[producer_row_base * Bc];
+            // A partial page holds keys of two frames at once: the ones inside its interval were
+            // relocated and keep the rotation of the position they were computed at, everything else
+            // in the page is read unrotated. Only the rotary region -- group 0 -- differs between
+            // those frames, so the interval's keys get one extra group-0 product from the tile staged
+            // in their frame, chosen per key, while groups 1..3 are shared.
+            const bool boundary = rope_delta_page_range_is_partial(current_range) &&
+                                  current_page_delta != 0;
+            const std::uint32_t range_begin =
+                boundary ? rope_delta_page_range_begin(current_range) : 0u;
+            const std::uint32_t range_end =
+                boundary ? rope_delta_page_range_end(current_range) : 0u;
             float score[QKNt][4];
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
@@ -530,10 +625,31 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         smem_addr(&q_b16[(producer_row_base + a_rowoff) * DB16 +
                                          gqa_small_t_tc_swz(producer_row_base + a_rowoff, acol)]));
                 }
+                // The rotary group's other frame, and the scale that frame quantized to. Read only on
+                // the one group that has two frames, so an ordinary page pays nothing for them.
+                unsigned af_shift[GroupKc][4];
+                float shift_scale0 = 0.0f;
+                float shift_scale1 = 0.0f;
+                if (boundary && g == 0) {
+#pragma unroll
+                    for (int kk = 0; kk < GroupKc; ++kk) {
+                        const int acol = kk * 16 + a_coloff;
+                        ldmatrix_x4(af_shift[kk][0], af_shift[kk][1], af_shift[kk][2],
+                                    af_shift[kk][3],
+                                    smem_addr(&q_shift_b16[(producer_row_base + a_rowoff) *
+                                                               kGqaKvShiftB16PerRow +
+                                                           gqa_kv_shift_swz(
+                                                               producer_row_base + a_rowoff,
+                                                               acol)]));
+                    }
+                    shift_scale0 = q_shift_scale[producer_row_base + gid];
+                    shift_scale1 = q_shift_scale[producer_row_base + gid + 8];
+                }
 
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
                     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                    int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
 #pragma unroll
                     for (int kk = 0; kk < GroupKc; ++kk) {
                         const int k    = g * GroupKc + kk;
@@ -545,6 +661,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                             smem_addr(&k_b16[brow * DB16 + gqa_small_t_tc_swz(brow, bcol)]));
                         mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
                                bf[1]);
+                        // The same K fragment serves both frames of group 0; only the query differs.
+                        if (boundary && g == 0) {
+                            mma_s8(s0, s1, s2, s3, af_shift[kk][0], af_shift[kk][1],
+                                   af_shift[kk][2], af_shift[kk][3], bf[0], bf[1]);
+                        }
                     }
                     // keya/keyb depend only on lid, so the eight lanes sharing a lid
                     // read one address: an LDS broadcast, not a dynamic-index shuffle.
@@ -552,10 +673,29 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     const int keyb  = keya + 1;
                     const float ka  = __half2float(k_scale_s[keya * Groups + g]);
                     const float kb2 = __half2float(k_scale_s[keyb * Groups + g]);
-                    score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
-                    score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
-                    score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
-                    score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
+                    if (boundary && g == 0) {
+                        const int key0 = k0 + keya;
+                        const int key1 = k0 + keyb;
+                        const std::uint32_t off0 =
+                            static_cast<std::uint32_t>(key0) & kPagedKVPageMask;
+                        const std::uint32_t off1 =
+                            static_cast<std::uint32_t>(key1) & kPagedKVPageMask;
+                        const bool in0 = off0 >= range_begin && off0 < range_end;
+                        const bool in1 = off1 >= range_begin && off1 < range_end;
+                        score[nt][0] += in0 ? shift_scale0 * ka * static_cast<float>(s0)
+                                            : q_scale_r0[0] * ka * static_cast<float>(c0);
+                        score[nt][1] += in1 ? shift_scale0 * kb2 * static_cast<float>(s1)
+                                            : q_scale_r0[0] * kb2 * static_cast<float>(c1);
+                        score[nt][2] += in0 ? shift_scale1 * ka * static_cast<float>(s2)
+                                            : q_scale_r1[0] * ka * static_cast<float>(c2);
+                        score[nt][3] += in1 ? shift_scale1 * kb2 * static_cast<float>(s3)
+                                            : q_scale_r1[0] * kb2 * static_cast<float>(c3);
+                    } else {
+                        score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
+                        score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
+                        score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
+                        score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
+                    }
                 }
             }
 

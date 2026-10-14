@@ -29,6 +29,34 @@ __device__ __forceinline__ std::int64_t gqa_kv_quant_code_index(int physical_pag
                                                                           page_offset, d);
 }
 
+// --- The shifted rotary group (partial-page delta) ---------------------------------------------
+//
+// A page whose relocated interval covers only part of it holds keys in two RoPE frames: the
+// relocated keys keep the frame of the position they were computed at, the rest keep the page's.
+// Rotation only touches the rotary region, which is the first kGqaKvQuantGroup dimensions -- group 0
+// of the quantized Q tile -- and the INT8 kernels quantize Q on chip, so the frame has to be chosen
+// *before* quantization. The shifted frame is therefore its own group-0 tile, 32 b16 lanes per row,
+// staged next to the full-width one instead of rotating anything in place.
+//
+// The tile uses the four-unit form of the b16 swizzle: `(col >> 3) ^ (row & 3)` is a bijection on
+// this group's four 16-byte units, so one row fits in 32 b16 lanes. The full-width tiles need the
+// eight-unit form (`^ (row & 7)`) because they are 128 lanes wide. These two helpers are the single
+// definition of that tile's layout: the store below and every ldmatrix address that reads it,
+// which is what makes the pair agree.
+inline constexpr int kGqaKvShiftB16PerRow = kGqaKvQuantGroup / 2;
+
+__device__ __forceinline__ int gqa_kv_shift_swz(int row, int col) {
+    return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
+}
+
+__device__ __forceinline__ void gqa_kv_shift_store_i8(std::int8_t* tile, int row, int d,
+                                                      std::int8_t code) {
+    const int c   = d >> 1;
+    const int lo  = d & 1;
+    const int off = (row * kGqaKvShiftB16PerRow + gqa_kv_shift_swz(row, c)) * 2 + lo;
+    tile[off]     = code;
+}
+
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_quant_scale_index(int physical_page, int kv_head,
                                                                  int group, int page_offset) {

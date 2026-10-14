@@ -56,7 +56,9 @@ This document is the single reference for the feature. The design documents that
 `src/ops/` (kernels, `sm_89`):
 
 - `gqa_attention_decode_bf16.cuh`, `gqa_attention_prefill_bf16.cuh` — boundary-aware score path
-- The INT8 equivalents follow the same delta-plane contract.
+- `gqa_attention_decode_i8.cuh`, `gqa_attention_prefill_i8.cuh` — the same path on the quantized
+  tiles, where the frame has to be chosen *before* quantization and only the rotary 64-dimension
+  group has two of them
 
 ## 3. How a relocation is expressed
 
@@ -106,77 +108,111 @@ Verified on the RTX 4090 (`sm_89`, CUDA 13.3, GCC 11), Linux host:
 |---|---|
 | `ninfer_gqa_attention_test` | pass |
 | `ninfer_gqa_kv_page_delta_test` (BF16, whole-page + partial-page) | pass |
-| `ninfer_gqa_kv_page_delta_i8_test` | pass |
-| `ninfer_gqa_kv_page_delta_rotated_test` (`rk4v4-e8`) | pass |
+| `ninfer_gqa_kv_page_delta_i8_test` (whole-page + partial-page, both routes) | pass |
+| `ninfer_gqa_kv_page_delta_rotated_test` (`rk8v4`, `rk4v4`, `rk4v4-e8`; whole-page + partial-page) | pass |
 | `ninfer_scr_relocation_integration_test` | pass |
-| Full CTest suite | 97/97 (5 real-model tests skip without weights) |
+| Full CTest suite | 97/97 (6 tests skip without model weights: the two `*_real_test`s, both `*load_plan_test`s, `prefill_determinism`, `*prefix_real_test`) |
 
-Measured on the partial-page oracle — the branch's newest path — the delta-plane route reads
+Measured on the partial-page oracle — the branch's newest paths — the delta-plane route reads
 **2.25e-03** (decode) and **1.86e-03** (prefill) relative L2 against a directly prefilled cache,
 against a 2.0e-02 limit, with the negative controls separating 2×–12×.
 
+On the INT8 route the same comparison, with the relocated run starting mid-page so each end of it
+lands inside a destination page, reads **3.42e-03** (plain `int8-g64`, decode) and **1.50e-03**
+(prefill); `rk8v4` 4.20e-03 / 2.51e-03, `rk4v4` 1.20e-02 / 9.03e-03, `rk4v4-e8` 1.73e-02 / 1.32e-02,
+against the same 2.0e-02 limit and against 9×–12× separation in the negative controls. The aligned
+blocks read the same numbers to three digits (e.g. 3.414e-03 aligned against 3.418e-03 off-grid),
+which is what the boundary path being an exact per-key frame choice rather than an approximation
+predicts.
+
+Costed on the RTX 4090 at a 4096-token context (T=8, `int8-g64`, 1000 iterations × 5 interleaved
+passes, minimum taken): an all-zero plane set 0.0639 ms/op on the pre-batch route and 0.0647 ms on
+this one; a whole-page relocation 0.0656 ms; the partial-page relocation 0.0651 ms — **1.007×** the
+no-plane baseline, i.e. inside the run-to-run spread of the same configuration. The extra work is
+confined to the partial pages (at most two per relocated span), and staging the shifted group only
+re-runs on a page transition that changes a frame.
+
 **Not covered:**
 
-- The five real-model tests need model weights and skip here. SCR is verified at the op/oracle
-  level, not end-to-end through the 27B/35B engine.
+- The six tests that need model weights skip here. SCR is verified at the op/oracle level, not
+  end-to-end through the 27B/35B engine.
 - `Segmented` mode is planner-only; the runtime acts on `Tail` alone.
-- INT8 and packed layouts still quantize destinations to whole pages — the packed interval path is
-  BF16-only.
-- Performance is unmeasured.
+- Prefill timing for the boundary path is unmeasured; only the decode op was costed. The prefill
+  kernel is also the one whose arena grew, so its occupancy is worth a measurement before the
+  feature is trusted on the 35B shapes.
+- Long-context cost is unmeasured: the decode figures above are for a single 4096-token context with
+  one relocated span.
 - The Windows/MSVC build is the official gate; this verification is Linux/GCC.
 
 ## 6. Known deferred work
 
-- The "is this page partial" predicate is re-derived from the packed value at five call sites
-  instead of having one definition.
-- The prefill boundary recompute rolls back an in-place `q_s` rotation via an `INT32_MIN` sentinel;
-  it works but is fragile against changes to the reload early-out.
-- `gqa_attention_decode_i8.cuh` threads a range pointer it never reads.
+- The BF16 prefill boundary recompute rolls back an in-place `q_s` rotation via an `INT32_MIN`
+  sentinel; it works but is fragile against changes to the reload early-out. The INT8 prefill does
+  not need the sentinel — it stages the shifted rotary group beside the base tile — so if the BF16
+  kernel is ever revisited, that is the shape to copy.
 - `ScrRelocationMode::Segmented` has no runtime path.
+- Each oracle exercises one dispatch shape per route (8 decode tokens, 128 prefill tokens), so the
+  other instantiations of the same kernel body — other `TokenTile`s, `MultiBatch`, `Masked` — carry
+  the boundary path but are not exercised end to end. Every codec variant is covered, each at that
+  one shape.
 
 ---
 
-## 7. Next task: INT8 arbitrary (partial-page) relocation
+## 7. INT8 arbitrary (partial-page) relocation
 
-**Not started.** The BF16 path supports arbitrary token offsets (§3); the INT8 path does not. Today an
-INT8 destination is quantized to whole pages, so up to 63 tokens at each end of a surviving run are
-re-prefilled rather than relocated — a run with no whole destination page cannot be relocated at all
-in that mode.
+**Implemented and verified at the op level.** An INT8 destination is no longer quantized to whole
+pages: the planner returns a run's real token interval for every dtype, and both INT8 attention
+routes read the packed interval and choose the query's frame per key, as BF16 does.
 
-The gap, concretely:
+How the frame is carried. Rotation touches only the rotary region, which is the first 64 dimensions
+of the quantized tile — group 0 — so a partial page needs one extra group-wide Q tile rather than a
+second full-width one. Each INT8 kernel stages that tile in the frame of the position its page's
+relocated keys were computed at, beside the base tile:
 
-1. **The range plane never reaches the INT8 kernels.** `launch_tc_partial_i8`
-   (`src/ops/launcher/gqa_attention_decode.cu`) takes `rope_page_deltas` but no range pointer, and
-   `gqa_attention_decode_i8.cuh` reads neither the packed interval nor
-   `rope_delta_page_range_is_partial`. The dispatch macro even casts
-   `cache.rope_delta_ranges.data` on the way in, so the plane is available at the call site and
-   dropped on the floor.
-2. **No boundary-aware score path in the INT8 kernels.** The BF16 kernels
-   (`gqa_attention_{decode,prefill}_bf16.cuh`) recompute QK scores with the shifted query for the
-   keys inside a partial page's interval and select per key; the INT8 equivalents have no analogue.
-   The rotated variants add a wrinkle: the host-side 64-point Hadamard means the shifted-query
-   recompute has to happen in the same rotated frame the plane is quantized in.
-3. **The planner still quantizes.** `plan_shifted_relocations(..., destination_may_shift = true)`
-   trims to whole pages for quantized destinations. With the kernels able to read an interval, that
-   branch can return the full token interval and let the plane describe the partial page.
-4. **The prefill (A1) route is unverified for INT8 partial pages.** The BF16 prefill path carries the
-   `INT32_MIN` rollback sentinel noted in §6; whatever the INT8 path does instead should be settled
-   before it is trusted.
+- `gqa_attention_kv_quant.cuh` owns the tile: 32 b16 lanes per row, the four-unit form of the b16
+  swizzle (`(col >> 3) ^ (row & 3)`), with `gqa_kv_shift_store_i8` and `gqa_kv_shift_swz` as the one
+  definition of its layout for the store and for every `ldmatrix` that reads it.
+- Group 0 is counter-rotated *and* Hadamard-rotated for the rotated codecs, in that order, matching
+  `stage_and_quantize_q`. The shifted group is quantized in the frame it is read in, so the shifted
+  product is a real QK product in the rotated basis and not a re-rotation of a quantized tile.
+- The score path takes one extra group-0 `mma_s8` per key block on a partial page and then selects
+  per key from the packed interval: keys inside it use the shifted group with the scale that group
+  quantized to, keys outside it use the base tile. Groups 1..3 are shared, so this is one extra
+  group product on one page's keys rather than a second QK recompute.
+- A page transition re-stages only the frame that changed: `current_delta` tracks the base tile,
+  `current_shift` the shifted one, and a partial page's base frame is the unrotated one — its keys
+  outside the interval never moved.
+- Neither INT8 kernel rotates Q in place, so neither needs the `INT32_MIN` rollback sentinel the BF16
+  prefill path carries (§6): the shifted group is a separate tile and the base tile is left alone.
 
-Definition of done, mirroring how the BF16 path was pinned:
+The four gaps this section used to list are closed: the range pointer reaches `launch_tc_partial_i8`
+and is threaded into the kernel; both INT8 kernels have the boundary-aware score path; the planner's
+`destination_may_shift = true` branch no longer trims by dtype (`request_plan_impl.h`); and the A1
+route is covered by the same blocks and the same limit as A3.
 
-- `ninfer_gqa_kv_page_delta_i8_test` and `ninfer_gqa_kv_page_delta_rotated_test` gain partial-page
-  blocks that measure against the same 2.0e-02 equivalence limit the BF16 blocks use, with negative
-  controls that still separate.
-- The oracle scenario must place the relocated run slot-by-slot into the destination physical pages
-  (as `place_unaligned_relocation` in `test_gqa_kv_page_delta.cpp` does for BF16) — an append at the
-  source positions plus a block-table alias does **not** produce a readable off-grid cache, which is
-  what made the BF16 fixture silently wrong.
-- Full CTest suite green, including the five real-model tests on the Windows box.
+The decode launcher now requests dynamic shared memory for every INT8 configuration, not only the
+ones whose K/V arena is dynamic, because the shifted group lives there. That is a residency change
+on a kernel tuned for occupancy on `sm_89`, which is why the cost below is measured against the
+pre-batch route and not against a same-binary control.
 
-Risks worth pricing first: the INT8 kernels are tuned for occupancy on `sm_89`, and the
-boundary-aware path adds a second QK recompute per partial tile. Whether that costs anything
-measurable on the decode path is unknown and should be measured before the design is settled.
+Definition of done, and where each part landed:
+
+- Partial-page blocks in the two INT8 oracles, judged against the same 2.0e-02 limit as the BF16
+  blocks, with negative controls that separate — done; numbers in §5.
+- A scenario that places the run into the destination physical pages — done, as
+  `place_unaligned_relocation_i8` in the shared header. It is one production `append_chunk` at the
+  destination positions rather than the BF16 placer's byte-level copy, because the INT8 fill
+  quantizes each row on its own: writing the source-phase rows at the destination slots produces
+  exactly the codes and scales a page copy would have moved there.
+- Full CTest suite green — 97/97 on this batch (§5), on the Linux/GCC host. The Windows/MSVC box
+  and the real-model tests still have to run before the feature is called end-to-end verified.
+
+Cost, measured (§5): the partial-page decode reads 1.007× the no-plane baseline and 0.992× the
+whole-page case at a 4096-token context, inside the spread between runs of one configuration. The
+occupancy question the dynamic-smem change raised is answered by the same numbers — 0.0647 ms here
+against 0.0639 ms on the pre-batch route, 1.3%, at the edge of the noise. What is *not* priced is the
+prefill route, whose arena grew by a whole tile, nor a long context carrying many relocated spans at
+once.
 
 ---
 
@@ -185,8 +221,8 @@ measurable on the decode path is unknown and should be measured before the desig
 | Test | What it pins |
 |---|---|
 | `tests/ops/test_gqa_kv_page_delta.cpp` | The delta-plane oracle, whole-page and partial-page, both attention routes, plus negative controls. |
-| `tests/ops/test_gqa_kv_page_delta_i8.cpp` | Same scenario on a plain INT8 plane. |
-| `tests/ops/test_gqa_kv_page_delta_rotated.cpp` | Rotated variants (`rk8v4`, `rk4v4-e8`) with a host port of the 64-point Hadamard. |
+| `tests/ops/test_gqa_kv_page_delta_i8.cpp` | Both scenarios (aligned and off-grid) on a plain INT8 plane, on both attention routes, each with its own negative control. |
+| `tests/ops/test_gqa_kv_page_delta_rotated.cpp` | The same two scenarios on the rotated variants (`rk8v4`, `rk4v4`, `rk4v4-e8`), each with a host port of the 64-point Hadamard. |
 | `tests/ops/test_scr_relocation_integration.cpp` | Every cache byte written by `gqa_kv_append`, read through the public entry points. |
 | `tests/test_paged_kv_delta_layout.cpp` | The packed range encoding and the planner arithmetic, off-machine. |
 | `tests/ops/test_scr_copied_relocation.cpp` | The copied-relocation oracle (mainline): bit-identical moved bytes, pool accounting, refusal cases. |
