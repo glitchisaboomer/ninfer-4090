@@ -52,6 +52,79 @@ DeltaMetadata make_delta_metadata(const Scenario& scenario) {
     return metadata;
 }
 
+// The device layout of one cache page: [kv head][page offset][d], which is what
+// paged_kv_element_offset computes and what image() reads back as
+// [physical page][kv head][page offset][d]. The relocation below writes through this
+// layout so the destination physical page really holds the run, at the offsets the
+// delta plane describes.
+constexpr std::int64_t unaligned_cache_offset(std::int32_t physical_page, std::int32_t head,
+                                              std::int32_t page_offset, std::int32_t d) {
+    return static_cast<std::int64_t>(kHeadDim) * static_cast<std::int64_t>(kPageSize) *
+               (static_cast<std::int64_t>(head) +
+                static_cast<std::int64_t>(kKvHeads) * static_cast<std::int64_t>(physical_page)) +
+           static_cast<std::int64_t>(kHeadDim) * static_cast<std::int64_t>(page_offset) +
+           static_cast<std::int64_t>(d);
+}
+
+// A copied relocation whose destination starts mid-page. The run is a contiguous
+// kRelocatedRun-token span, so it occupies dst slots [dst & 63, 64) of the first
+// destination page and [0, tail) of the second -- exactly the intervals
+// plan_rope_delta_page_ranges publishes, and exactly the slots the copier fills.
+//
+// The source is off-grid by a *different* offset than the destination, which is the
+// case the whole-page delta plane cannot express: page 3 is partial because the run
+// starts at slot 7, and page 4 is partial because it ends at slot 6. The previous
+// construction of this scenario appended the run at the source positions and aliased
+// the destination pages to the source pages, which left the destination slots holding
+// whatever the source append happened to write there: the source run's own offset (13)
+// does not match the destination's (7), so destination slot 7 was never written by any
+// append and the fixture asked the kernels to read a key that does not exist. That is
+// a fixture defect, not a kernel one -- the host model of the intended semantics
+// reproduces the kernel's output bit for bit on it (3.1230e-01 both sides), and the
+// error collapses by 10x once the destination slots are written for real.
+//
+// What is written here is what production's copier writes: the run's K rows, rotated
+// at the source positions, placed in the destination pages at the destination offsets,
+// with V byte-identical to a direct prefill's.
+void place_unaligned_relocation(Cache& cache, const Scenario& scenario) {
+    const std::int32_t dst_page  = scenario.dst / kPageSize;
+    const std::int32_t dst_slot  = scenario.dst % kPageSize;
+    const std::int32_t phys_page = cache.table_host[static_cast<std::size_t>(dst_page)];
+    const std::size_t bytes      = static_cast<std::size_t>(kHeadDim) * sizeof(__nv_bfloat16);
+    for (std::int32_t token = 0; token < kRelocatedRun; ++token) {
+        const std::int32_t slot = dst_slot + token;
+        if (slot >= kPageSize) { break; } // the run's tail lands on the next page, below
+        for (std::int32_t head = 0; head < kKvHeads; ++head) {
+            const std::size_t src_index = act_index(head, token, kKvHeads, 0);
+            cache.k.copy_from_host(&scenario.k_src[src_index], bytes,
+                                   unaligned_cache_offset(phys_page, head, slot, 0) *
+                                       sizeof(__nv_bfloat16));
+            cache.v.copy_from_host(&scenario.v[src_index], bytes,
+                                   unaligned_cache_offset(phys_page, head, slot, 0) *
+                                       sizeof(__nv_bfloat16));
+        }
+    }
+    // The tail that crossed into the second destination page. The second page is the
+    // one the destination mapping's next logical page names, which is the page the
+    // block table already points at the run's continuation.
+    const std::int32_t tail = kRelocatedRun - (kPageSize - dst_slot);
+    if (tail > 0) {
+        const std::int32_t phys_next = cache.table_host[static_cast<std::size_t>(dst_page + 1)];
+        for (std::int32_t token = 0; token < tail; ++token) {
+            for (std::int32_t head = 0; head < kKvHeads; ++head) {
+                const std::size_t src_index =
+                    act_index(head, kPageSize - dst_slot + token, kKvHeads, 0);
+                cache.k.copy_from_host(&scenario.k_src[src_index], bytes,
+                                       unaligned_cache_offset(phys_next, head, token, 0) *
+                                           sizeof(__nv_bfloat16));
+                cache.v.copy_from_host(&scenario.v[src_index], bytes,
+                                       unaligned_cache_offset(phys_next, head, token, 0) *
+                                           sizeof(__nv_bfloat16));
+            }
+        }
+    }
+}
+
 Scenario build_unaligned_scenario(const FreqTable& freq) {
     Scenario scenario = build_scenario(freq);
     scenario.src = kSourcePage * kPageSize + 13;
@@ -131,7 +204,7 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
     // 1. Build a cache with K at source positions (no physical re-rotation)
 
     Cache cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+    place_unaligned_relocation(cache, scenario);
 
 
     // 2. Build page deltas and packed interval bounds for every destination page touched.
@@ -220,7 +293,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
 
     // 1. Build a cache with K at source positions (no physical re-rotation)
     Cache cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+    place_unaligned_relocation(cache, scenario);
 
     // 2. Build page deltas and packed interval bounds for every destination page touched.
     DeltaMetadata delta_metadata = make_delta_metadata(scenario);

@@ -289,7 +289,7 @@ void check_append_attention_equivalence(const Scenario& scenario) {
 
     if (!expect_conformant(measure(got_reference.out,
                                   ideal_attention(tail_q_data, reference, tail_first, kTailTokens)),
-                          "A1 over a directly prefilled page")) {
+                          "A1 over a directly prefilled page", kConformanceIntegrationA1Bf16)) {
         ++failures;
     }
     const Error correct = measure(got_relocated.out, got_reference.out);
