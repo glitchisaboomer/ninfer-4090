@@ -115,6 +115,7 @@ struct PagedKVPoolLayout {
 
 class PagedKVAllocation;
 struct PagedKVResize;
+struct PagedKVReservation;
 
 class PagedKVPool {
 public:
@@ -189,6 +190,8 @@ public:
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
+    friend std::vector<PagedKVAllocation> reserve_paged_kv_bundle(
+        std::span<const PagedKVReservation> reservations);
 
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;

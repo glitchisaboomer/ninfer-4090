@@ -78,7 +78,18 @@ inline constexpr std::uint32_t kRopeDeltaRangeEmpty = 0xffffffffu;
 inline constexpr std::uint32_t kRopeDeltaRangeMaxOffset =
     static_cast<std::uint32_t>(kPagedKVPageSize);
 
-[[nodiscard]] constexpr std::uint32_t pack_rope_delta_page_range(
+// Pure packing/unpacking arithmetic over one uint32_t, called from both host planning code and the
+// boundary-aware device kernels. `__host__ __device__` keeps them constexpr-evaluable on the host
+// (the layout tests depend on that) while legal to inline into device code; a host-only constexpr
+// here is an nvcc error at every kernel call site. The annotation collapses to nothing in plain
+// C++ translation units, where CUDA's specifiers do not exist.
+#ifdef __CUDACC__
+#define NINFER_ROPE_DELTA_RANGE_HOST_DEVICE __host__ __device__
+#else
+#define NINFER_ROPE_DELTA_RANGE_HOST_DEVICE
+#endif
+
+[[nodiscard]] NINFER_ROPE_DELTA_RANGE_HOST_DEVICE constexpr std::uint32_t pack_rope_delta_page_range(
     std::uint32_t begin, std::uint32_t end) noexcept {
     if (begin >= end || end > static_cast<std::uint32_t>(kPagedKVPageSize)) {
         return kRopeDeltaRangeEmpty;
@@ -86,15 +97,18 @@ inline constexpr std::uint32_t kRopeDeltaRangeMaxOffset =
     return begin | (end << 6);
 }
 
-[[nodiscard]] constexpr bool rope_delta_page_range_is_empty(std::uint32_t packed) noexcept {
+[[nodiscard]] NINFER_ROPE_DELTA_RANGE_HOST_DEVICE constexpr bool rope_delta_page_range_is_empty(
+    std::uint32_t packed) noexcept {
     return packed == kRopeDeltaRangeEmpty;
 }
 
-[[nodiscard]] constexpr std::uint32_t rope_delta_page_range_begin(std::uint32_t packed) noexcept {
+[[nodiscard]] NINFER_ROPE_DELTA_RANGE_HOST_DEVICE constexpr std::uint32_t rope_delta_page_range_begin(
+    std::uint32_t packed) noexcept {
     return packed & 0x3fu;
 }
 
-[[nodiscard]] constexpr std::uint32_t rope_delta_page_range_end(std::uint32_t packed) noexcept {
+[[nodiscard]] NINFER_ROPE_DELTA_RANGE_HOST_DEVICE constexpr std::uint32_t rope_delta_page_range_end(
+    std::uint32_t packed) noexcept {
     return (packed >> 6) & 0x7fu;
 }
 
@@ -108,7 +122,8 @@ inline constexpr std::uint32_t kRopeDeltaRangeMaxOffset =
 // that forgets the emptiness guard mistakes an ordinary page for a partial one. That failure is
 // silent -- both halves rotate plausibly -- which is why it gets a tested definition instead of
 // being spelled out at each use.
-[[nodiscard]] constexpr bool rope_delta_page_range_is_partial(std::uint32_t packed) noexcept {
+[[nodiscard]] NINFER_ROPE_DELTA_RANGE_HOST_DEVICE constexpr bool rope_delta_page_range_is_partial(
+    std::uint32_t packed) noexcept {
     if (rope_delta_page_range_is_empty(packed)) { return false; }
     return rope_delta_page_range_begin(packed) != 0 ||
            rope_delta_page_range_end(packed) != static_cast<std::uint32_t>(kPagedKVPageSize);
