@@ -147,21 +147,37 @@ public:
     // must lie inside `block_tables_`. Throws if it does not.
     [[nodiscard]] Tensor rope_delta_row_for_block_table(Tensor block_table) const;
 
-  private:
-    // Which row of `block_tables_` a single-row slice points into, or a throw if it does not name
-    // one. Shared by both `*_for_block_table` lookups, which differ only in the plane they read
-    // afterwards: both must agree on the pointer arithmetic, and a divergence there is silent -
-    // the wrong row still holds well-formed data.
-    [[nodiscard]] std::int32_t block_table_row_index(Tensor block_table) const;
-
+    // Entitlement and occupancy accounting. Public because the runtime planner prices a
+    // sequence's growth and a relocation's page demand against them before it commits, which is
+    // a read of pool state rather than pool internals; the private section below holds the
+    // operations only the allocation and the bundle helpers may perform.
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
-    [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
-    [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
+    [[nodiscard]] std::size_t total_page_bytes() const noexcept;
+
+    // Acquires one page of entitlement. Throws std::bad_alloc when the pool cannot satisfy it.
+    // The runtime planner takes single pages this way while pricing an off-grid span.
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
 
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
+
+    // Device-side gather/scatter across all planes, used to stage a checkpoint's pages in and out
+    // of one contiguous device buffer.
+    void gather_to_contiguous_device(std::span<const std::int32_t> page_ids, void* d_staging,
+                                     cudaStream_t stream = nullptr) const;
+    void scatter_from_contiguous_device(std::span<const std::int32_t> page_ids, const void* d_staging,
+                                       cudaStream_t stream = nullptr);
+
+    // Per-page I/O. Public because staging a checkpoint's pages and verifying a plane's contents
+    // are both operations on the pool's storage, not on its internals; the single-page forms are
+    // what the cache test uses to round-trip a page and to check clear_rope_delta_row's bytes.
+    [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
+    [[nodiscard]] std::size_t page_bytes(std::size_t plane_index) const;
+    void copy_page_to_host(std::size_t plane_index, std::int32_t page_id, void* dst,
+                           cudaStream_t stream = nullptr) const;
+    void copy_page_from_host(std::size_t plane_index, std::int32_t page_id, const void* src,
+                             cudaStream_t stream = nullptr);
 
     // Resets one table row's RoPE deltas to `kRopeDeltaNone`. Called by `PagedKVAllocation::bind_row`
     // on the caller's stream, which is what establishes the plane's invariant: a row carries either
@@ -170,22 +186,18 @@ public:
     // non-blocking stream that will read it.
     void clear_rope_delta_row(std::int32_t row, cudaStream_t stream = nullptr);
 
-    [[nodiscard]] std::size_t page_bytes(std::size_t plane_index) const;
-    void copy_page_to_host(std::size_t plane_index, std::int32_t page_id, void* dst,
-                           cudaStream_t stream = nullptr) const;
-    void copy_page_from_host(std::size_t plane_index, std::int32_t page_id, const void* src,
-                             cudaStream_t stream = nullptr);
+  private:
+    // Which row of `block_tables_` a single-row slice points into, or a throw if it does not name
+    // one. Shared by both `*_for_block_table` lookups, which differ only in the plane they read
+    // afterwards: both must agree on the pointer arithmetic, and a divergence there is silent -
+    // the wrong row still holds well-formed data.
+    [[nodiscard]] std::int32_t block_table_row_index(Tensor block_table) const;
+
+    [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     void copy_pages_to_host(std::size_t plane_index, std::span<const std::int32_t> page_ids, void* dst,
                             cudaStream_t stream = nullptr) const;
     void copy_pages_from_host(std::size_t plane_index, std::span<const std::int32_t> page_ids, const void* src,
                               cudaStream_t stream = nullptr);
-
-    // Device-side gather/scatter across all planes
-    void gather_to_contiguous_device(std::span<const std::int32_t> page_ids, void* d_staging,
-                                     cudaStream_t stream = nullptr) const;
-    void scatter_from_contiguous_device(std::span<const std::int32_t> page_ids, const void* d_staging,
-                                       cudaStream_t stream = nullptr);
-    [[nodiscard]] std::size_t total_page_bytes() const noexcept;
 
 private:
     friend class PagedKVAllocation;

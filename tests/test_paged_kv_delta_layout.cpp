@@ -551,8 +551,8 @@ void test_rope_delta_page_ranges() {
               "the empty sentinel is not partial");
         check(rope_delta_page_range_begin(kRopeDeltaRangeEmpty) == 63 &&
                   rope_delta_page_range_end(kRopeDeltaRangeEmpty) == 127,
-              "the sentinel decodes as a nonsensical interval, which is why callers must test
-               emptiness first");
+              "the sentinel decodes as a nonsensical interval, which is why callers must test "
+              "emptiness first");
     }
     const std::vector<RelocatedCopySpan> spans{{465, 321, 100}};
     const std::vector<RopeDeltaPageRange> ranges = plan_rope_delta_page_ranges(spans, 16);

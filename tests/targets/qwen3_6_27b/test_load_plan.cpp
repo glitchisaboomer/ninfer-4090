@@ -5,6 +5,7 @@
 
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
