@@ -10,7 +10,7 @@
 // <cuda_runtime_api.h>, so the header that declares the pool cannot be compiled, let alone tested, in a
 // sandbox with no nvcc. Everything below is arithmetic over `table_rows`, `logical_pages` and
 // `sizeof(std::int32_t)` and depends on no CUDA type, which makes it the part of the pool-layout work
-// that can be verified off-machine. See docs/SCR_QUANTIZED_KV_RELOCATION.md §"Step 1a".
+// that can be verified off-machine. See docs/SCR.md §"Step 1a".
 //
 // The plane it describes is what lets attention read a relocated page as if it had been prefilled at
 // its new position: instead of rewriting the quantized K plane, attention reads this per-logical-page

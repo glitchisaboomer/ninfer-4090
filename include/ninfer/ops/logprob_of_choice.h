@@ -36,7 +36,7 @@ namespace ninfer::ops {
  * runner-up rides along in that same state rather than costing a second pass.
  *
  * This exists because Suffix Cache Reuse has to be *measured*, not merely observed to produce
- * plausible text: Phase 5.5 of docs/SCR_ROADMAP.md scores the divergence of the two reuse paths in
+ * plausible text: Phase 5.5 of docs/SCR.md scores the divergence of the two reuse paths in
  * nats, and the argmax of a column says nothing about how far the runner-up was.
  *
  * `out` and `margin` must not overlap `logits`, `chosen`, or each other. The Op has no workspace and

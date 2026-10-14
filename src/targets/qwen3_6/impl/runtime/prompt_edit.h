@@ -41,7 +41,7 @@ inline bool scr_diagnostics_enabled() {
 // Off by default. The path it selects copies the KV payload instead of re-pointing the page that
 // already holds it, which is what lets a run survive an edit whose token delta is not a multiple of
 // the 64-token page -- the shape of essentially every edit a user types, and one the aligned path
-// can never relocate (see `docs/SCR_ALIGNMENT_FREE_RELOCATION.md`). The re-pointing path is
+// can never relocate (see `docs/SCR.md`). The re-pointing path is
 // hardware-verified and stays the default until this one has been through the same ladder, so a
 // regression here cannot reach a default run.
 inline bool scr_source_shift_enabled() {
@@ -123,7 +123,7 @@ struct RelocatedSpan {
 // Turn a diff into the relocation geometry a runtime can act on.
 //
 // This is the general selector, for the segmented runtime described in
-// `docs/SCR_RELOCATION_PATHS.md` as Path B: surviving spans interleaved anywhere in the prompt,
+// `docs/SCR.md` as Path B: surviving spans interleaved anywhere in the prompt,
 // rather than the one contiguous run `plan_tail_relocation` selects.
 //
 // A span is only relocatable when all of the following hold:

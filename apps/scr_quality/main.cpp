@@ -1,4 +1,4 @@
-// Phase 5.5 of docs/SCR_ROADMAP.md: does Suffix Cache Reuse change the model's answer?
+// Phase 5.5 of docs/SCR.md: does Suffix Cache Reuse change the model's answer?
 //
 // This drives ninfer-serve rather than the Engine API directly, because the serve binary is where
 // SCR is switchable (`--scr`) and it already writes the per-request telemetry the comparison needs

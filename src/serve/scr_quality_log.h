@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5.5 of docs/SCR_ROADMAP.md scores Suffix Cache Reuse by comparing two runs of one prompt.
+// Phase 5.5 of docs/SCR.md scores Suffix Cache Reuse by comparing two runs of one prompt.
 // When those runs are served by ninfer-serve rather than driven in-process, the only channel that
 // carries per-token logprobs is the request JSONL log (`--request-log-jsonl`); this module turns
 // that log into the target's own scoring input.

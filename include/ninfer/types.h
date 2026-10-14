@@ -160,7 +160,7 @@ struct StopPolicy {
 
 // Which relocation shape the planner targets. Suffix Cache Reuse is an approximation either way;
 // this only decides how many prefilled ranges the runtime has to support, so the two can be
-// benchmarked against each other. See docs/SCR_RELOCATION_PATHS.md.
+// benchmarked against each other. See docs/SCR.md.
 enum class ScrRelocationMode : std::uint8_t {
     // One contiguous surviving run, so the runtime prefills exactly two ranges around it.
     Tail,
@@ -412,7 +412,7 @@ struct GenerationResult {
     // sampler's token domain. Always the same size as `generated_token_ids`; a token whose producing
     // path does not measure logprobs (the MTP/DFlash licensed tokens) is reported as NaN rather than
     // being dropped, so the two vectors never describe different tokens. Phase 5.5 of
-    // docs/SCR_ROADMAP.md measures Suffix Cache Reuse with this; the served API does not expose it.
+    // docs/SCR.md measures Suffix Cache Reuse with this; the served API does not expose it.
     std::vector<float> generated_logprobs;
     // Best-minus-second-best logit gap in nats, parallel to `generated_logprobs`. NaN where a path
     // measured no margin. See ops::logprob_of_choice.

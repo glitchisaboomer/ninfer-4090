@@ -74,7 +74,7 @@ function(ninfer_add_host_test name)
 endfunction()
 
 # The rope-delta plane's shape, sizing and per-page rule. Registered as a host test precisely because
-# docs/SCR_QUANTIZED_KV_RELOCATION.md records that `paged_kv_cache.h` includes <cuda_runtime_api.h>,
+# docs/SCR.md records that `paged_kv_cache.h` includes <cuda_runtime_api.h>,
 # so the arithmetic had to be pulled into a CUDA-free header before it could be tested anywhere
 # without a toolchain.
 ninfer_add_host_test(ninfer_paged_kv_delta_layout_test
@@ -304,7 +304,7 @@ ninfer_add_op_test(ninfer_gqa_kv_page_delta_rotated_test
   SOURCES ops/test_gqa_kv_page_delta_rotated.cpp
   LIBRARIES ninfer_ops)
 # Log-probability of the chosen token, against an FP64 log-softmax oracle. Phase 5.5 of
-# docs/SCR_ROADMAP.md scores the two reuse paths in nats, so this measures the quantity that score
+# docs/SCR.md scores the two reuse paths in nats, so this measures the quantity that score
 # consumes rather than the argmax it is often confused with.
 ninfer_add_op_test(ninfer_logprob_of_choice_test
   SOURCES ops/test_logprob_of_choice.cpp

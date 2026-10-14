@@ -49,7 +49,7 @@ struct GenerationOutcome {
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
     // Exactly the tokens this request delivered and the logprob the model gave each one, in
-    // generation order. Phase 5.5 of docs/SCR_ROADMAP.md compares Suffix Cache Reuse against the
+    // generation order. Phase 5.5 of docs/SCR.md compares Suffix Cache Reuse against the
     // full-prefill path with these, and the request JSONL log is where they are published: the wire
     // protocols stay unchanged, and a run only pays for them when the log is enabled. A token whose
     // producing path measures no logprob carries NaN, so the two vectors always describe the same

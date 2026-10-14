@@ -229,7 +229,7 @@ int main() {
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
     // The delivered tokens and their logprobs, with one deliberately unmeasured token in the middle:
-    // Phase 5.5 of docs/SCR_ROADMAP.md reads them from this record, and a NaN must reach the file as
+    // Phase 5.5 of docs/SCR.md reads them from this record, and a NaN must reach the file as
     // null rather than as a number that claims a measurement nobody made.
     outcome.generated_token_ids = {11, 22, 33};
     outcome.generated_logprobs  = {0.5f, std::numeric_limits<float>::quiet_NaN(), -1.25f};

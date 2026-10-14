@@ -286,7 +286,7 @@ int expect_rope_delta_recycling(ninfer::PagedKVPool& pool, cudaStream_t stream, 
     return failures == 0 ? 0 : 1;
 }
 
-// Step 3a of docs/SCR_QUANTIZED_KV_RELOCATION.md: after a reassign that carries a delta
+// Step 3a of docs/SCR.md: after a reassign that carries a delta
 // plane, the plane must hold the shift for each relocated page and kRopeDeltaNone
 // elsewhere. This is the pool-side half of the writer; the runtime-side half (the loop
 // that computes the deltas from relocated spans) is in program_impl.h and needs a GPU.

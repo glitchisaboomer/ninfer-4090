@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 5.5 of docs/SCR_ROADMAP.md: decide whether Suffix Cache Reuse changed the model's output
+// Phase 5.5 of docs/SCR.md: decide whether Suffix Cache Reuse changed the model's output
 // enough to be unacceptable.
 //
 // SCR reuses KV computed under the pre-edit context, so it is an approximation. The roadmap fixed

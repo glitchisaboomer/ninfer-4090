@@ -65,7 +65,7 @@ constexpr auto kLaunchers5120x17408 =
 // `NINFER_Q5_RESIDUAL_SPLITS=1` runs the identical schedule with one writer per element: deterministic,
 // and it rounds once instead of twice. It costs half the CTAs along K, which is what the split was for,
 // so it is an override rather than the default until that cost has been measured. See
-// docs/ISSUE_prefill-nondeterminism.md for the evidence that this is the divergent write.
+// docs/SCR.md for the evidence that this is the divergent write.
 bool q5_residual_single_split() {
     static const bool single = [] {
         const char* value = std::getenv("NINFER_Q5_RESIDUAL_SPLITS");

@@ -2,7 +2,7 @@
 // that lets attention read a relocated page as if it had been prefilled at its new position, and the
 // per-page delta rule that fills it.
 //
-// This is the half of docs/SCR_QUANTIZED_KV_RELOCATION.md Step 1 that needs no CUDA toolchain. The
+// This is the half of docs/SCR.md Step 1 that needs no CUDA toolchain. The
 // pool header that consumes these numbers includes <cuda_runtime_api.h>, so this arithmetic was pulled
 // into a CUDA-free header specifically so it can be tested somewhere without nvcc -- and so that an
 // off-by-one in the page rounding or a half-page span is caught here rather than on a GPU run where
