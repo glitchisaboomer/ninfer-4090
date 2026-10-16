@@ -15,8 +15,9 @@ The comparison is worthless unless SCR actually engaged, so this script fails lo
 server does not report reuse=suffix_relocation rather than reporting a vacuous pass.
 
 It also checks that the engagement was real work: the request log's `computed_prefill_tokens` is the
-engine's own count of the prompt tokens its prefill chunks ran, and for a relocated request that must
-be the prompt minus the relocated run. A relocation that is planned but never applied still answers
+engine's own count of the prompt tokens its prefill chunks ran, and that must be the prompt minus
+whatever was served from resident KV -- the cache hit plus the relocated run, for a request that
+reports both. A relocation that is planned but never applied still answers
 correctly -- the re-prefilled pages hold what the relocation would have served -- so the only thing
 that catches it is the work. `--scr-mode tail|segmented` selects which relocation shape to check, and
 `--shape scope-a|interleaved` selects the fixture it runs on: the built-in Scope-A prompt has one
@@ -1003,10 +1004,11 @@ def main():
                 "SCR did not engage, so this comparison would be vacuous. "
                 "Make the shared tail longer (>= a few 64-token blocks) and check that no "
                 "turn-checkpoint path is taking precedence.")
-        # cache_hit is prefix reuse only. For this edit shape the prefix does not match (the middle is
-        # deleted, so the resident prompt is not a prefix of the new one), so reuse_base is 0 and
-        # cache_hit is legitimately 0 even when relocation saved hundreds of tokens. The relocated
-        # count is reported separately as prefix_relocated_tokens in the JSON completion record.
+        # cache_hit is prefix reuse only, and the relocated count is reported separately, so the two
+        # are read separately below. An edit of this shape used to leave cache_hit at 0 -- the resident
+        # prompt is not a prefix of the new one, so there was no whole-prompt match to reuse -- but the
+        # opening of the prompt is unchanged, and the runtime now reuses it. A run therefore reports a
+        # cache hit and a relocated count at the same time.
 
     if len(ref_records) < 2:
         problems.append(f"expected 2 completion records in the --no-scr run, saw {len(ref_records)}")
@@ -1041,7 +1043,19 @@ def main():
         for record in scr_requests:
             prompt = record["prompt_tokens"]
             relocated = record["relocated"] if record["reuse"] == "suffix_relocation" else 0
-            cache = record["cache_hit"] if record["reuse"] != "suffix_relocation" else 0
+            # A path that relocates nothing has to report no relocated tokens: the plan clears them
+            # when it gives up on a relocation, and a summary that kept them would report reuse the
+            # request never performed. Read conditionally below, that field would hide such a plan, so
+            # it is checked here instead.
+            if record["reuse"] != "suffix_relocation" and record["relocated"] != 0:
+                problems.append(
+                    f"request {record['id']} ({record['reuse']}) reported {record['relocated']} "
+                    "relocated tokens on a path that relocates nothing")
+            # The cache hit is counted whatever the path. The prefill computes the prompt minus
+            # everything served from resident KV, and a plan that resumes at a shared prefix and
+            # relocates past it reports both counts at once -- the shape this fixture produces -- so
+            # zeroing either term would make the invariant wrong for exactly that request.
+            cache = record["cache_hit"]
             expected = prompt - relocated - cache
             computed = record["computed_prefill_tokens"]
             skipped = prompt - computed
