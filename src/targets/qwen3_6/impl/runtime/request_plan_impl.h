@@ -230,6 +230,47 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 plan->disk_snapshot_path = disk_match->file_path;
             }
         }
+        // The longest leading run the resident sequence and this prompt still share. Every path above
+        // needs the prompt to reach a frontier the lane kept whole -- the exact one it stopped at, a
+        // turn checkpoint, or a snapshot -- so a prompt that diverges before that frontier matched none
+        // of them and took a cold prefill, even where the leading run was identical, resident, and
+        // already at the positions the prompt wants.
+        //
+        // Nothing downstream recovers that run. Both relocation selectors drop it: a leading span is
+        // "ordinary prefix reuse", which they hold the reuse base responsible for. With a zero base it
+        // was therefore neither reused nor relocated, and every token of it was re-prefilled -- on the
+        // e2e fixture, which deletes a middle region, 576 of a 990-token prompt.
+        //
+        // Deliberately after the paths above and before relocation: they reuse more whenever they
+        // apply, and this one only ever claims less than the ledger holds, so it cannot displace a
+        // longer hit. It sets the base the relocation block below plans against, which is the other
+        // half of the same gap: survivors past the shared run are still relocated at their new
+        // positions, and the run itself needs nothing done to it at all.
+        //
+        // DFlash is excluded for the reason relocation already excludes it: its continuation is
+        // carried on a frontier of its own and its cache is filled through `kv_cache_append_prefix`
+        // rather than the page table, so resuming below that frontier is a different problem. The
+        // identity check is what keeps a prompt whose token types, positions or Vision items changed
+        // inside the shared run off this path; a Vision item straddling its end declines here and keeps
+        // the cold prefill it would otherwise have had.
+        if (plan->reuse == ReusePath::FullReset && sequence.retained && sequence.kv &&
+            speculative_backend != SpeculativeBackend::DFlash) {
+            const std::uint32_t resident_kv = static_cast<std::uint32_t>(
+                std::min(sequence.ledger.size(), static_cast<std::size_t>(sequence.text_kv_valid)));
+            // The final prompt token is always prefilled, because prompt logits can only come from a
+            // real forward pass. A base at the prompt end would instead sample from the hidden state of
+            // the last token the resident sequence generated, which is a different position entirely.
+            const std::uint32_t reusable =
+                static_cast<std::uint32_t>(prompt.token_ids.size() - 1ULL);
+            const std::uint32_t shared = qwen3_6::detail::longest_shared_prefix_tokens(
+                sequence.ledger, prompt.token_ids, resident_kv, reusable);
+            if (shared >= qwen3_6::detail::kPromptEditBlockTokens &&
+                qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                                shared)) {
+                plan->reuse      = ReusePath::AppendAtSharedPrefix;
+                plan->reuse_base = shared;
+            }
+        }
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -242,7 +283,16 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             (plan->reuse == ReusePath::RestoreTurnCheckpoint && decoder->mtp_cache() != nullptr &&
              sequence.mtp_kv_valid >= plan->reuse_base - 1) ||
             is_disk_restore;
-        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
+        // A shared-prefix resume consumes MTP rows the way it consumes Text ones: the rows below
+        // `reuse_base` are the resident rows, at the positions this prompt still wants, so only their
+        // extent has to be checked. `tail_hidden_valid` is deliberately not required here, unlike on
+        // the append path -- the prompt is longer than the base, so the first sample comes from the
+        // prefill and never from a retained hidden state.
+        const bool shared_prefix_ready =
+            plan->reuse == ReusePath::AppendAtSharedPrefix && decoder->mtp_cache() != nullptr &&
+            (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
+        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
+            !shared_prefix_ready) {
             plan->reuse              = ReusePath::FullReset;
             plan->reuse_base         = 0;
             plan->disk_snapshot_path.clear();
@@ -278,7 +328,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         base.vision_control == nullptr && sequence.retained && sequence.kv &&
         prompt.identity.reusable &&
         delta_path_supports_dtype(kv_dtype) &&
-        (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier)) {
+        (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier ||
+         plan->reuse == ReusePath::AppendAtSharedPrefix)) {
         // A relocation whose source is off the page grid cannot be re-pointed at all, only copied, so
         // both the detector and the selector/expressibility rules it feeds have to know which grid
         // they are planning against. Off by default: with the flag unset this block is the code it was
@@ -298,6 +349,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // contiguous run, so the derivation reproduces exactly the head and tail that mode has
         // always reported; segmented mode may interleave survivors anywhere, which yields one range
         // per gap and is the only structural difference.
+        //
+        // A shared-prefix resume reaches this block with the base it just claimed, so the run it
+        // covers is excluded from every span twice over -- by the selectors' "destination below the
+        // prefix frontier" rule and by the leading-span rule if the run starts at 0. That is the
+        // intent: those tokens are already reused, and a span over them would count them again and
+        // re-point pages that are already where the prompt wants them.
         const bool source_may_shift = qwen3_6::detail::scr_source_shift_enabled();
         const qwen3_6::detail::PromptEditDiff diff =
             source_may_shift
@@ -478,6 +535,18 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                    plan->reuse == ReusePath::RestoreDiskCheckpoint) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
+        } else if (plan->reuse == ReusePath::AppendAtSharedPrefix) {
+            // Staged, and with no bridge, for the reason SuffixRelocation has none: the bridge writes
+            // the MTP row at `base - 1` from the base model's hidden state at `base - 1`, and a lane
+            // retains exactly one, at the previous sequence's *last* position. That is `base - 1`
+            // only when the prompt reaches the frontier, which is the append path and precisely the
+            // case this one exists for the absence of. The row at `base - 1` therefore keeps the
+            // resident token it was written against. The MTP stem pairs row p with token p+1, so that
+            // one row ends up paired with a token the prompt no longer has there; drafts are verified
+            // against the base model, so the cost is draft quality at that position and never a wrong
+            // accepted token.
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = MtpBridgeMode::None;
         } else if (plan->reuse == ReusePath::SuffixRelocation) {
             // The relocated run's MTP rows are re-pointed alongside Text's, so only the two prefilled
             // ranges need staging, and the walk's `prepare_mtp` places them on the same pages the

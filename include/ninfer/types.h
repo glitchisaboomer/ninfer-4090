@@ -402,6 +402,14 @@ enum class PrefixReusePath : std::uint8_t {
     // re-prefilled. Unlike every other path, the tokens after `reuse_base` are not all
     // prefilled, so consumers must not assume "prefill the remainder".
     SuffixRelocation,
+    // The prompt shares a leading run with the resident sequence but diverges before the frontier
+    // the lane stopped at, which is the shape of an edit made inside the prompt. Unlike
+    // `AppendAtFrontier` the prompt reaches no frontier the lane kept whole, so the reuse ends at
+    // the divergence: resident KV covers `[0, reuse_base)`, everything after it is prefilled, and
+    // the recurrent state is zeroed because it was summarised past the divergence. The lane also
+    // retained no hidden state at `reuse_base - 1`, so a speculative backend stages its prefill
+    // here without a bridge. Appended rather than inserted so the existing values do not move.
+    AppendAtSharedPrefix,
 };
 
 struct GenerationResult {

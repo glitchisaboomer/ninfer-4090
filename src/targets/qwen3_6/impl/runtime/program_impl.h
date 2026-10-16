@@ -486,6 +486,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
     const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
+    // Whether this reuse resumes exactly where the resident sequence stopped, which is what makes
+    // the resident recurrent state a valid starting state for it. That state is a running summary of
+    // the whole resident sequence, so a base below the frontier it was summarised to means the prompt
+    // diverged from that sequence and the state asserts content the prompt no longer contains. The
+    // two cases that reuse below the frontier -- a shared-prefix resume, and a relocation whose first
+    // survivor starts exactly at the base -- each invalidate it, and nothing else does.
+    const bool reuse_covers_resident = base != 0 && base == sequence.execution_frontier;
     // Suffix Cache Reuse can only be applied when the plan carries the ranges the staged prefill has
     // to cover. `plan_tail_relocation` always yields a non-empty tail; the general selector does not
     // supply one, so a plan without it falls back to ordinary prefix reuse. That keeps generated
@@ -762,7 +769,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 set_device_i32(io.rope_delta, sequence.rope_delta);
             }
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier ||
-                   request_plan.reuse == ReusePath::SuffixRelocation) {
+                   request_plan.reuse == ReusePath::SuffixRelocation ||
+                   request_plan.reuse == ReusePath::AppendAtSharedPrefix) {
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
@@ -1005,8 +1013,16 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // the first survivor starts at the frontier, the resident prompt is a strict
                 // prefix of the new one, nothing was deleted ahead of the run, and the existing
                 // state is already a valid state for the reused prefix.
+                //
+                // The second clause is the frontier test rather than a second copy of the first,
+                // and it is what keeps the two apart: a survivor starting exactly at the base says
+                // nothing about whether the base is the frontier, and this plan resumed below it --
+                // which is the whole shape of a shared-prefix resume, and of an edit that moves a
+                // relocation onto a reused prefix. The first clause alone reads that as "the
+                // resident prompt is a strict prefix of the new one" and leaves the state stale
+                // for a prompt that diverges there.
                 const bool rebuild_linear_state =
-                    request_plan.relocated_spans.front().dest_begin > base;
+                    request_plan.relocated_spans.front().dest_begin > base || !reuse_covers_resident;
                 if (rebuild_linear_state) {
                     decoder->linear_attention.zero_slot(
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
@@ -1023,6 +1039,38 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
             } else {
                 trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+                // The relocation branch's contradiction, reached by the other route. A shared-prefix
+                // resume keeps the resident KV below `base` -- same tokens, same positions, so the
+                // pages are already what the prompt wants -- while the recurrent state was summarised
+                // to a frontier above it, so that state records the region the edit replaced. Nothing
+                // else invalidates it: it is not relocated, and this prompt never starts from it.
+                // Leaving it in place is 48 of 64 layers asserting content the prompt no longer
+                // contains, which is what made a misplaced relocated run emit degenerate output.
+                //
+                // Zeroing drops the prefix's own contribution as well, which is the approximation
+                // this path accepts and the SCR quality harness measures. Recovering it would mean
+                // replaying the prefix, which is the prefill the path exists to avoid.
+                if (!reuse_covers_resident) {
+                    LinearAttentionStateFingerprint gdn_before;
+                    if (scr_diagnostics_enabled()) {
+                        gdn_before = decoder->linear_attention.fingerprint_slot(
+                            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                            device.stream);
+                    }
+                    decoder->linear_attention.zero_slot(
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                        device.stream);
+                    if (scr_diagnostics_enabled()) {
+                        // The head is the reused prefix, and no recurrent layer sees any of it, so the
+                        // trace reports an empty head rather than a range to rebuild from.
+                        log_scr_gdn_state("invalidate", true, true, gdn_before,
+                                          decoder->linear_attention.fingerprint_slot(
+                                              LinearStateSlots::current_state_slot(
+                                                  sequence.lane, max_concurrency),
+                                              device.stream),
+                                          device.stream);
+                    }
+                }
             }
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);

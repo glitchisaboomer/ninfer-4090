@@ -22,6 +22,7 @@ namespace {
 using ninfer::TokenId;
 using ninfer::targets::qwen3_6::detail::diff_prompt_edit;
 using ninfer::targets::qwen3_6::detail::kPromptEditBlockTokens;
+using ninfer::targets::qwen3_6::detail::longest_shared_prefix_tokens;
 using ninfer::targets::qwen3_6::detail::PromptEditDiff;
 using ninfer::targets::qwen3_6::detail::SurvivingSpan;
 
@@ -1299,6 +1300,116 @@ void test_copied_price_covers_the_substitution_the_copier_performs() {
 
 } // namespace
 
+// The measurement the shared-prefix reuse path resumes on: how much of a prompt an edit made inside
+// it can still keep from resident KV. Every branch here is a different cap, because each one is a
+// separate fact about the lane -- the ledger, the prompt, the resident KV extent, and the rule that
+// the final token is prefilled -- and getting one wrong either claims KV nothing verified or throws
+// away reuse the lane could serve.
+//
+// The block floor is the part worth stating outright: the answer becomes a reuse base, resident KV
+// is addressed in whole pages, and a base that is not a whole block would leave the page behind it
+// partly valid and partly stale. So a run is reported in blocks, and a run shorter than one block is
+// reported as no reuse at all rather than as a fraction of a block.
+void test_longest_shared_prefix_tokens() {
+    const std::uint32_t block = kPromptEditBlockTokens;
+
+    // A whole shared run, with the prompt then diverging.
+    {
+        Tokens resident = segment(1, 4);
+        Tokens prompt   = segment(1, 4);
+        append(prompt, std::vector<TokenId>{99});
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(4),
+                                           static_cast<std::uint32_t>(prompt.size())) ==
+                   block_tokens(4),
+               "a whole shared run is reported in full");
+    }
+    // The same run plus half a block, which is not claimed: the partial block is dropped, never
+    // rounded up, because rounding up would claim KV the comparison never confirmed.
+    {
+        Tokens resident = segment(1, 4);
+        Tokens prompt   = segment(1, 4);
+        for (std::uint32_t i = 0; i < block / 2; ++i) { prompt.push_back(7); }
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(4),
+                                           static_cast<std::uint32_t>(prompt.size())) ==
+                   block_tokens(4),
+               "a partial trailing block is not claimed");
+    }
+    // Divergence inside a block drops that whole block rather than the part of it that still
+    // matches: the base has to name a page the prompt wants in full.
+    {
+        Tokens resident = segment(1, 5);
+        Tokens prompt   = segment(1, 5);
+        prompt[block_tokens(4) + 1] = 12345;
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(5),
+                                           static_cast<std::uint32_t>(prompt.size())) ==
+                   block_tokens(4),
+               "a divergence inside a block drops that block");
+    }
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 2), segment(2, 2), block_tokens(2),
+                                           block_tokens(2)) == 0,
+               "unrelated prompts share nothing");
+    }
+    // One whole block is the smallest base this reports, which is the threshold the caller applies
+    // too -- so a plan never resumes on less than a block.
+    {
+        const Tokens resident = segment(1, 1);
+        const Tokens prompt   = segment(1, 1);
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(1), block_tokens(1)) ==
+                   block_tokens(1),
+               "one whole block is a reuse base");
+    }
+    // Half a block of genuine token agreement is still no reuse base, though the tokens match and
+    // every cap allows it: the answer has to land on a page boundary.
+    {
+        const Tokens resident = segment(1, 1);
+        Tokens prompt;
+        for (std::uint32_t i = 0; i < block / 2; ++i) { prompt.push_back(resident[i]); }
+        prompt.push_back(7777);
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(1),
+                                           static_cast<std::uint32_t>(prompt.size())) == 0,
+               "a sub-block match is not a reuse base");
+    }
+    // Capped by the resident KV the lane holds, even where both ledgers agree further: KV past the
+    // resident frontier does not exist, so a longer match cannot be reused.
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 4), segment(1, 4), block_tokens(2),
+                                           block_tokens(4)) == block_tokens(2),
+               "the resident KV caps the shared run");
+    }
+    // Capped by `limit`, which is how the final prompt token stays prefilled.
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 4), segment(1, 4), block_tokens(4),
+                                           block_tokens(4) + block - 1) == block_tokens(4),
+               "a limit past the shared run does not extend it");
+        expect(longest_shared_prefix_tokens(segment(1, 4), segment(1, 4), block_tokens(4),
+                                           block_tokens(3)) == block_tokens(3),
+               "the limit caps the shared run");
+    }
+    // The shorter sequence ends the run, and degenerate inputs answer zero rather than throwing:
+    // every request that reaches the fallback calls this one.
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 2), segment(1, 4), block_tokens(4),
+                                           block_tokens(4)) == block_tokens(2),
+               "the shorter sequence bounds the run");
+        expect(longest_shared_prefix_tokens({}, segment(1, 2), block_tokens(2), block_tokens(2)) == 0,
+               "an empty resident ledger shares nothing");
+        expect(longest_shared_prefix_tokens(segment(1, 2), {}, 0, 0) == 0,
+               "an empty prompt shares nothing");
+    }
+    // Measured, not assumed: the same inputs answer the same number every time, so the base a plan
+    // is built on is reproducible across a suite run.
+    {
+        const Tokens resident = segment(3, 6);
+        const Tokens prompt   = segment(3, 6);
+        for (int i = 0; i < 8; ++i) {
+            expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(6),
+                                               block_tokens(6)) == block_tokens(6),
+                   "the shared-prefix measurement is deterministic");
+        }
+    }
+}
+
 int main() {
     test_identical_prompts();
     test_reasoning_stripping();
@@ -1327,6 +1438,7 @@ int main() {
     test_plan_copied_page_remap_acquires_every_relocated_page();
     test_shifted_pricing_excludes_the_copy_sources();
     test_copied_price_covers_the_substitution_the_copier_performs();
+    test_longest_shared_prefix_tokens();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

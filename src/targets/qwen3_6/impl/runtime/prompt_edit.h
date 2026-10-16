@@ -128,8 +128,12 @@ struct RelocatedSpan {
 //
 // A span is only relocatable when all of the following hold:
 //
-//   * It is not the leading span. The leading span is ordinary prefix reuse, which the existing
-//     planner already expresses, so relocating it would double account the same tokens.
+//   * It is not the leading span. The leading span is ordinary prefix reuse, which the planner
+//     expresses as the reuse base, so relocating it would double account the same tokens. Whether
+//     that base actually covers the run is the caller's side of the contract, not this function's:
+//     a caller that hands over a base of zero while the two prompts still share a leading run
+//     leaves every token of it to be re-prefilled, which is why request planning resolves the
+//     shared prefix before it selects spans.
 //   * Its source range is fully inside `resident_kv_tokens`, because resident KV for anything past
 //     the resident frontier does not exist.
 //   * Its destination range begins at or after `prefix_reuse_tokens`. A destination inside that
@@ -447,5 +451,32 @@ relocation_prefill_ranges(std::span<const RelocatedSpan> spans, std::uint32_t pr
 [[nodiscard]] PromptEditDiff diff_prompt_edit_shifted(std::span<const TokenId> previous,
                                                       std::span<const TokenId> current,
                                                       std::uint32_t anchor_tokens = 16);
+
+// The longest prefix `resident_tokens` and `prompt_tokens` agree on, in whole prompt-edit blocks.
+//
+// Every other prefix-reuse path needs the new prompt to reach a frontier the lane kept whole: the
+// exact one it stopped at, a turn checkpoint, or a snapshot. A prompt that diverges before that
+// frontier matches none of them, so it fell back to a cold prefill even where its leading run was
+// identical, resident, and already at the positions it wants. This measures that run, which is the
+// only reuse an edit made inside the prompt leaves available.
+//
+// Three caps, each a fact about the lane rather than a policy: the resident ledger, the prompt,
+// `resident_kv_tokens` because KV past the resident frontier does not exist, and `limit` because the
+// final prompt token is always prefilled -- prompt logits can only come from a real forward pass,
+// and a base at the prompt end would sample from a hidden state the lane never kept.
+//
+// Flooring to whole blocks is what makes the answer usable as a reuse base. Resident KV is addressed
+// in whole logical pages, so a prefix ending inside one would leave that page partly valid and
+// partly stale; flooring keeps every page the base retains entirely valid, at the cost of at most
+// one block of extra prefill. The measurement itself is token-exact -- a block counts only when all
+// of it matches.
+//
+// Token identity is not a reuse decision on its own: the caller still has to confirm its own
+// constraints (token types, positions, Vision items) at the returned count, exactly as
+// `diff_prompt_edit` leaves them to its caller, because this function sees none of them.
+[[nodiscard]] std::uint32_t longest_shared_prefix_tokens(std::span<const TokenId> resident_tokens,
+                                                         std::span<const TokenId> prompt_tokens,
+                                                         std::uint32_t resident_kv_tokens,
+                                                         std::uint32_t limit) noexcept;
 
 } // namespace ninfer::targets::qwen3_6::detail

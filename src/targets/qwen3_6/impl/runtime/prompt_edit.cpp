@@ -703,4 +703,19 @@ std::vector<RelocatedSpan> plan_shifted_relocations(const PromptEditDiff& diff,
     return candidates;
 }
 
+std::uint32_t longest_shared_prefix_tokens(std::span<const TokenId> resident_tokens,
+                                           std::span<const TokenId> prompt_tokens,
+                                           std::uint32_t resident_kv_tokens,
+                                           std::uint32_t limit) noexcept {
+    const std::size_t reach = std::min(
+        {resident_tokens.size(), prompt_tokens.size(), static_cast<std::size_t>(resident_kv_tokens),
+         static_cast<std::size_t>(limit)});
+    std::size_t shared = 0;
+    while (shared < reach && resident_tokens[shared] == prompt_tokens[shared]) { ++shared; }
+    // Whole blocks only, so every page the base retains is entirely valid rather than valid up to
+    // its last tokens. A short trailing run is dropped rather than rounded up: rounding up would
+    // claim KV the comparison never confirmed.
+    return static_cast<std::uint32_t>((shared / kPromptEditBlockTokens) * kPromptEditBlockTokens);
+}
+
 } // namespace ninfer::targets::qwen3_6::detail
