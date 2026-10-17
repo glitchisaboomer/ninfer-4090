@@ -85,6 +85,30 @@ std::uint32_t relocation_limit(std::uint32_t prompt_tokens,
     return limit;
 }
 
+void trim_relocated_run_tails(std::vector<RelocatedSpan>& spans, std::uint32_t tokens) {
+    if (spans.empty() || tokens == 0) { return; }
+    std::sort(spans.begin(), spans.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
+        return a.dest_begin < b.dest_begin;
+    });
+
+    std::vector<RelocatedSpan> kept;
+    kept.reserve(spans.size());
+    for (std::size_t i = 0; i < spans.size(); ++i) {
+        // Only the last span of a run ends where the prompts diverge. Spans whose destinations touch
+        // are one run, so the spans before that one have a trailing edge the edit did not replace and
+        // nothing to give back.
+        const bool ends_run =
+            (i + 1 == spans.size()) || (spans[i].dest_end() != spans[i + 1].dest_begin);
+        RelocatedSpan span = spans[i];
+        if (ends_run) {
+            if (span.tokens <= tokens) { continue; }
+            span.tokens -= tokens;
+        }
+        kept.push_back(span);
+    }
+    spans = std::move(kept);
+}
+
 std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
                                            std::uint32_t resident_kv_tokens,
                                            std::uint32_t prefix_reuse_tokens,

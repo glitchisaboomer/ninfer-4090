@@ -1486,6 +1486,56 @@ void test_relocation_leaves_a_forwarded_tail() {
            "the general selector forwards the same tail");
 }
 
+// Trimming a run's trailing edge moves its end back into text both prompts share, which is what the
+// second token-predicting layer's row pairing needs. A run with nothing to give is dropped, and a
+// run's earlier spans keep their full length because they do not end at the divergence.
+void test_trim_relocated_run_tails() {
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::trim_relocated_run_tails;
+
+    const auto span = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = source, .dest_begin = dest, .tokens = tokens};
+    };
+
+    // A single run loses exactly one block from its end and keeps its start.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(3))};
+        trim_relocated_run_tails(spans, kPromptEditBlockTokens);
+        expect(spans.size() == 1, "a run longer than the trim survives");
+        if (spans.size() == 1) {
+            expect(spans.front().source_begin == block_tokens(1) &&
+                       spans.front().dest_begin == block_tokens(2),
+                   "the trim keeps the run's start");
+            expect(spans.front().tokens == block_tokens(2), "the run loses one block from its end");
+        }
+    }
+    // A run no longer than the trim has nothing left to relocate.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(1))};
+        trim_relocated_run_tails(spans, kPromptEditBlockTokens);
+        expect(spans.empty(), "a run with nothing to give is dropped");
+    }
+    // Two spans whose destinations touch are one run: only the second ends at the divergence, so the
+    // first keeps its full length and the second gives back a block.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(1)),
+                                         span(block_tokens(2), block_tokens(3), block_tokens(2))};
+        trim_relocated_run_tails(spans, kPromptEditBlockTokens);
+        expect(spans.size() == 2, "both spans of a split run survive the trim");
+        if (spans.size() == 2) {
+            expect(spans.front().tokens == block_tokens(1), "the run's earlier span is untouched");
+            expect(spans.back().tokens == block_tokens(1), "the run's last span gives back a block");
+        }
+    }
+    // A zero trim leaves the plan alone.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(1))};
+        trim_relocated_run_tails(spans, 0);
+        expect(spans.size() == 1 && spans.front().tokens == block_tokens(1),
+               "a zero trim changes nothing");
+    }
+}
+
 int main() {
     test_identical_prompts();
     test_reasoning_stripping();
@@ -1506,6 +1556,7 @@ int main() {
     test_plan_tail_relocation_picks_one_run();
     test_plan_tail_relocation_merges_adjacent_survivors();
     test_relocation_leaves_a_forwarded_tail();
+    test_trim_relocated_run_tails();
     test_plan_page_remap();
     test_plan_page_remap_second_allocation();
     test_remap_pages_from_pool();

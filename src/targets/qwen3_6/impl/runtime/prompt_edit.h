@@ -62,8 +62,8 @@ inline constexpr std::uint32_t kPromptEditBlockTokens = 64;
 // ranges the prefill covers, so a run ending at the prompt end would leave those layers without any
 // of the prompt's own final tokens to summarise. The authors' reference keeps the same kind of floor
 // (16 tokens at the end of each moved block). This value bounds the suffix as a whole; a run's own
-// trailing edge is bounded separately, in whole blocks, because the page grid can only give a block
-// back.
+// trailing edge is bounded separately, in whole blocks, by `trim_relocated_run_tails`, because the
+// page grid can only give a block back.
 inline constexpr std::uint32_t kMinimumForwardedTailTokens = 16;
 
 // A contiguous run of tokens that is token-identical in both prompts, expressed in
@@ -136,6 +136,20 @@ struct RelocatedSpan {
 // tail floor return zero, which no run can satisfy, so they relocate nothing.
 [[nodiscard]] std::uint32_t relocation_limit(std::uint32_t prompt_tokens,
                                              std::optional<std::uint32_t> turn_rewrite_boundary);
+
+// Shrink the trailing edge of every contiguous relocated run by `tokens`, keeping each run's start
+// where it is. A run with nothing left to give is dropped, so a plan can end up relocating nothing.
+//
+// A surviving run always ends where the two prompts diverge. Leaving that run's last `tokens` to be
+// prefilled moves its end back into text both prompts share, which is what a moved row needs: the
+// token after the run then matches on both sides, so a position's moved key pairs with the token the
+// current prompt actually has after it rather than the one the edited prompt had. The layer that
+// predicts more than one token reads that pairing, so a run that ends at a divergence leaves its
+// last position paired with a token the edit replaced.
+//
+// The selectors do not apply this themselves: it is a cost paid only when a second token-predicting
+// layer will read the moved cache, and the caller decides that.
+void trim_relocated_run_tails(std::vector<RelocatedSpan>& spans, std::uint32_t tokens);
 
 // Turn a diff into the relocation geometry a runtime can act on.
 //

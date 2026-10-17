@@ -431,6 +431,17 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             }
         }
 
+        // The layer that predicts more than one token reads the same moved cache with a stem that
+        // pairs row p with token p + 1, so a run ending where the prompts diverge leaves its last
+        // row paired with a token the edit replaced. Forwarding each run's last block moves that
+        // end back into text the two prompts share, and the prefill then writes the row from a
+        // token the new prompt actually has. The cost is one block of reuse per run, paid only when
+        // that second token-predicting layer will read the cache.
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            qwen3_6::detail::trim_relocated_run_tails(plan_spans,
+                                                      qwen3_6::detail::kPromptEditBlockTokens);
+        }
+
         // The prefilled ranges, derived from the spans rather than carried next to them: one source
         // for both modes, and the tiling with the spans is what makes the accounting below honest.
         const std::uint32_t prompt_tokens_count =
