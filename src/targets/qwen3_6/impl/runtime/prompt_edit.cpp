@@ -76,6 +76,15 @@ constexpr std::size_t kMaxCandidateProbes = 8;
 
 } // namespace
 
+std::uint32_t relocation_limit(std::uint32_t prompt_tokens,
+                               std::optional<std::uint32_t> turn_rewrite_boundary) {
+    std::uint32_t limit = prompt_tokens > kMinimumForwardedTailTokens
+                              ? prompt_tokens - kMinimumForwardedTailTokens
+                              : 0;
+    if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
+    return limit;
+}
+
 std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
                                            std::uint32_t resident_kv_tokens,
                                            std::uint32_t prefix_reuse_tokens,
@@ -87,12 +96,9 @@ std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
         return candidates;
     }
 
-    // The last token a span may reach. The final prompt token is always prefilled, because prompt
-    // logits can only come from a real forward pass; the turn-rewrite boundary, when supplied, is
-    // earlier still, because it is the first token whose KV is already stale. The same limit the
-    // tail planner applies, for the same two reasons.
-    std::uint32_t limit = prompt_tokens - 1;
-    if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
+    // The same limit the tail planner applies, for the same two reasons: the tail after the last
+    // run is always prefilled, and the turn-rewrite boundary is the first token whose KV is stale.
+    const std::uint32_t limit = relocation_limit(prompt_tokens, turn_rewrite_boundary);
 
     for (const SurvivingSpan& span : diff.spans) {
         // The leading span is ordinary prefix reuse, already expressed by the planner's
@@ -156,12 +162,10 @@ TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_
     }
 
     // No span may reach this token, because nothing at or after it can be served from resident KV.
-    // Without a boundary the limit is the final prompt token, which always has to be prefilled
-    // because prompt logits can only come from a real forward pass. With one, the limit is the
-    // boundary itself, which is where the assistant's reasoning is rewritten and every earlier
-    // token stays valid.
-    std::uint32_t limit = prompt_tokens - 1;
-    if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
+    // The limit keeps the tail after the last run prefilled, and the turn-rewrite boundary, when
+    // supplied, cuts it earlier still: the boundary is where the assistant's reasoning is rewritten
+    // and every token before it stays valid.
+    const std::uint32_t limit = relocation_limit(prompt_tokens, turn_rewrite_boundary);
     if (trace != nullptr) {
         trace->limit             = limit;
         trace->boundary_supplied = turn_rewrite_boundary.has_value();
@@ -661,8 +665,7 @@ std::vector<RelocatedSpan> plan_shifted_relocations(const PromptEditDiff& diff,
         return candidates;
     }
 
-    std::uint32_t limit = prompt_tokens - 1;
-    if (turn_rewrite_boundary && *turn_rewrite_boundary < limit) { limit = *turn_rewrite_boundary; }
+    const std::uint32_t limit = relocation_limit(prompt_tokens, turn_rewrite_boundary);
 
     for (const SurvivingSpan& span : diff.spans) {
         if (span.old_begin == 0 && span.new_begin == 0) { continue; }

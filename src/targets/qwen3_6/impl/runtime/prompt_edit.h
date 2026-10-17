@@ -56,6 +56,16 @@ inline bool scr_source_shift_enabled() {
 // pages and can be described by page-aligned relocation metadata.
 inline constexpr std::uint32_t kPromptEditBlockTokens = 64;
 
+// The smallest stretch of prompt a plan must leave to be prefilled after its last relocated run.
+//
+// The layers that carry a recurrent state instead of per-token entries advance only over the token
+// ranges the prefill covers, so a run ending at the prompt end would leave those layers without any
+// of the prompt's own final tokens to summarise. The authors' reference keeps the same kind of floor
+// (16 tokens at the end of each moved block). This value bounds the suffix as a whole; a run's own
+// trailing edge is bounded separately, in whole blocks, because the page grid can only give a block
+// back.
+inline constexpr std::uint32_t kMinimumForwardedTailTokens = 16;
+
 // A contiguous run of tokens that is token-identical in both prompts, expressed in
 // whole blocks. Ranges are half-open: [begin, begin + tokens).
 struct SurvivingSpan {
@@ -120,6 +130,13 @@ struct RelocatedSpan {
     [[nodiscard]] std::uint32_t dest_end() const noexcept { return dest_begin + tokens; }
 };
 
+// The last token a relocated run may reach. It is the prompt end less
+// `kMinimumForwardedTailTokens`, so the tail after the last run is always prefilled, further
+// reduced to `turn_rewrite_boundary` when one is supplied and earlier. Smaller prompts than the
+// tail floor return zero, which no run can satisfy, so they relocate nothing.
+[[nodiscard]] std::uint32_t relocation_limit(std::uint32_t prompt_tokens,
+                                             std::optional<std::uint32_t> turn_rewrite_boundary);
+
 // Turn a diff into the relocation geometry a runtime can act on.
 //
 // This is the general selector, for the segmented runtime described in
@@ -140,8 +157,10 @@ struct RelocatedSpan {
 //     region is already covered by ordinary prefix reuse, and a span that straddles the boundary
 //     would be claimed twice, so the whole span is dropped rather than split.
 //   * Its destination ends before the last token a span may reach: the smaller of
-//     `prompt_tokens - 1` and `turn_rewrite_boundary`. The final prompt token must always be
-//     prefilled, because prompt logits can only come from a real forward pass. The boundary is the
+//     `prompt_tokens - kMinimumForwardedTailTokens` and `turn_rewrite_boundary`. The tail after the
+//     last relocated run is always prefilled, because prompt logits can only come from a real
+//     forward pass and the recurrent layers need the prompt's own final tokens; `relocation_limit`
+//     computes that end. The boundary is the
 //     first token whose KV is already stale, because the assistant's reasoning is about to be
 //     rewritten there, and a span carrying tokens at or after it would reuse KV that is stale by
 //     definition. A span overrunning either limit is trimmed back to the last whole block ending
@@ -263,10 +282,12 @@ struct TailRelocationPlan {
 //   * It is not the leading span, which is ordinary prefix reuse and would be counted twice.
 //   * Its source range is fully inside `resident_kv_tokens`.
 //   * Its destination begins at or after `prefix_reuse_tokens`.
-//   * Its destination begins before `prompt_tokens - 1`, so the final prompt token is always
-//     prefilled and the plan's `tail` range is never empty. A span reaching past that point is
-//     trimmed back to the last whole block ending before it, rather than dropped, so a surviving
-//     suffix that runs to the end of the prompt still relocates everything but its final block.
+//   * Its destination ends at or before `relocation_limit(prompt_tokens, turn_rewrite_boundary)`.
+//     That keeps at least `kMinimumForwardedTailTokens` tokens after the last run to be prefilled,
+//     so the recurrent layers always see the prompt's own final tokens and the plan's `tail` range
+//     is never empty. A span reaching past the limit is trimmed back to the last whole block ending
+//     before it, rather than dropped, so a surviving suffix that runs to the end of the prompt still
+//     relocates everything but its final block.
 //   * Its destination ends at or before `turn_rewrite_boundary`, when one is supplied.
 //
 // The boundary is the first prompt token whose KV is stale because the assistant's reasoning is

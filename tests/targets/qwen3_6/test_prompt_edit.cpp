@@ -1434,6 +1434,58 @@ void test_longest_shared_prefix_tokens() {
     }
 }
 
+// The tail after the last relocated run is always prefilled, and it has to be long enough for the
+// recurrent layers to summarise the prompt's own final tokens. A run that would otherwise reach the
+// prompt end is trimmed back a whole block when the remaining tail would be shorter than the floor.
+void test_relocation_leaves_a_forwarded_tail() {
+    using ninfer::targets::qwen3_6::detail::kMinimumForwardedTailTokens;
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::plan_tail_relocation;
+    using ninfer::targets::qwen3_6::detail::relocation_limit;
+
+    // The floor itself, and the boundary that can pull it earlier still.
+    expect(relocation_limit(0, std::nullopt) == 0, "an empty prompt has no relocatable tail");
+    expect(relocation_limit(kMinimumForwardedTailTokens, std::nullopt) == 0,
+           "a prompt no longer than the floor leaves nothing to relocate");
+    expect(relocation_limit(kMinimumForwardedTailTokens + 1, std::nullopt) == 1,
+           "one token past the floor leaves one token reachable");
+    expect(relocation_limit(block_tokens(4), std::nullopt) ==
+               block_tokens(4) - kMinimumForwardedTailTokens,
+           "the limit is the prompt end less the floor");
+    expect(relocation_limit(block_tokens(4), 7) == 7, "a boundary inside the tail wins");
+
+    // [P RRR SSS] -> [P SSS xxxxxxxx]: the survivor would reach the prompt end if it kept all three
+    // blocks, leaving only a partial block (8 tokens) to forward. The floor trims it to two.
+    Tokens previous;
+    append(previous, segment(1, 1)); // P
+    append(previous, segment(2, 3)); // R, deleted by the edit
+    append(previous, segment(3, 3)); // S, survives and moves left
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(3, 3));
+    for (int i = 0; i < 8; ++i) { current.push_back(11000 + i); } // trailing text, not a whole block
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    const auto plan = plan_tail_relocation(diff, resident, 0, prompt, 6);
+    expect(plan.viable, "the survivor still relocates when the tail would otherwise be short");
+    expect(plan.spans.size() == 1, "the short-tail fixture yields one relocated run");
+    if (plan.spans.size() == 1) {
+        expect(plan.spans.front().tokens == block_tokens(2),
+               "the run keeps the blocks that leave a full forwarded tail");
+        expect(plan.spans.front().dest_end() + kMinimumForwardedTailTokens <= prompt,
+               "the run ends early enough to leave the floor to be prefilled");
+        expect(plan.tail.tokens() >= kMinimumForwardedTailTokens,
+               "the tail carries at least the floor to be prefilled");
+    }
+
+    const auto general = plan_relocations(diff, resident, 0, prompt, std::nullopt, 6);
+    expect(general.size() == 1 && general.front().tokens == block_tokens(2),
+           "the general selector forwards the same tail");
+}
+
 int main() {
     test_identical_prompts();
     test_reasoning_stripping();
@@ -1453,6 +1505,7 @@ int main() {
     test_plan_tail_relocation_respects_turn_rewrite_boundary();
     test_plan_tail_relocation_picks_one_run();
     test_plan_tail_relocation_merges_adjacent_survivors();
+    test_relocation_leaves_a_forwarded_tail();
     test_plan_page_remap();
     test_plan_page_remap_second_allocation();
     test_remap_pages_from_pool();
