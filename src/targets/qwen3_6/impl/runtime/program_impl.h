@@ -1634,65 +1634,129 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
     return decoder->text_kv.execution_view(sequence.kv->text);
 }
 
+// The KV probe's decoding and row geometry, shared by both fingerprint functions and by the
+// `k_plane0` summary. None of it may assume a float plane.
+namespace {
+
+// One element of a KV plane as a float, decoded by the plane's own dtype.
+//
+// The dtype branch is not cosmetic. A BF16 plane stores a truncated FP32 and decodes as a shift; an
+// int8 plane stores one code per byte; and a packed plane (`rk4v4`, `rk4v4-e8`, `rk2v4-e8`) stores two
+// to four quantization codes per byte with every scale in a separate FP16 plane. Decoding packed codes
+// as BF16 does not read K, it reads the code bytes: `0x7F7F` becomes `FLT_MAX` and `0x7F2A` becomes a
+// NaN. That is exactly what a run with `--kv-dtype rk4v4-e8` reported before this branch existed --
+// 47143 "non-finite" words, a `[-3.38953e+38, 3.38953e+38]` range made of nothing but bit patterns,
+// and every relocated page marked changed because a fabricated NaN never equals itself.
+[[nodiscard]] float scr_plane_value(const void* plane, std::size_t index, DType dtype) {
+    switch (dtype) {
+        case DType::BF16: {
+            const std::uint32_t bits =
+                static_cast<std::uint32_t>(static_cast<const std::uint16_t*>(plane)[index]) << 16;
+            float value = 0.0F;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        }
+        case DType::FP32:
+            return static_cast<const float*>(plane)[index];
+        case DType::U8:
+            return static_cast<float>(static_cast<const std::uint8_t*>(plane)[index]);
+        case DType::I8:
+            return static_cast<float>(static_cast<const std::int8_t*>(plane)[index]);
+        default:
+            // No other dtype reaches a K/V plane today (`k_plane_dtype` is BF16, I8 or U8). For an
+            // unexpected one, report the raw element rather than inventing a float decode, so the
+            // fingerprints stay byte-exact even where their magnitudes are not activation-like.
+            return static_cast<float>(
+                static_cast<const std::uint8_t*>(plane)[index * dtype_size(dtype)]);
+    }
+}
+
+[[nodiscard]] float scr_plane_magnitude(const void* plane, std::size_t index, DType dtype) {
+    return std::fabs(scr_plane_value(plane, index, dtype));
+}
+
+// Element count of one (kv_head, page_offset) row, read from the plane's shape rather than from
+// `head_dim`: a packed plane holds `head_dim/2` codes per token, i.e. `head_dim/4` elements of a
+// 16-bit read, so dividing the element index by `head_dim` folded four tokens into one printed row
+// and shifted the reported `kv_head` -- the `of 256` count and the `pos=` labels drifting.
+// Zero means the page does not divide into `rows` even rows and the caller must bail rather than
+// mislabel.
+[[nodiscard]] std::size_t scr_row_elements(const PagedKVLayerView& layer, std::size_t page_stride,
+                                          std::size_t rows) {
+    const std::size_t element_size = dtype_size(layer.k_pages.dtype);
+    if (rows == 0 || element_size == 0 || page_stride % (rows * element_size) != 0) { return 0; }
+    return page_stride / (rows * element_size);
+}
+
+[[nodiscard]] const char* scr_dtype_name(DType dtype) {
+    switch (dtype) {
+        case DType::BF16: return "bf16";
+        case DType::FP32: return "f32";
+        case DType::FP16: return "f16";
+        case DType::U8: return "u8";
+        case DType::I8: return "i8";
+        case DType::I32: return "i32";
+        case DType::I64: return "i64";
+    }
+    return "unknown";
+}
+
+} // namespace
+
 // Suffix-relocation diagnostics. Off unless scr_diagnostics_enabled(), so it costs nothing in
 // production. Writes to stderr, which the e2e script folds into the server log.
-// A KV plane is BF16, and BF16 is exactly the top 16 bits of an FP32, so decoding is a shift. The
-// page stride comes from nb[3] rather than a computed element count, so this stays correct for any
-// plane dtype.
+// The page stride comes from nb[3] and the element size from the plane's dtype, so a page is read as
+// what it is: `head_dim` BF16 per head for an uncompressed plane, `head_dim/2` packed codes per head
+// for `rk4v4-e8`. Nothing here assumes a float plane.
 float ProgramImplCore::scr_page_fingerprint(const PagedKVLayerView& layer,
                                              std::int32_t physical_page,
                                              cudaStream_t stream) const {
     if (physical_page < 0 || physical_page >= layer.k_pages.ne[3]) { return -1.0F; }
-    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
-    const std::size_t elements    = page_stride / sizeof(std::uint16_t);
-    std::vector<std::uint16_t> host(elements);
+    const std::size_t page_stride  = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t element_size = dtype_size(layer.k_pages.dtype);
+    if (element_size == 0 || page_stride % element_size != 0) { return -1.0F; }
+    const std::size_t elements = page_stride / element_size;
+    std::vector<std::uint8_t> host(page_stride);
     // Enqueued on the launching stream and then drained, so the read cannot precede the writes it
     // is meant to observe.
     CUDA_CHECK(cudaMemcpyAsync(host.data(),
                                static_cast<const char*>(layer.k_pages.data) +
                                    static_cast<std::size_t>(physical_page) * page_stride,
-                               host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
-                               stream));
+                               page_stride, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     float total = 0.0F;
-    for (const std::uint16_t word : host) {
-        std::uint32_t bits = static_cast<std::uint32_t>(word) << 16;
-        float value        = 0.0F;
-        std::memcpy(&value, &bits, sizeof(value));
-        total += std::fabs(value);
+    for (std::size_t i = 0; i < elements; ++i) {
+        total += scr_plane_magnitude(host.data(), i, layer.k_pages.dtype);
     }
     return total;
 }
 
+// sum|x| per (kv_head, page_offset) row of one physical page, with the row width taken from the plane
+// so the printed `kv_head`/`pos` name the row the bytes actually came from.
 std::vector<float> ProgramImplCore::scr_page_row_fingerprints(const PagedKVLayerView& layer,
                                                               std::int32_t physical_page,
                                                               cudaStream_t stream) const {
-    // The plane is page-major, then kv_head, then page_offset, then head_dim, so the page-relative
-    // element index divided by head_dim names the row directly.
     const std::size_t rows =
         static_cast<std::size_t>(layer.num_kv_heads) * kPagedKVPageSize;
     std::vector<float> totals(rows, 0.0F);
     if (physical_page < 0 || physical_page >= layer.k_pages.ne[3]) { return totals; }
 
-    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
-    const std::size_t elements    = page_stride / sizeof(std::uint16_t);
-    const std::size_t head_dim    = static_cast<std::size_t>(layer.head_dim);
-    if (head_dim == 0) { return totals; }
-    std::vector<std::uint16_t> host(elements);
+    const std::size_t page_stride  = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t row_elements = scr_row_elements(layer, page_stride, rows);
+    if (row_elements == 0) { return totals; }
+    std::vector<std::uint8_t> host(page_stride);
     // Enqueued on the launching stream and then drained, so the read cannot precede the writes it
     // is meant to observe.
     CUDA_CHECK(cudaMemcpyAsync(host.data(),
                                static_cast<const char*>(layer.k_pages.data) +
                                    static_cast<std::size_t>(physical_page) * page_stride,
-                               host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
-                               stream));
+                               page_stride, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    for (std::size_t i = 0; i < elements; ++i) {
-        std::uint32_t bits = static_cast<std::uint32_t>(host[i]) << 16;
-        float value        = 0.0F;
-        std::memcpy(&value, &bits, sizeof(value));
-        const std::size_t row = i / head_dim;
-        if (row < totals.size()) { totals[row] += std::fabs(value); }
+    for (std::size_t row = 0; row < rows; ++row) {
+        const std::size_t base = row * row_elements;
+        for (std::size_t i = 0; i < row_elements; ++i) {
+            totals[row] += scr_plane_magnitude(host.data(), base + i, layer.k_pages.dtype);
+        }
     }
     return totals;
 }
@@ -1764,18 +1828,22 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
     // show up here rather than as an unexplained downstream symptom.
     // Read exactly the plane's own bytes. This previously read numel * 4 from a BF16 plane, twice
     // the allocation, so the reported range and non-finite count described memory past the plane.
-    const std::size_t plane_bytes = static_cast<std::size_t>(layer.k_pages.bytes());
-    std::vector<std::uint16_t> host(plane_bytes / sizeof(std::uint16_t));
+    // The elements are decoded by the plane's dtype and labelled with it, because a packed plane's
+    // range is a range of quantization codes -- "finite" there is a property of the dtype, not a
+    // check of the data, and calling `head_dim`-wide BF16 words out of `head_dim/2` code bytes is
+    // what manufactured NaN and `FLT_MAX` in the first place.
+    const std::size_t plane_bytes    = static_cast<std::size_t>(layer.k_pages.bytes());
+    const std::size_t element_size   = dtype_size(layer.k_pages.dtype);
+    const std::size_t plane_elements = element_size == 0 ? 0 : plane_bytes / element_size;
+    std::vector<std::uint8_t> host(plane_bytes);
     CUDA_CHECK(cudaMemcpy(host.data(), layer.k_pages.data, plane_bytes, cudaMemcpyDeviceToHost));
     std::size_t non_finite = 0;
     std::size_t first_bad  = 0;
     float lo               = 0.0F;
     float hi               = 0.0F;
     bool seeded            = false;
-    for (std::size_t i = 0; i < host.size(); ++i) {
-        std::uint32_t bits = static_cast<std::uint32_t>(host[i]) << 16;
-        float value        = 0.0F;
-        std::memcpy(&value, &bits, sizeof(value));
+    for (std::size_t i = 0; i < plane_elements; ++i) {
+        const float value = scr_plane_value(host.data(), i, layer.k_pages.dtype);
         if (!std::isfinite(value)) {
             if (non_finite == 0) { first_bad = i; }
             ++non_finite;
@@ -1785,7 +1853,8 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
         if (!seeded || value > hi) { hi = value; }
         seeded = true;
     }
-    out << " k_plane0{bytes=" << plane_bytes << " non_finite=" << non_finite;
+    out << " k_plane0{bytes=" << plane_bytes << " dtype=" << scr_dtype_name(layer.k_pages.dtype)
+        << " elements=" << plane_elements << " non_finite=" << non_finite;
     if (non_finite != 0) { out << " first_bad_index=" << first_bad; }
     out << " range=[" << lo << "," << hi << "]}";
 
@@ -1840,8 +1909,19 @@ void ProgramImplCore::log_scr_relocation_integrity(
         return total;
     };
 
+    // The plane's geometry, printed once, so the per-row numbers below can be read without knowing
+    // which `--kv-dtype` produced them: `head_dim` elements per row for an uncompressed plane,
+    // `head_dim/2` packed codes per row for `rk4v4-e8`, and `dtype=u8` saying that a row total is a
+    // sum of code bytes rather than of activation magnitudes.
+    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t page_rows =
+        static_cast<std::size_t>(layer.num_kv_heads) * kPagedKVPageSize;
+
     std::ostringstream out;
-    out << "[scr-diag] post-prefill integrity";
+    out << "[scr-diag] post-prefill integrity plane{dtype="
+        << scr_dtype_name(layer.k_pages.dtype)
+        << " row_elements=" << scr_row_elements(layer, page_stride, page_rows)
+        << " rows=" << page_rows << " packed=" << (layer.packed_k ? "yes" : "no") << "}";
     std::size_t intact_pages = 0;
     for (const auto& probe : probes) {
         const std::size_t logical  = static_cast<std::size_t>(probe.logical_page);
@@ -1861,7 +1941,10 @@ void ProgramImplCore::log_scr_relocation_integrity(
         for (std::size_t row = 0; row < row_count; ++row) {
             const float expected = probe.row_fingerprints[row];
             const float observed = after[row];
-            if (expected == observed) { continue; }
+            // Bit-exact, not `==`. A fingerprint that decodes to NaN is itself a finding, and
+            // `NaN != NaN` booked every NaN row as changed -- which is how a fabricated NaN in a
+            // packed plane turned into `0/282 intact` on a run whose bytes had not moved at all.
+            if (std::memcmp(&expected, &observed, sizeof(float)) == 0) { continue; }
             ++changed;
             largest = std::max(largest, std::fabs(observed - expected));
             if (shown < 6) {

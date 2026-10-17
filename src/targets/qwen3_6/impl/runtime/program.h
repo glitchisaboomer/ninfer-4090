@@ -513,6 +513,11 @@ private:
     // the page remap, per-page fingerprints taken before and after the re-rotation, and whether the
     // relocated K plane is finite, since the relocation path has produced badly wrong output while
     // every component tests clean in isolation.
+    //
+    // Every number here is decoded by the plane's own dtype. A packed plane (`--kv-dtype rk4v4`,
+    // `rk4v4-e8`, `rk2v4-e8`) holds quantization codes, not floats, and reading them as BF16 invents
+    // NaN (`0x7F2A`) and `FLT_MAX` (`0x7F7F`) rather than measuring anything: on such a run
+    // `non_finite` and `range` describe bit patterns, and a row total is a sum of code bytes.
     void log_scr_relocation(const RequestPlanImpl& request_plan, std::uint32_t prompt_tokens,
                             std::uint32_t base, std::span<const std::int32_t> remap,
                             const qwen3_6::PagedKVCacheView& view,
@@ -527,7 +532,9 @@ private:
                                              cudaStream_t stream) const;
 
     // sum|x| per (kv_head, page_offset) row of one physical page. Strictly finer than
-    // scr_page_fingerprint, which collapses the whole page to one number.
+    // scr_page_fingerprint, which collapses the whole page to one number. The row width is the
+    // plane's own element extent, so the rows are the same rows for a packed plane; the printed
+    // integrity line labels the dtype so a code-byte total is not read as an activation magnitude.
     [[nodiscard]] std::vector<float> scr_page_row_fingerprints(const PagedKVLayerView& layer,
                                                               std::int32_t physical_page,
                                                               cudaStream_t stream) const;
