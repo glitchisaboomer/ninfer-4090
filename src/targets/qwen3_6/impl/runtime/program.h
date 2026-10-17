@@ -549,25 +549,23 @@ private:
     // The GDN half of the relocation diagnostic.
     //
     // A Linear Attention slot is one recurrent summary of a whole sequence rather than a per-token
-    // cache, so it cannot be relocated: there is nothing to move and no RoPE to undo. A relocated
-    // request therefore has to invalidate it, and program_impl.h does that by zeroing the slot and
-    // replaying the head range. That reasoning is sound but was never observed, and it has one
-    // unverified branch: when the plan's head range is empty the zero is skipped on the argument
-    // that the resident prompt is then a strict prefix of the new one. Nothing checked that
-    // argument, and a wrong answer here does not fail loudly -- 48 of 64 layers simply start from a
-    // summary of a prompt the request never contained, which shows up only as drift in the first
-    // generated token's logprob.
+    // cache, so it cannot be relocated and has no RoPE to undo. The relocated run is simply not
+    // forwarded; the state is kept. That follows the authors' design -- "snapshot the recurrent
+    // state before the edit and continue from that snapshot" -- which their reference implements as
+    // `KVREUSE_SSM_MODE=fork` (the default): restore the state saved at the end of the previous
+    // prompt. program_impl.h therefore keeps the resident slot and lets only the ranges the prefill
+    // covers advance it; it is not zeroed, because dropping the reused prefix's contribution from
+    // 48 of 64 layers is a far wider approximation than SCR accepts and bounds with K.
     //
-    // This reports, per stage, whether the zero was taken and how much magnitude each layer's conv
-    // and recurrent halves actually carry, so the three states that look alike from the outside
-    // separate: zero skipped (magnitude left over from the previous prompt), zero taken and still
-    // zero (head range empty or not yet replayed), and zero taken and refilled by prefill (magnitude
-    // back). A non-zero non-finite count means the replay itself produced garbage, which is a
-    // different fault entirely.
+    // This reports, per stage, how much magnitude each layer's conv and recurrent halves carry, so
+    // the state a stage ends with can be lined up against the cold-start control (`full_reset`) and
+    // read for drift. `full_reset` is the only stage that takes a zero, so only it reports the
+    // before/after pair; `fork` and `post_prefill` report the single retained magnitude. A non-zero
+    // non-finite count means a kernel produced garbage, which is a different fault entirely.
     //
     // Reading the whole slot costs a full PCIe round trip per stage, which is why this stays behind
     // the same NINFER_SCR_DIAG switch as the KV probe rather than running unconditionally.
-    void log_scr_gdn_state(const char* stage, bool zero_taken, std::optional<bool> head_empty,
+    void log_scr_gdn_state(const char* stage, bool zero_taken,
                            const LinearAttentionStateFingerprint& before,
                            const LinearAttentionStateFingerprint& after,
                            cudaStream_t stream) const;

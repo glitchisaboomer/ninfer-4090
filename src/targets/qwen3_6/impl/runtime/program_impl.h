@@ -486,13 +486,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
     const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
-    // Whether this reuse resumes exactly where the resident sequence stopped, which is what makes
-    // the resident recurrent state a valid starting state for it. That state is a running summary of
-    // the whole resident sequence, so a base below the frontier it was summarised to means the prompt
-    // diverged from that sequence and the state asserts content the prompt no longer contains. The
-    // two cases that reuse below the frontier -- a shared-prefix resume, and a relocation whose first
-    // survivor starts exactly at the base -- each invalidate it, and nothing else does.
-    const bool reuse_covers_resident = base != 0 && base == sequence.execution_frontier;
     // Suffix Cache Reuse can only be applied when the plan carries the ranges the staged prefill has
     // to cover. `plan_tail_relocation` always yields a non-empty tail; the general selector does not
     // supply one, so a plan without it falls back to ordinary prefix reuse. That keeps generated
@@ -536,11 +529,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
             // The control leg of the diagnostic. `ordered_reset` zeroes the GDN slot here too, so
-            // without this line the trace only ever shows the relocated path's stages and there is
-            // nothing to read a "stale recurrent state" against -- the run that is supposed to be
-            // the reference cannot be observed.
+            // this is the only stage that reads a cold-start state; without it the trace only ever
+            // shows the `fork` and `post_prefill` stages of a retained state, and there is nothing
+            // to read their magnitude against.
             if (scr_diagnostics_enabled()) {
-                log_scr_gdn_state("full_reset", true, std::nullopt, LinearAttentionStateFingerprint{},
+                log_scr_gdn_state("full_reset", true, LinearAttentionStateFingerprint{},
                                   decoder->linear_attention.fingerprint_slot(
                                       LinearStateSlots::current_state_slot(sequence.lane,
                                                                            max_concurrency),
@@ -989,14 +982,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     }
                 }
                 suffix_prefill_ranges.clear();
-                // Diagnostic only: fingerprint the GDN slot across the invalidation below so the
-                // trace says whether the zero ran, not merely that the code path was reached.
-                LinearAttentionStateFingerprint gdn_before;
-                if (scr_diagnostics_enabled()) {
-                    gdn_before = decoder->linear_attention.fingerprint_slot(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                        device.stream);
-                }
                 // Every range the plan reports, in prompt order, with the relocated runs as the gaps
                 // between them. One range is the ordinary contiguous shape; more than one is what
                 // interleaved survivors produce, and the staged walk consumes either without change
@@ -1006,43 +991,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     suffix_prefill_ranges.push_back(range);
                 }
                 // The linear-attention layers keep one fixed-size recurrent state for the whole
-                // sequence rather than a per-token cache, so there is nothing to relocate and
-                // nothing to re-rotate. The state left over from the previous prompt was
-                // summarised over the *old* token sequence, including the region this edit just
-                // deleted, so leaving it in place has 48 of 64 layers asserting that content the
-                // prompt no longer contains. That is a contradiction rather than an
-                // approximation, and it is what made the relocated run emit degenerate output.
+                // sequence rather than a per-token cache, so there is nothing to relocate and no
+                // RoPE to undo: the relocated run is simply not forwarded. The state is kept, not
+                // rebuilt -- the authors' design "snapshots the recurrent state before the edit and
+                // continues from that snapshot", and their reference implements it as
+                // `KVREUSE_SSM_MODE=fork` (its default): "restore the state saved at the end of the
+                // previous prompt". The resident state is exactly that snapshot, and only the ranges
+                // pushed above advance it.
                 //
-                // Zeroing is sufficient and needs no snapshot. The ranges pushed just above are
-                // prefilled from this point on, and feeding the new content into a zeroed
-                // recurrence yields exactly the state a cold prefill of it would produce, which is
-                // what the paper's "snapshot the recurrent state before the edit" recovers. The
-                // relocated run then contributes nothing to these layers, which is the
-                // approximation the paper describes and measures as robust.
-                //
-                // Only when the first relocated destination does not start at the frontier, which
-                // is exactly when a range exists between the frontier and it to rebuild from. When
-                // the first survivor starts at the frontier, the resident prompt is a strict
-                // prefix of the new one, nothing was deleted ahead of the run, and the existing
-                // state is already a valid state for the reused prefix.
-                //
-                // The second clause is the frontier test rather than a second copy of the first,
-                // and it is what keeps the two apart: a survivor starting exactly at the base says
-                // nothing about whether the base is the frontier, and this plan resumed below it --
-                // which is the whole shape of a shared-prefix resume, and of an edit that moves a
-                // relocation onto a reused prefix. The first clause alone reads that as "the
-                // resident prompt is a strict prefix of the new one" and leaves the state stale
-                // for a prompt that diverges there.
-                const bool rebuild_linear_state =
-                    request_plan.relocated_spans.front().dest_begin > base || !reuse_covers_resident;
-                if (rebuild_linear_state) {
-                    decoder->linear_attention.zero_slot(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                        device.stream);
-                }
+                // Zeroing instead drops the whole reused prefix's contribution from 48 of 64 layers,
+                // an approximation far wider than the one SCR bounds with K. The reset that used to
+                // run here was added for degenerate output whose own later fix attributed the symptom
+                // to the prefill's base position, not this state, so it never had to drop the prefix.
                 if (scr_diagnostics_enabled()) {
-                    log_scr_gdn_state("invalidate", rebuild_linear_state, !rebuild_linear_state,
-                                      gdn_before,
+                    log_scr_gdn_state("fork", false, LinearAttentionStateFingerprint{},
                                       decoder->linear_attention.fingerprint_slot(
                                           LinearStateSlots::current_state_slot(sequence.lane,
                                                                                max_concurrency),
@@ -1051,37 +1013,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
             } else {
                 trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
-                // The relocation branch's contradiction, reached by the other route. A shared-prefix
-                // resume keeps the resident KV below `base` -- same tokens, same positions, so the
-                // pages are already what the prompt wants -- while the recurrent state was summarised
-                // to a frontier above it, so that state records the region the edit replaced. Nothing
-                // else invalidates it: it is not relocated, and this prompt never starts from it.
-                // Leaving it in place is 48 of 64 layers asserting content the prompt no longer
-                // contains, which is what made a misplaced relocated run emit degenerate output.
-                //
-                // Zeroing drops the prefix's own contribution as well, which is the approximation
-                // this path accepts and the SCR quality harness measures. Recovering it would mean
-                // replaying the prefix, which is the prefill the path exists to avoid.
-                if (!reuse_covers_resident) {
-                    LinearAttentionStateFingerprint gdn_before;
-                    if (scr_diagnostics_enabled()) {
-                        gdn_before = decoder->linear_attention.fingerprint_slot(
-                            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                            device.stream);
-                    }
-                    decoder->linear_attention.zero_slot(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                        device.stream);
-                    if (scr_diagnostics_enabled()) {
-                        // The head is the reused prefix, and no recurrent layer sees any of it, so the
-                        // trace reports an empty head rather than a range to rebuild from.
-                        log_scr_gdn_state("invalidate", true, true, gdn_before,
-                                          decoder->linear_attention.fingerprint_slot(
-                                              LinearStateSlots::current_state_slot(
-                                                  sequence.lane, max_concurrency),
-                                              device.stream),
-                                          device.stream);
-                    }
+                // A shared-prefix resume keeps the resident KV below `base` and the recurrent state
+                // the previous prompt summarised. That state covers a frontier above `base` and so
+                // records the region the edit replaced -- which is precisely the pre-edit snapshot
+                // the authors' design continues from (`KVREUSE_SSM_MODE=fork`). It is kept, and the
+                // prompt's new ranges below advance it, for the same reason the relocation branch
+                // keeps it: dropping it would discard the reused prefix's contribution from 48 of 64
+                // layers, far wider than the approximation SCR accepts and bounds with K.
+                if (scr_diagnostics_enabled()) {
+                    log_scr_gdn_state("fork", false, LinearAttentionStateFingerprint{},
+                                      decoder->linear_attention.fingerprint_slot(
+                                          LinearStateSlots::current_state_slot(sequence.lane,
+                                                                               max_concurrency),
+                                          device.stream),
+                                      device.stream);
                 }
             }
             sequence.text_kv_valid = base;
@@ -1974,11 +1919,11 @@ void ProgramImplCore::log_scr_prefill_chunk(std::uint32_t base, std::uint32_t cu
 }
 
 // Compact per-layer magnitude summary. Printing all 64 layers per stage would swamp the trace the
-// run is read through, so the line carries the total (which catches "the zero never ran"), the
-// worst layer (which catches one layer diverging while the total stays plausible), and a few
-// evenly spaced samples so two runs can be lined up by eye without a diff tool.
+// run is read through, so the line carries the total (which catches a slot left at zero when it
+// should carry a prefix), the worst layer (which catches one layer diverging while the total stays
+// plausible), and a few evenly spaced samples so two runs can be lined up by eye without a diff
+// tool.
 void ProgramImplCore::log_scr_gdn_state(const char* stage, bool zero_taken,
-                                        std::optional<bool> head_empty,
                                         const LinearAttentionStateFingerprint& before,
                                         const LinearAttentionStateFingerprint& after,
                                         cudaStream_t stream) const {
@@ -1999,23 +1944,16 @@ void ProgramImplCore::log_scr_gdn_state(const char* stage, bool zero_taken,
     };
 
     std::ostringstream out;
-    out << "[scr-diag] gdn stage=" << stage << " zero_taken=" << (zero_taken ? "yes" : "no")
-        << " head_range=";
-    if (!head_empty.has_value()) {
-        out << "n/a";
-    } else {
-        out << (*head_empty ? "empty" : "nonempty");
-    }
+    out << "[scr-diag] gdn stage=" << stage << " zero_taken=" << (zero_taken ? "yes" : "no");
 
-    // Read the layer count from `after`, which every stage fills. The two stages that have nothing
-    // to compare against pass an empty `before`, and reading the count from there would report
+    // Read the layer count from `after`, which every stage fills. The stages that have nothing to
+    // compare against pass an empty `before`, and reading the count from there would report
     // layers=0 on exactly the baseline legs a relocated run gets compared against.
     out << " layers=" << after.conv_abs_sum.size();
     if (zero_taken) {
-        // The whole question this line answers is whether the slot the relocation branch left
-        // behind is zero or stale, so report the magnitude rather than a boolean: "nonzero" alone
-        // would also be the answer after prefill has legitimately refilled it, and those two are
-        // the difference between a bug and the feature working.
+        // Only the cold-start control still takes a zero, and its whole question is whether the
+        // slot reads as zero afterwards, so report the before/after pair rather than a boolean:
+        // "nonzero" alone would also be the answer after prefill legitimately refilled it.
         out << " conv_abs_before=" << total(before.conv_abs_sum)
             << " conv_abs_after=" << total(after.conv_abs_sum)
             << " rec_abs_before=" << total(before.recurrent_abs_sum)
@@ -2714,18 +2652,17 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (scr_diagnostics_enabled()) {
                 // The GDN state every phase ends its prefill with.
                 //
-                // This is deliberately not gated on relocation. The question the run is trying to
-                // answer is whether a relocated request starts from a recurrent state that describes
-                // its own prompt, and "describes its own prompt" has to be checked against a run that
-                // provably built its state from a cold start. Fingerprinting only the relocated leg
-                // produces a number with nothing to compare it to -- which is exactly how the GDN
-                // invalidation went unobserved: each reading looked locally plausible.
+                // This is deliberately not gated on relocation. A relocated request now keeps the
+                // recurrent state the previous prompt summarised (the authors' `fork`) and advances
+                // it only over the ranges the prefill covers, so the question is whether that state
+                // still describes the new prompt; the reading is compared against a run that
+                // provably built its state from a cold start, which is what `full_reset` records.
                 //
                 // It is also the only per-phase observation of the state the first sampled token is
                 // computed from, so a baseline-vs-baseline difference here localises run-to-run
                 // drift to the recurrent state instead of leaving it somewhere in 64 layers.
-                log_scr_gdn_state("post_prefill", staged.reuse == ReusePath::SuffixRelocation,
-                                  std::nullopt, LinearAttentionStateFingerprint{},
+                log_scr_gdn_state("post_prefill", false,
+                                  LinearAttentionStateFingerprint{},
                                   decoder->linear_attention.fingerprint_slot(
                                       LinearStateSlots::current_state_slot(sequence.lane,
                                                                            max_concurrency),
