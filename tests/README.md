@@ -36,8 +36,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
 - `test_scr_e2e_shape.py` — the Suffix Cache Reuse end-to-end script's relocation fixtures and
   plan-shape assertions: the interleaved shape's two separated survivors, the tail/segmented
-  selection difference, the span cap, and the parser and tiling checks the `--scr-diag` plan is
-  read back through. Host-only, with a stand-in tokenizer, so it runs anywhere;
+  selection difference, the span cap, the off-grid shape's non-whole-page edit and the relaxation
+  its plan check needs, and the parser and tiling checks the `--scr-diag` plan is read back
+  through. Host-only, with a stand-in tokenizer, so it runs anywhere;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
