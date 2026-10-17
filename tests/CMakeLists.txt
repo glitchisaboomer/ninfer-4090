@@ -178,6 +178,13 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# What a mid-prompt edit costs the recurrent state, which cannot be relocated or rewound. Separate
+# from the prefix test above because it leaves a long prompt resident, and that test's cases were
+# recorded against the sequence state they set up for themselves.
+ninfer_add_test(ninfer_qwen3_6_27b_mid_prompt_edit_test
+  SOURCES targets/qwen3_6_27b/test_engine_mid_prompt_edit.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_mid_prompt_edit_test PROPERTIES SKIP_RETURN_CODE 77)
 # Guards prefill reproducibility. Position 0's logprob comes from the forward pass alone, so a
 # disagreement between two cold prefills of one fixed prompt is prefill disagreeing with itself.
 ninfer_add_test(ninfer_qwen3_6_27b_prefill_determinism_test
