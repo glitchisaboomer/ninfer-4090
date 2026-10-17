@@ -810,15 +810,24 @@ void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapp
     }
 
     // The mapping as it stands is the copy's source, and it stays valid until the copies have run.
+    //
+    // The two may differ in length, and a copied relocation has to accept that because the edit it
+    // serves is usually a deletion: the new prompt needs fewer pages than the resident one holds,
+    // while a surviving run still reads the pages above the new mapping's end. `reassign_pages` has
+    // always taken that shape -- it has no length guard either -- and the substitution below is the
+    // same arithmetic with the pages the copies read held out of the reuse, so a source page above
+    // the destination mapping is no more foreign to it than one below. What bounds this is not the
+    // length but the two ends being checked against their own mappings, which is
+    // `plan_relocated_page_moves`' job and the reason it takes both counts.
     const std::vector<std::int32_t> sources(page_ids_.begin(), page_ids_.end());
-    if (mapping.size() != sources.size()) {
-        throw std::invalid_argument("Paged KV relocation does not resize its mapping");
-    }
 
     // The moves, then the pages they read. Both are pure arithmetic over page ids -- in
-    // `core/paged_kv_delta_layout.h`, so they are testable without a GPU -- and both refuse a span that
-    // does not fit the mapping, which is what keeps a half-copied relocation from being published.
-    const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(spans, sources.size());
+    // `core/paged_kv_delta_layout.h`, so they are testable without a GPU -- and each end of a span is
+    // checked against the mapping that end is indexed in, which is what keeps a half-copied relocation
+    // from naming a page either side does not have and being published anyway.
+    const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(
+        spans, RelocatedPageCounts{.source      = sources.size(),
+                                   .destination = mapping.size()});
     std::vector<std::uint32_t> planned_ranges =
         encode_rope_delta_page_ranges(spans, mapping.size());
     std::vector<std::int32_t> protected_pages;

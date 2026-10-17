@@ -66,7 +66,7 @@ Keys aren't re-written with new rotations; they keep their original source rotat
 ## 4. Relocation Routes
 
 1. **Re-pointing (Default):** Updates block table to point to an existing physical page. Zero copy cost, requires free destination pages.
-2. **Copied Relocation:** Copies payload into acquired pool pages. Handles occupied destinations and off-grid sources.
+2. **Copied Relocation:** Copies payload into acquired pool pages. Handles occupied destinations, off-grid sources, and a mapping that is not the same length as the resident one — a deleted region shortens the prompt, so a surviving run's source pages lie above the new mapping's end; they pay for a destination unless a copy reads them, in which case they are released after the copy has run.
 
 ---
 
@@ -75,7 +75,7 @@ Keys aren't re-written with new rotations; they keep their original source rotat
 Verified on RTX 4090 (`sm_89`, CUDA 13.3, GCC 11, Linux):
 
 * `ninfer_gqa_attention_test`, `ninfer_gqa_kv_page_delta_test` (BF16), `_i8_test`, `_rotated_test`, `ninfer_scr_relocation_integration_test` all pass.
-* CTest: 97/97 pass (6 tests skipped due to missing model weights).
+* CTest: 98/98 pass (6 tests skipped due to missing model weights).
 * **Accuracy:** Partial-page relative L2 vs direct prefill is $\sim 1.86\times 10^{-3}$ to $3.42\times 10^{-3}$ (well under the $2.0\times 10^{-2}$ limit).
 * **Cost:** Partial-page decode is $1.007\times$ the baseline (essentially noise).
 
@@ -110,6 +110,7 @@ INT8 destinations aren't restricted to whole pages anymore.
 | `tests/ops/test_gqa_kv_page_delta_rotated.cpp` | Rotated variants (`rk8v4`, `rk4v4`, `rk4v4-e8`). |
 | `tests/ops/test_scr_relocation_integration.cpp` | End-to-end cache bytes check. |
 | `tests/test_paged_kv_delta_layout.cpp` | Packed range encoding & planner math. |
+| `tests/test_paged_kv_copied_relocation.cpp` | Copier oracle (`relocate_copied_pages`, device): a published mapping shorter than the resident one, the equal-length control, a growing mapping whose new destinations come from the pool, and the refusals. |
 | `tests/targets/qwen3_6/test_prompt_edit.cpp` | Detector/selector planning, including the off-grid planner gate. |
 | `tests/ops/test_scr_copied_relocation.cpp` | Copied-relocation oracle. |
 | `tests/targets/qwen3_6_27b/test_engine_prefill_determinism.cpp` | Prefill reproducibility (needs weights). |

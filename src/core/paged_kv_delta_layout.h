@@ -286,26 +286,49 @@ struct RelocatedPageMove {
     std::uint32_t tokens      = 0;
 };
 
-// Decomposes copied spans into the moves that carry them, validating against the mapping they are
-// being published into. `mapping_pages` is the page count of *both* mappings: the sources are the
-// current mapping's logical pages, the destinations the published mapping's, and a relocation never
-// changes the logical page count (it re-points and drops, it does not resize).
+// The two logical page counts a copied relocation spans: `source` is the mapping standing now,
+// which the copies read, and `destination` the mapping being published. Named rather than
+// positional because the two are the same type -- and, for a relocation that does not resize,
+// the same value -- so a transposition of two `std::size_t` arguments would compile and stay
+// invisible.
+struct RelocatedPageCounts {
+    std::size_t source      = 0;
+    std::size_t destination = 0;
+
+    // The common no-resize case, where both mappings are the same length.
+    [[nodiscard]] static constexpr RelocatedPageCounts same(std::size_t pages) noexcept {
+        return RelocatedPageCounts{.source = pages, .destination = pages};
+    }
+};
+
+// Decomposes copied spans into the moves that carry them, validating each end against the mapping
+// that end is indexed in: the sources are logical pages of the mapping standing now, which is the
+// copy's source, and the destinations logical pages of the mapping being published.
+//
+// Two counts, not one, because a relocation *can* resize. An edit that deletes a region shortens the
+// prompt, so the published mapping is shorter than the one it replaces, while a surviving run's
+// source still lies in the part of the old mapping the new one does not cover -- the reused prefix is
+// exactly that part. Bounding the sources by the destination's count refuses those edits for a reason
+// that is not true of them: the source never left its own mapping. Callers whose two mappings are the
+// same length pass `RelocatedPageCounts::same(pages)`.
 //
 // Splits at both source and destination page boundaries. Throws `std::invalid_argument` for a span
 // outside either mapping or for a relocation with no moves.
 [[nodiscard]] inline std::vector<RelocatedPageMove>
-plan_relocated_page_moves(std::span<const RelocatedCopySpan> spans, std::size_t mapping_pages) {
+plan_relocated_page_moves(std::span<const RelocatedCopySpan> spans, RelocatedPageCounts mappings) {
     constexpr std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
     std::vector<RelocatedPageMove> moves;
     moves.reserve(spans.size() * 4);
     for (const RelocatedCopySpan& span : spans) {
         const std::uint64_t dest_end = static_cast<std::uint64_t>(span.dest_begin) + span.tokens;
         const std::uint64_t source_end = static_cast<std::uint64_t>(span.source_begin) + span.tokens;
-        const std::uint64_t mapping_tokens = static_cast<std::uint64_t>(mapping_pages) * page;
-        if (span.tokens == 0 || dest_end > mapping_tokens) {
+        const std::uint64_t dest_tokens =
+            static_cast<std::uint64_t>(mappings.destination) * page;
+        const std::uint64_t source_tokens = static_cast<std::uint64_t>(mappings.source) * page;
+        if (span.tokens == 0 || dest_end > dest_tokens) {
             throw std::invalid_argument("Paged KV relocation span reaches past its mapping");
         }
-        if (source_end > mapping_tokens) {
+        if (source_end > source_tokens) {
             throw std::invalid_argument("Paged KV relocation source reaches past its mapping");
         }
 

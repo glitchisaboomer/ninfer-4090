@@ -926,8 +926,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // own check then refuses after the plan was reported as reuse.
                 std::vector<std::uint32_t> relocation_source_pages;
                 if (copying) {
-                    const std::vector<RelocatedPageMove> moves =
-                        plan_relocated_page_moves(copy_spans, remap.size());
+                    // The sources are logical pages of the mapping that stands now and the
+                    // destinations logical pages of the one being published, and those two are
+                    // different lengths whenever the edit resized the prompt: a deleted region leaves
+                    // the new prompt needing fewer pages than the resident one holds, while the
+                    // surviving run still reads the pages above the new mapping's end. Bounding the
+                    // sources by the destination's count refused exactly that, naming a source that
+                    // never left its own mapping -- and it refused it here, before the pool was
+                    // priced, so the request failed on an edit the copied path exists to serve. The
+                    // allocation's own relocate reads the same two counts the same way; these pages
+                    // are released after the copy, not before.
+                    const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(
+                        copy_spans,
+                        RelocatedPageCounts{.source      = sequence.kv->text.page_ids().size(),
+                                            .destination = remap.size()});
                     relocation_source_pages.reserve(moves.size());
                     for (const RelocatedPageMove& move : moves) {
                         relocation_source_pages.push_back(

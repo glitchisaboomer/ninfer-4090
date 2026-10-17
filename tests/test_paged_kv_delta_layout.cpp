@@ -44,6 +44,7 @@ using ninfer::kPagedKVAquirePage;
 using ninfer::plan_relocated_page_moves;
 using ninfer::plan_relocated_page_substitution;
 using ninfer::RelocatedCopySpan;
+using ninfer::RelocatedPageCounts;
 using ninfer::RelocatedPageMove;
 using ninfer::RelocatedPageSubstitution;
 using ninfer::RopeDeltaPageRange;
@@ -332,7 +333,16 @@ void test_copied_span_moves() {
     const auto moves_of = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens,
                              std::size_t pages) {
         const RelocatedCopySpan span{source, dest, tokens};
-        return plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1), pages);
+        return plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1),
+                                         RelocatedPageCounts::same(pages));
+    };
+    const auto moves_of_shrinking = [](std::uint32_t source, std::uint32_t dest,
+                                       std::uint32_t tokens, std::size_t source_pages,
+                                       std::size_t dest_pages) {
+        const RelocatedCopySpan span{source, dest, tokens};
+        return plan_relocated_page_moves(
+            std::span<const RelocatedCopySpan>(&span, 1),
+            RelocatedPageCounts{.source = source_pages, .destination = dest_pages});
     };
 
     // An aligned source is one move per destination page: the 64 tokens fit inside one source page.
@@ -436,7 +446,8 @@ void test_copied_span_moves() {
                               std::uint32_t tokens, std::size_t pages) {
         const RelocatedCopySpan span{source, dest, tokens};
         try {
-            (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1), pages);
+            (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1),
+                                            RelocatedPageCounts::same(pages));
             std::printf("  FAIL: accepted %s\n", what);
             ++g_failures;
         } catch (const std::invalid_argument&) {
@@ -472,10 +483,45 @@ void test_copied_span_moves() {
     // A relocation of nothing is not a relocation: the caller has to learn that rather than publish an
     // empty move list as success.
     try {
-        (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(), 16);
+        (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(),
+                                        RelocatedPageCounts::same(16));
         std::printf("  FAIL: accepted a relocation with no spans\n");
         ++g_failures;
     } catch (const std::invalid_argument&) {
+    }
+
+    // A shrinking edit, which is the shape the copied path exists for. The prompt lost a region, so
+    // the mapping being published is shorter than the one it replaces, and a surviving run reads pages
+    // above the published mapping's end while staying well inside its own. Measuring both ends against
+    // the published count refused exactly this, naming a source that never left its own mapping.
+    {
+        const std::vector<RelocatedPageMove> moves = moves_of_shrinking(960, 768, 192, 18, 16);
+        check(moves.size() == 3, "a source above the published mapping still splits per page");
+        for (std::size_t index = 0; index < moves.size() && index < 3; ++index) {
+            check(moves[index].dest_page == static_cast<std::int32_t>(12 + index),
+                  "its destinations ascend from the first published page it covers");
+            check(moves[index].source_page == static_cast<std::int32_t>(15 + index),
+                  "and its sources ascend in the mapping being replaced, not the published one");
+            check(moves[index].dest_token == 0 && moves[index].source_token == 0,
+                  "an aligned move starts at both page origins");
+            check(moves[index].tokens == static_cast<std::uint32_t>(kPagedKVPageSize),
+                  "each move carries a whole page");
+        }
+    }
+    // The same run against a source mapping that really is too short is still refused. This is the
+    // check that keeps the copier from naming a page the allocation does not have, and it has to
+    // survive the fix above rather than being traded away for it.
+    {
+        const RelocatedCopySpan span{960, 768, 192};
+        bool threw = false;
+        try {
+            (void)plan_relocated_page_moves(
+                std::span<const RelocatedCopySpan>(&span, 1),
+                RelocatedPageCounts{.source = 17, .destination = 16});
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        check(threw, "a source past its own mapping is still refused");
     }
 }
 
@@ -805,6 +851,65 @@ void test_relocated_page_substitution() {
               "and it is held once, as the page it is");
         check(out.final_ids[1] == 12 && out.final_ids[2] == kPagedKVAquirePage,
               "so the other dropped page pays for one destination and the pool for the other");
+    }
+
+    // A shrinking edit, which is the shape this substitution exists for: the new prompt needs fewer
+    // pages than the resident mapping holds, and a surviving run reads a page above the new mapping's
+    // end. The allocation used to refuse that outright -- it required the two mappings to be the same
+    // length -- which made the copied path unreachable for a deletion, the very edit that needs it.
+    // The arithmetic never needed the equality: a page above the destination mapping is a dropped page
+    // like any other, so it pays for a destination unless a copy reads it, and if a copy reads it it is
+    // held and returned after the copies have run.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13, 14, 15};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        // 14 is above the published mapping's last page and is the one the copies read.
+        const std::vector<std::int32_t> protected_pages{14};
+        const RelocatedPageSubstitution out =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        check(out.final_ids[0] == 10 && out.final_ids[1] == 11,
+              "the pages the shorter mapping keeps are kept");
+        check(out.final_ids[2] == 12 && out.final_ids[3] == 13,
+              "the dropped pages below the sources pay for both destinations");
+        check(out.from_pool == 0, "so the pool is not asked for anything");
+        check(out.held_for_copy.size() == 2 && out.held_for_copy[0] == 14 &&
+                  out.held_for_copy[1] == 15,
+              "the page above the mapping that a copy reads is held, and so is the surplus after it");
+
+        // Everything the allocation owned is accounted for exactly once: named by the shorter mapping,
+        // held for the copy, or -- when the pool is asked -- not owned at all. A leak here is a page the
+        // pool frees while the allocation still believes it owns it.
+        std::vector<std::int32_t> named(out.final_ids);
+        check(std::count(named.begin(), named.end(), kPagedKVAquirePage) ==
+                  static_cast<std::ptrdiff_t>(out.from_pool),
+              "the slots left for the pool are exactly the pages it supplies");
+        named.erase(std::remove(named.begin(), named.end(), kPagedKVAquirePage), named.end());
+        named.insert(named.end(), out.held_for_copy.begin(), out.held_for_copy.end());
+        std::sort(named.begin(), named.end());
+        check(named == current, "a shrink accounts for every page it owned, exactly once");
+    }
+
+    // The same shrink with nothing read: the pages above the mapping are then ordinary surplus, and
+    // they are handed back after the copies -- of which there are none -- rather than leaked.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13, 14, 15};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        const RelocatedPageSubstitution out = plan_relocated_page_substitution(current, mapping, {});
+        check(out.from_pool == 0, "a shorter mapping with unread surplus never asks the pool");
+        check(out.held_for_copy == std::vector<std::int32_t>({14, 15}),
+              "the surplus past the reuse is returned to the pool once the copies have run");
+    }
+
+    // And the other direction, so the arithmetic is not merely tolerated for a growth: a longer mapping
+    // buys its extra destinations from the pool when the current mapping has nothing to drop.
+    {
+        const std::vector<std::int32_t> current{10, 11};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        const RelocatedPageSubstitution out = plan_relocated_page_substitution(current, mapping, {});
+        check(out.from_pool == 2, "a longer mapping with nothing dropped asks the pool for both");
+        check(out.final_ids[0] == 10 && out.final_ids[1] == 11,
+              "while the pages it still names stay mapped");
+        check(out.held_for_copy.empty(), "and nothing is held, because nothing was dropped");
     }
 }
 
