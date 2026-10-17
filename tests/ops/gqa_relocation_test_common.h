@@ -1105,16 +1105,20 @@ inline bool expect_control_separates(const Error& correct, const Error& control,
 
 // The scenario: a 64-token run that prefill wrote at `src` must, after re-pointing the destination
 // logical page at the source's physical page, be what a direct prefill at `dst` would have written.
-constexpr std::int32_t kLogicalPages = 16;
 constexpr std::int32_t kSourcePage   = 9;
 constexpr std::int32_t kDestPage     = 3;
 constexpr std::int32_t kRelocatedRun = 64;
 constexpr std::int32_t kQueryTokens  = 16;
+// The fixture's cache is 16 pages. A scenario whose source position is further away than that needs
+// a bigger mapping, or the block table cannot name the page holding the surviving run, so the page
+// count travels with the scenario rather than being a global every check has to agree with.
+constexpr std::int32_t kLogicalPages = 16;
 // The queries sit at the end of the destination page, so every relocated key is visible.
 constexpr std::int32_t kQueryBase = kDestPage * kPageSize + kRelocatedRun - kQueryTokens;
 
 struct Scenario {
     std::vector<std::int32_t> table;
+    std::int32_t logical_pages        = kLogicalPages;
     std::int32_t src                  = kSourcePage * kPageSize;
     std::int32_t dst                  = kDestPage * kPageSize;
     std::vector<__nv_bfloat16> raw_k; // pre-RoPE, [head][token][d]
@@ -1124,17 +1128,33 @@ struct Scenario {
     std::vector<__nv_bfloat16> q;
 };
 
-inline Scenario build_scenario(const FreqTable& freq) {
+// One builder for every scenario shape. The page count and both positions are arguments, and the
+// keys are drawn in a fixed order, so two callers that pass the same positions get the same bytes.
+// `src` may start off-grid -- the surviving run of an edit can begin partway through a page -- and
+// the destination offsets are what the fixture then compares against.
+inline Scenario build_scenario_at(const FreqTable& freq, std::int32_t logical_pages,
+                                  std::int32_t src, std::int32_t dst) {
     Scenario scenario;
+    scenario.logical_pages = logical_pages;
+    scenario.src           = src;
+    scenario.dst           = dst;
     // A non-identity permutation, so logical page N is not physical page N and the Op has to consult
-    // the block table.
-    scenario.table.resize(static_cast<std::size_t>(kLogicalPages));
-    for (std::int32_t i = 0; i < kLogicalPages; ++i) {
-        scenario.table[static_cast<std::size_t>(i)] = (i * 7 + 3) % kLogicalPages;
+    // the block table. 7 is coprime with every page count used here, so this stays a permutation.
+    scenario.table.resize(static_cast<std::size_t>(logical_pages));
+    for (std::int32_t i = 0; i < logical_pages; ++i) {
+        scenario.table[static_cast<std::size_t>(i)] = (i * 7 + 3) % logical_pages;
     }
     // reassign_pages: the destination logical page now points at the surviving physical page.
-    scenario.table[static_cast<std::size_t>(kDestPage)] =
-        scenario.table[static_cast<std::size_t>(kSourcePage)];
+    const std::int32_t dst_page = dst / kPageSize;
+    const std::int32_t src_page = src / kPageSize;
+    scenario.table[static_cast<std::size_t>(dst_page)] =
+        scenario.table[static_cast<std::size_t>(src_page)];
+    // A run that starts off-grid continues on the next destination page, which is the source run's
+    // own continuation. An aligned run covers one page completely and needs no second alias.
+    if (dst % kPageSize + kRelocatedRun > kPageSize) {
+        scenario.table[static_cast<std::size_t>(dst_page + 1)] =
+            scenario.table[static_cast<std::size_t>(src_page + 1)];
+    }
 
     const std::size_t elems =
         static_cast<std::size_t>(kHeadDim) * kKvHeads * static_cast<std::size_t>(kRelocatedRun);
@@ -1182,9 +1202,42 @@ inline Scenario build_scenario(const FreqTable& freq) {
     return scenario;
 }
 
+inline Scenario build_scenario(const FreqTable& freq) {
+    return build_scenario_at(freq, kLogicalPages, kSourcePage * kPageSize, kDestPage * kPageSize);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Large-delta scenarios.
+//
+// The two above move a run by six pages (delta -384). A live session published -3021 and -9340 on a
+// 330-page cache, and the counter-rotation is the one input whose magnitude changes the arithmetic:
+// the kernel computes sincosf(delta * inv_freq) in float, and pair 0's inv_freq is 1.0, so a delta
+// of 9340 is a rotation argument of 9340 radians -- a range the 384 case never reaches. The partial
+// page asks the same question from the other side: on a page holding a relocated interval plus
+// unrotated keys, the two frames are now thousands of tokens apart instead of a few hundred, and the
+// extra group-0 tile the interval reads must still be the one the keys were computed in.
+//
+// 160 logical pages is 10,240 addressable positions, enough to hold both deltas with the surviving
+// run inside the mapping, so the block table still names the page that really holds it.
+
+constexpr std::int32_t kLargeDeltaLogicalPages = 160;
+
+// A run covering whole destination pages, moved by `delta` tokens. Negative means the source sits
+// after the destination, which is what an edit that deletes text leaves behind.
+inline Scenario build_large_delta_scenario(const FreqTable& freq, std::int32_t delta) {
+    const std::int32_t dst = kDestPage * kPageSize;
+    return build_scenario_at(freq, kLargeDeltaLogicalPages, dst - delta, dst);
+}
+
+// The same move into an off-grid destination, so each end of the run falls inside a page.
+inline Scenario build_large_delta_unaligned_scenario(const FreqTable& freq, std::int32_t delta) {
+    const std::int32_t dst = kDestPage * kPageSize + 7;
+    return build_scenario_at(freq, kLargeDeltaLogicalPages, dst - delta, dst);
+}
+
 // A cache holding what a direct prefill at the destination would have written, reachable as a value.
 inline Cache make_reference_cache(const Scenario& scenario) {
-    Cache cache(kLogicalPages, scenario.table, kKvHeads);
+    Cache cache(scenario.logical_pages, scenario.table, kKvHeads);
     append_chunk(cache, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
     return cache;
 }
@@ -1204,12 +1257,12 @@ inline DeltaMetadata make_delta_metadata(const Scenario& scenario) {
     const RelocatedCopySpan span{static_cast<std::uint32_t>(scenario.src),
                                  static_cast<std::uint32_t>(scenario.dst),
                                  static_cast<std::uint32_t>(kRelocatedRun)};
-    const auto page_ranges = plan_rope_delta_page_ranges(
-        std::span<const RelocatedCopySpan>(&span, 1), static_cast<std::size_t>(kLogicalPages));
-    DeltaMetadata metadata{std::vector<std::int32_t>(kLogicalPages, 0),
+    const auto mapping_pages = static_cast<std::size_t>(scenario.logical_pages);
+    const auto page_ranges   = plan_rope_delta_page_ranges(
+        std::span<const RelocatedCopySpan>(&span, 1), mapping_pages);
+    DeltaMetadata metadata{std::vector<std::int32_t>(scenario.logical_pages, 0),
                            encode_rope_delta_page_ranges(
-                               std::span<const RelocatedCopySpan>(&span, 1),
-                               static_cast<std::size_t>(kLogicalPages))};
+                               std::span<const RelocatedCopySpan>(&span, 1), mapping_pages)};
     for (std::size_t page = 0; page < page_ranges.size(); ++page) {
         if (page_ranges[page].begin != page_ranges[page].end) {
             metadata.deltas[page] = page_ranges[page].delta;
@@ -1306,20 +1359,23 @@ inline void place_unaligned_relocation_i8(Int8Cache& cache, const Scenario& scen
 // the fixture has always done, and the placers above write the run into those pages at the
 // destination offsets.
 inline Scenario build_unaligned_scenario(const FreqTable& freq) {
-    Scenario scenario = build_scenario(freq);
-    scenario.src = kSourcePage * kPageSize + 13;
-    scenario.dst = kDestPage * kPageSize + 7;
-    scenario.table[static_cast<std::size_t>(kDestPage)] =
-        scenario.table[static_cast<std::size_t>(kSourcePage)];
-    scenario.table[static_cast<std::size_t>(kDestPage + 1)] =
-        scenario.table[static_cast<std::size_t>(kSourcePage + 1)];
+    // Offsets 13 and 7 differ, which is the case the whole-page delta plane cannot express: page 3 is
+    // partial because the run starts at slot 7, page 4 because it ends at slot 6.
+    Scenario scenario = build_scenario_at(freq, kLogicalPages, kSourcePage * kPageSize + 13,
+                                         kDestPage * kPageSize + 7);
+    // This scenario's keys are rotated from the BF16-rounded raw rows rather than from the FP64 draws
+    // `build_scenario_at` keeps, because that is how this fixture was built before the two builders
+    // shared a body and its recorded numbers belong to that image. Re-deriving here keeps the bytes
+    // identical; `k_src` and `k_dst` move together, so the oracle and the kernel still read the same
+    // cache. Do not fold this back into `build_scenario_at` without re-recording every number this
+    // suite prints.
     std::array<double, kHeadDim> raw{};
     std::array<double, kHeadDim> rotated{};
     for (std::int32_t token = 0; token < kRelocatedRun; ++token) {
         for (std::int32_t head = 0; head < kKvHeads; ++head) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                raw[static_cast<std::size_t>(d)] = __bfloat162float(
-                    scenario.raw_k[act_index(head, token, kKvHeads, d)]);
+                raw[static_cast<std::size_t>(d)] =
+                    __bfloat162float(scenario.raw_k[act_index(head, token, kKvHeads, d)]);
             }
             forward_rope(raw.data(), scenario.src + token, freq, rotated.data());
             for (std::int32_t d = 0; d < kHeadDim; ++d) {

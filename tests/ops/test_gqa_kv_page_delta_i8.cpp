@@ -30,6 +30,23 @@ std::string named(const std::string& what, const char* scenario_name) {
     return labelled(what, scenario_name);
 }
 
+// Print what the delta plane actually carries for the destination page, not just what the fixture
+// asked for. The two can only disagree if the planner refused the span, and a fixture that silently
+// publishes an all-zero plane is the failure this whole test exists to catch.
+void print_large_delta_scenario(const char* name, const Scenario& scenario) {
+    const DeltaMetadata metadata = make_delta_metadata(scenario);
+    const std::int32_t pages     = scenario.logical_pages;
+    const std::size_t page       = static_cast<std::size_t>(scenario.dst / kPageSize);
+    const std::uint32_t range    = metadata.ranges[page];
+    std::printf("  %s: src %d -> dst %d, delta %d, plane[%zu] = %d, slots [%u, %u), %d pages\n",
+                name, scenario.src, scenario.dst, scenario.dst - scenario.src, page,
+                metadata.deltas[page], rope_delta_page_range_begin(range),
+                rope_delta_page_range_end(range), pages);
+    if (metadata.deltas[page] != scenario.dst - scenario.src) {
+        fail("the delta plane does not carry the scenario's shift for the destination page");
+    }
+}
+
 // The flag combination for KvCacheStorage::Int8Group64, confirmed in Part 0a: expected all
 // false. These constants feed both Int8Cache constructions and the diagnostic printf in
 // main, so a stale value is visible in the ctest output. If Part 0a reports otherwise,
@@ -57,25 +74,26 @@ void check_decode_attention_with_delta(const Scenario& scenario, const char* sce
     const std::int32_t base      = scenario.dst + kRelocatedRun - kDecodeTokens;
     const std::uint32_t visible  = static_cast<std::uint32_t>(base + kDecodeTokens);
     const DeltaMetadata metadata = make_delta_metadata(scenario);
+    const std::int32_t pages     = scenario.logical_pages;
 
     DeviceBuffer delta_buf = upload_i32(metadata.deltas);
     DeviceBuffer range_buf(metadata.ranges.size() * sizeof(std::uint32_t));
     range_buf.copy_from_host(metadata.ranges.data(),
                              metadata.ranges.size() * sizeof(std::uint32_t));
 
-    Int8Cache cache(kLogicalPages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
+    Int8Cache cache(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                     kPackedK, kE8Lattice, kE8Root);
     place_unaligned_relocation_i8(cache, scenario);
 
     PagedKVLayerView view = cache.view();
-    view.rope_deltas       = Tensor(delta_buf.p, DType::I32, {kLogicalPages});
-    view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {kLogicalPages});
+    view.rope_deltas       = Tensor(delta_buf.p, DType::I32, {pages});
+    view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {pages});
     view.rope_inv_freq     = freq;
 
     auto got_relocated = run_cached_attention_view_i8(cache, scenario.q, base, kDecodeTokens,
                                                       visible, view);
 
-    Int8Cache reference(kLogicalPages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
+    Int8Cache reference(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                         kPackedK, kE8Lattice, kE8Root);
     append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
     PagedKVLayerView ref_view = reference.view();
@@ -105,14 +123,14 @@ void check_decode_attention_with_delta(const Scenario& scenario, const char* sce
     // append -- so the skipped counter-rotation is the only difference this measures, and on a
     // partial page it stays the only difference: the ranges are still published, and a zero page
     // delta selects the same unrotated frame for both halves of the page.
-    std::vector<std::int32_t> zero_deltas(kLogicalPages, 0);
+    std::vector<std::int32_t> zero_deltas(pages, 0);
     DeviceBuffer zero_buf = upload_i32(zero_deltas);
-    Int8Cache stale(kLogicalPages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
+    Int8Cache stale(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                     kPackedK, kE8Lattice, kE8Root);
     place_unaligned_relocation_i8(stale, scenario);
     PagedKVLayerView stale_view = stale.view();
-    stale_view.rope_deltas       = Tensor(zero_buf.p, DType::I32, {kLogicalPages});
-    stale_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {kLogicalPages});
+    stale_view.rope_deltas       = Tensor(zero_buf.p, DType::I32, {pages});
+    stale_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {pages});
     stale_view.rope_inv_freq     = freq;
     auto got_stale = run_cached_attention_view_i8(stale, scenario.q, base, kDecodeTokens,
                                                   visible, stale_view);
@@ -136,6 +154,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const char* sc
     const FreqTable freq        = default_inv_freq();
     const std::int32_t base     = scenario.dst + kRelocatedRun;
     const std::uint32_t visible = static_cast<std::uint32_t>(base + kPrefillTokens);
+    const std::int32_t pages    = scenario.logical_pages;
 
     // The prefill path uses a Q sized for kPrefillTokens, not kQueryTokens. The reference must use
     // the same Q at the same positions, or the comparison is meaningless.
@@ -157,13 +176,13 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const char* sc
     range_buf.copy_from_host(metadata.ranges.data(),
                              metadata.ranges.size() * sizeof(std::uint32_t));
 
-    Int8Cache cache(kLogicalPages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
+    Int8Cache cache(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                     kPackedK, kE8Lattice, kE8Root);
     place_unaligned_relocation_i8(cache, scenario);
 
     PagedKVBatchLayerView batch_view = cache.batch_view();
-    batch_view.rope_deltas       = Tensor(delta_buf.p, DType::I32, {kLogicalPages, 1});
-    batch_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {kLogicalPages, 1});
+    batch_view.rope_deltas       = Tensor(delta_buf.p, DType::I32, {pages, 1});
+    batch_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {pages, 1});
     batch_view.rope_inv_freq     = freq;
 
     // The tail chunk the prefill call writes past the run. In the off-grid scenario its first page
@@ -186,7 +205,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const char* sc
                                                   visible, batch_view);
 
     // Reference: a direct prefill at the destination, then the same tail chunk.
-    Int8Cache reference(kLogicalPages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
+    Int8Cache reference(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                         kPackedK, kE8Lattice, kE8Root);
     append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
     auto got_reference = run_prefill_attention_i8(prefill_q, tail_k, tail_v, base, kPrefillTokens,
@@ -208,14 +227,14 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const char* sc
 
     // NEGATIVE CONTROL: the same run in the same destination slots with an all-zero delta plane,
     // through the same route, which also writes the same tail chunk into it.
-    std::vector<std::int32_t> zero_deltas(kLogicalPages, 0);
+    std::vector<std::int32_t> zero_deltas(pages, 0);
     DeviceBuffer zero_buf = upload_i32(zero_deltas);
-    Int8Cache stale(kLogicalPages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
+    Int8Cache stale(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                     kPackedK, kE8Lattice, kE8Root);
     place_unaligned_relocation_i8(stale, scenario);
     PagedKVBatchLayerView stale_view = stale.batch_view();
-    stale_view.rope_deltas       = Tensor(zero_buf.p, DType::I32, {kLogicalPages, 1});
-    stale_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {kLogicalPages, 1});
+    stale_view.rope_deltas       = Tensor(zero_buf.p, DType::I32, {pages, 1});
+    stale_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {pages, 1});
     stale_view.rope_inv_freq     = freq;
 
     auto got_stale = run_prefill_attention_i8(prefill_q, tail_k, tail_v, base, kPrefillTokens,
@@ -256,6 +275,24 @@ int main() {
     check_prefill_attention_with_delta(scenario, "aligned");
     check_decode_attention_with_delta(unaligned, "off-grid");
     check_prefill_attention_with_delta(unaligned, "off-grid");
+
+    // Deltas in the thousands: the two values production published (2026-10-17 session, -3021 and
+    // -9340). The counter-rotation argument is delta * inv_freq, whose pair 0 is delta itself, so
+    // these are the only cases whose angle is large enough for range reduction to matter, and the
+    // off-grid one asks it of a page holding two frames at once.
+    const Scenario delta_3021  = build_large_delta_scenario(freq, -3021);
+    const Scenario delta_9340  = build_large_delta_scenario(freq, -9340);
+    const Scenario delta_split = build_large_delta_unaligned_scenario(freq, -9340);
+    print_large_delta_scenario("large delta, aligned", delta_3021);
+    print_large_delta_scenario("large delta, aligned", delta_9340);
+    print_large_delta_scenario("large delta, off-grid", delta_split);
+
+    check_decode_attention_with_delta(delta_3021, "large delta, aligned");
+    check_prefill_attention_with_delta(delta_3021, "large delta, aligned");
+    check_decode_attention_with_delta(delta_9340, "large delta, aligned");
+    check_prefill_attention_with_delta(delta_9340, "large delta, aligned");
+    check_decode_attention_with_delta(delta_split, "large delta, off-grid");
+    check_prefill_attention_with_delta(delta_split, "large delta, off-grid");
 
     if (failures != 0) {
         std::printf("GQA KV page-delta INT8 oracle checks FAILED (%d)\n", failures);
