@@ -42,6 +42,10 @@ enum class MtpBridgeMode : std::uint8_t {
     None,
     BeforeSuffix,
     AfterExactHit,
+    // Forward the single token at `base - 1` over the resident prefix to recover the hidden state
+    // no cache holds there, and write the MTP row at `base - 1` from it. `BeforeSuffix` reads a
+    // hidden the lane kept; this mode has to produce one, so it runs the base model once.
+    FrontierForward,
 };
 
 // Host-side relocation geometry for Suffix Cache Reuse. Defined with the edit detector so

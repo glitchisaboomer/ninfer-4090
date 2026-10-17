@@ -1536,6 +1536,25 @@ void test_trim_relocated_run_tails() {
     }
 }
 
+// The MTP frontier forward is only usable when there is a prefix to read and a following token to
+// pair the recovered hidden with. Both ends matter: a zero base has no reused prefix, and a base at
+// the prompt end would read the token after the prompt while writing the row before it.
+void test_mtp_frontier_forward_applies() {
+    using ninfer::targets::qwen3_6::detail::mtp_frontier_forward_applies;
+
+    expect(!mtp_frontier_forward_applies(0, 0), "an empty prompt has no frontier to forward");
+    expect(!mtp_frontier_forward_applies(0, block_tokens(4)),
+           "a zero base has no reused prefix to read");
+    expect(!mtp_frontier_forward_applies(block_tokens(4), block_tokens(4)),
+           "a base at the prompt end has no following token");
+    expect(!mtp_frontier_forward_applies(block_tokens(5), block_tokens(4)),
+           "a base past the prompt end has no following token");
+    expect(mtp_frontier_forward_applies(block_tokens(1), block_tokens(4)),
+           "a base with a prefix and a following token applies");
+    expect(mtp_frontier_forward_applies(1, 2),
+           "the one-token prefix with one following token applies");
+}
+
 int main() {
     test_identical_prompts();
     test_reasoning_stripping();
@@ -1557,6 +1576,7 @@ int main() {
     test_plan_tail_relocation_merges_adjacent_survivors();
     test_relocation_leaves_a_forwarded_tail();
     test_trim_relocated_run_tails();
+    test_mtp_frontier_forward_applies();
     test_plan_page_remap();
     test_plan_page_remap_second_allocation();
     test_remap_pages_from_pool();

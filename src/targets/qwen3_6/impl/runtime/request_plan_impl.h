@@ -547,36 +547,41 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->prepare_mtp = true;
             plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
         } else if (plan->reuse == ReusePath::AppendAtSharedPrefix) {
-            // Staged, and with no bridge, for the reason SuffixRelocation has none: the bridge writes
-            // the MTP row at `base - 1` from the base model's hidden state at `base - 1`, and a lane
-            // retains exactly one, at the previous sequence's *last* position. That is `base - 1`
-            // only when the prompt reaches the frontier, which is the append path and precisely the
-            // case this one exists for the absence of. The row at `base - 1` therefore keeps the
-            // resident token it was written against. The MTP stem pairs row p with token p+1, so that
-            // one row ends up paired with a token the prompt no longer has there; drafts are verified
-            // against the base model, so the cost is draft quality at that position and never a wrong
-            // accepted token.
+            // The bridge reads a hidden the lane kept, and a lane keeps exactly one, at the previous
+            // sequence's *last* position -- which is `base - 1` only when the prompt reaches the
+            // frontier. This path exists for the case where it does not, so there is no hidden to
+            // read and the row at `base - 1` has to be produced instead: forward that one token over
+            // the resident prefix and write the row from the result.
             plan->prepare_mtp = true;
-            plan->mtp_bridge  = MtpBridgeMode::None;
+            plan->mtp_bridge  = qwen3_6::detail::mtp_frontier_forward_applies(
+                                   plan->reuse_base, plan->summary.prompt_tokens)
+                                    ? MtpBridgeMode::FrontierForward
+                                    : MtpBridgeMode::None;
         } else if (plan->reuse == ReusePath::SuffixRelocation) {
             // The relocated run's MTP rows are re-pointed alongside Text's, so only the two prefilled
             // ranges need staging, and the walk's `prepare_mtp` places them on the same pages the
             // Text remap chose.
             //
-            // No bridge, deliberately. The bridge writes the MTP row at the frontier from the base
-            // model's hidden state at `base - 1`, and a mid-prompt edit's frontier is a position the
-            // lane never retained: the one hidden state kept per lane, `sequence.tail_hidden`, is
-            // the previous sequence's *last* position, which is `base - 1` only for the
-            // AppendAtFrontier path. The MTP stem pairs row p with token p+1
-            // (`plan_mtp_alignment_window`: `shifted_embedding_begin = chunk_begin + 1`), so the two
-            // rows the edit moves -- the row at `base - 1` and the last row of the relocated run,
-            // each paired with a pre-edit token -- stay as the relocation left them. That costs
-            // draft quality at those positions and nothing else: drafts are verified against the
-            // base model, so a mist-paired row can lose a draft but never become a wrong accepted
-            // token. Recovering the true hidden is the open design question for this path; it is
-            // recorded here so the omission reads as a decision rather than an oversight.
+            // The MTP stem pairs row p with token p+1 (`plan_mtp_alignment_window`:
+            // `shifted_embedding_begin = chunk_begin + 1`), so a row left where the prompts diverge
+            // stays paired with a token the edit replaced. Two rows are exposed to that: the row at
+            // `base - 1`, and each moved run's last row.
+            //
+            // The moved run's last row is closed by the trim above: giving each run's last block back
+            // to the prefill moves its end into text both prompts share, so the prefill writes that
+            // row from a token the new prompt actually has.
+            //
+            // The row at `base - 1` has no stored hidden behind it -- `sequence.tail_hidden` is the
+            // previous sequence's *last* position, not this one -- so the runtime produces the hidden
+            // by forwarding that one token (`FrontierForward`). The forward reads the resident prefix
+            // and writes that position's Text KV in passing, which is saved and restored around it, so
+            // the reused prefix is left as the relocation found it. It does advance the recurrent
+            // summary by the one token; the caller's comment records why that is left alone.
             plan->prepare_mtp = true;
-            plan->mtp_bridge  = MtpBridgeMode::None;
+            plan->mtp_bridge  = qwen3_6::detail::mtp_frontier_forward_applies(
+                                   plan->reuse_base, plan->summary.prompt_tokens)
+                                    ? MtpBridgeMode::FrontierForward
+                                    : MtpBridgeMode::None;
         }
     }
     // The coupling, asserted where it can hold: the block above is what stages the MTP prefill, so a

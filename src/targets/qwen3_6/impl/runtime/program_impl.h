@@ -2564,6 +2564,39 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.mtp_bridge     = MtpBridgeMode::None;
         }
 
+        if (staged.mtp_bridge == MtpBridgeMode::FrontierForward) {
+            if (staged.cursor != staged.base ||
+                !qwen3_6::detail::mtp_frontier_forward_applies(staged.base,
+                                                               staged.prompt_tokens)) {
+                throw std::logic_error("staged MTP frontier forward is outside the reusable suffix");
+            }
+            if (staged.vision || dflash || !sequence.kv || !sequence.kv->text.valid()) {
+                throw std::logic_error("staged MTP frontier forward needs a resident Text prefix");
+            }
+            const std::uint32_t frontier_page =
+                (staged.base - 1) / static_cast<std::uint32_t>(kPagedKVPageSize);
+            const auto prefix_pages = sequence.kv->text.page_ids();
+            if (frontier_page >= prefix_pages.size() || prefix_pages[frontier_page] < 0) {
+                throw std::logic_error("staged MTP frontier forward has no prefix page to preserve");
+            }
+            mark_workspace_usage(workspace_plan.mtp_prefill);
+            // Forward the one token at `base - 1` to recover the hidden state the row there needs.
+            // That position is inside the reused prefix and its page is exact, so the helper stashes
+            // the page across the forward. The forward advances the recurrent summary by that one
+            // token and it is left advanced: the summary is already the previous prompt's end state
+            // (the fork the relocation keeps), which carries every token the edit replaced plus the
+            // generation that followed, so one more token sits inside that approximation. Restoring
+            // it would cost a second full state image per lane -- an FP32 [128,128,value_heads] per
+            // GDN layer -- and that is not worth a one-token difference inside a summary the fork
+            // already approximates. The MTP row this produces is the row the row at `base - 1` needs,
+            // and it is the only thing this forward exists for.
+            schedule::mtp_frontier_forward_row(
+                schedule_state, decoder->text_kv.pool(), prefix_pages[frontier_page],
+                std::span<const TokenId>(staged.prompt.token_ids), staged.base - 1);
+            sequence.mtp_kv_valid = staged.base;
+            staged.mtp_bridge     = MtpBridgeMode::None;
+        }
+
         if (staged.cursor < staged.prompt_tokens) {
             // Suffix Cache Reuse prefills the ranges the plan reported and leaves the relocated run
             // between them to resident KV, so the cursor skips over that run here.

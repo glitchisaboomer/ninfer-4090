@@ -66,6 +66,21 @@ inline constexpr std::uint32_t kPromptEditBlockTokens = 64;
 // page grid can only give a block back.
 inline constexpr std::uint32_t kMinimumForwardedTailTokens = 16;
 
+// Whether the MTP frontier forward applies to a reuse whose base is `base` for a prompt of
+// `prompt_tokens` tokens.
+//
+// The layer that predicts a second token pairs the row at position `p` with the embedding of token
+// `p + 1`, so the row at `base - 1` only matches the new prompt when it is written from the hidden
+// state at `base - 1`. No stored hidden covers that position, so the runtime forwards that one token
+// over the reused prefix and writes the row from the result. The forward needs both a prefix to read
+// and a following token to pair with: a nonzero base, and a base below the prompt end. Every plan
+// that selects the forward satisfies both; the runtime re-checks them where it runs, because a plan
+// that named a base outside them would otherwise have the forward underflow or read past the prompt.
+[[nodiscard]] constexpr bool mtp_frontier_forward_applies(std::uint32_t base,
+                                                          std::uint32_t prompt_tokens) noexcept {
+    return base > 0 && base < prompt_tokens;
+}
+
 // A contiguous run of tokens that is token-identical in both prompts, expressed in
 // whole blocks. Ranges are half-open: [begin, begin + tokens).
 struct SurvivingSpan {
