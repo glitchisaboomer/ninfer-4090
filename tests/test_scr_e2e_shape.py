@@ -127,13 +127,31 @@ def candidates(spans, resident_tokens, limit):
 
 
 def select_segmented(spans, resident_tokens, limit, max_spans):
-    """A port of detail::plan_relocations' selection: the `max_spans` longest survivors.
+    """A port of detail::plan_relocations' selection.
 
-    The cap is applied longest-first and the survivors are then handed back in prompt order, which
-    is the order the runtime consumes (`plan_relocations` sorts by `dest_begin` after the cap).
+    The longest survivors are taken first, so a destination-page collision displaces the least reuse
+    and the cap keeps the most. The cap counts relocated spans, not candidates: a survivor that
+    collides with a longer one already kept is passed over rather than displacing it. At most one span
+    may occupy a 64-token destination page, because the packed range plane names one relocated interval
+    per page and the runtime refuses a plan that breaks the rule rather than truncating it.
+
+    Both the collision rule and the reordering are inert on the aligned fixtures here, whose survivors
+    begin on block boundaries and are separated by a whole block; they exist for the all-offset
+    detector's off-grid destinations, which are the only source of a span that is not a whole page.
+    The survivors are handed back in prompt order, which is the order the runtime consumes
+    (`plan_relocations` sorts by `dest_begin` last).
     """
-    return sorted(sorted(candidates(spans, resident_tokens, limit),
-                         key=lambda span: -span[1])[:max_spans])
+    pool = sorted(candidates(spans, resident_tokens, limit), key=lambda span: (-span[1], span[0]))
+    kept = []
+    for dest, tokens in pool:
+        if len(kept) >= max_spans:
+            break
+        last = (dest + tokens - 1) // BLOCK
+        if any(dest // BLOCK <= (kept_dest + kept_tokens - 1) // BLOCK and
+               kept_dest // BLOCK <= last for kept_dest, kept_tokens in kept):
+            continue
+        kept.append((dest, tokens))
+    return sorted(kept)
 
 
 def select_tail(spans, resident_tokens, limit, max_spans):
@@ -425,8 +443,13 @@ def test_a_plan_line_parses_back_off_the_diagnostic() -> None:
             "span{src=832 dst=640 tok=128 delta=-192 src_pages=13..14 dst_pages=10..11} "
             "span{src=960 dst=832 tok=128 delta=-128 src_pages=15..16 dst_pages=13..14} "
             "ranges=3 [0,640) [768,832) [960,1000) remap[-1,5,-1,6]")
-    plans = scr_e2e_check.parse_relocation_plans(
-        "[scr-diag] declined prompt_tokens=1 reuse_base=0\n" + line)
+    # The planner's own line runs alongside the applied one on every request that reaches the SCR
+    # block, and it names spans and counts that were planned rather than run. It must be skipped.
+    planned = ("[scr-diag] plan mode=segmented shift=on prompt_tokens=1000 reuse_base=0 "
+               "resident_kv=1024 max_spans=6 limit=984 boundary=no spans_seen=3 candidates=2 "
+               "selector=2 fallback=no after_trim=2 expressible=yes final=2 relocated=256 "
+               "reject{leading span is prefix reuse old=[0,64) new_begin=0 tokens=64}")
+    plans = scr_e2e_check.parse_relocation_plans(planned + "\n" + line)
     assert len(plans) == 1
     assert plans[0]["prompt"] == 1000 and plans[0]["base"] == 0
     assert plans[0]["spans"] == [{"src": 832, "dst": 640, "tok": 128},
@@ -434,6 +457,15 @@ def test_a_plan_line_parses_back_off_the_diagnostic() -> None:
     assert plans[0]["ranges"] == [(0, 640), (768, 832), (960, 1000)]
     assert plans[0]["ranges_reported"] == 3
     assert scr_e2e_check.check_relocation_plan(plans[0], 2) == []
+
+
+def test_a_refusal_is_not_read_as_an_applied_plan() -> None:
+    """A refusal names the spans and ranges the runtime *did not* run, so reading it back as a plan
+    would assert a plan shape that never executed."""
+    refused = ("[scr] refused an inexpressible relocation plan: refused=spans share a destination "
+               "page reuse_base=0 prompt_tokens=1000 span{src=0 dst=64 tokens=100} "
+               "span{src=256 dst=164 tokens=16} range[0,64) range[180,1000)")
+    assert scr_e2e_check.parse_relocation_plans(refused) == []
 
 
 # ---------------------------------------------------------------------------------------------

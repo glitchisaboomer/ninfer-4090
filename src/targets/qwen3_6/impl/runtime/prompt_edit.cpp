@@ -109,68 +109,182 @@ void trim_relocated_run_tails(std::vector<RelocatedSpan>& spans, std::uint32_t t
     spans = std::move(kept);
 }
 
+namespace {
+
+// The cap and the destination-page rule, shared by both selectors because both owe the runtime the
+// same invariant: the packed range plane names at most one relocated interval per logical destination
+// page, so two spans landing in one page cannot both be described, and `relocation_is_expressible`
+// refuses the whole plan rather than the one span that broke it -- giving up every span in it. A page
+// the reused prefix only partly covers is spoken for the same way: the prefix keeps that page, so a
+// span may not begin inside it.
+//
+// The longest survivors are taken first, so a collision displaces the least reuse and the cap keeps
+// the most. The cap counts kept spans, not candidates, so a survivor that collides with a longer one
+// already kept is passed over instead of displacing it.
+//
+// The aligned selectors cannot produce a collision at all -- their destinations are whole pages --
+// so this is inert for every default run, and only the all-offset destinations reach it.
+// `rejected`, when given, receives every dropped span under the label the diagnostics print.
+std::vector<RelocatedSpan> cap_and_separate_destinations(std::vector<RelocatedSpan> candidates,
+                                                         std::uint32_t prefix_reuse_tokens,
+                                                         std::uint32_t max_spans,
+                                                         std::vector<RelocationReject>* rejected) {
+    const auto reject = [&](const RelocatedSpan& span, const char* reason) {
+        if (rejected == nullptr) { return; }
+        rejected->push_back(RelocationReject{.reason    = reason,
+                                             .old_begin = span.source_begin,
+                                             .old_end   = span.source_end(),
+                                             .new_begin = span.dest_begin,
+                                             .tokens    = span.tokens});
+    };
+
+    // Longest first, so a destination-page collision displaces the least reuse and the cap keeps the
+    // most. `dest_begin` breaks ties so the choice does not depend on the order the detector reported.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const RelocatedSpan& a, const RelocatedSpan& b) {
+                  if (a.tokens != b.tokens) { return a.tokens > b.tokens; }
+                  return a.dest_begin < b.dest_begin;
+              });
+
+    const bool prefix_page_partial = prefix_reuse_tokens % kPromptEditBlockTokens != 0;
+    const auto page_of = [](std::uint32_t token) { return token / kPromptEditBlockTokens; };
+    const auto shares_a_page = [&](const RelocatedSpan& candidate,
+                                   const std::vector<RelocatedSpan>& kept) {
+        for (const RelocatedSpan& span : kept) {
+            if (page_of(candidate.dest_begin) <= page_of(span.dest_end() - 1) &&
+                page_of(span.dest_begin) <= page_of(candidate.dest_end() - 1)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<RelocatedSpan> kept;
+    kept.reserve(std::min<std::size_t>(max_spans, candidates.size()));
+    for (const RelocatedSpan& candidate : candidates) {
+        if (kept.size() >= max_spans) {
+            reject(candidate, "beyond the max_spans cap");
+            continue;
+        }
+        if (prefix_page_partial && page_of(candidate.dest_begin) == page_of(prefix_reuse_tokens)) {
+            reject(candidate, "destination in the prefix frontier's partial page");
+            continue;
+        }
+        if (shares_a_page(candidate, kept)) {
+            reject(candidate, "destination page already claimed by a longer span");
+            continue;
+        }
+        kept.push_back(candidate);
+    }
+
+    // The runtime consumes them in prompt order.
+    std::sort(kept.begin(), kept.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
+        return a.dest_begin < b.dest_begin;
+    });
+    return kept;
+}
+
+} // namespace
+
 std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
                                            std::uint32_t resident_kv_tokens,
                                            std::uint32_t prefix_reuse_tokens,
                                            std::uint32_t prompt_tokens,
                                            std::optional<std::uint32_t> turn_rewrite_boundary,
-                                           std::uint32_t max_spans) {
-    std::vector<RelocatedSpan> candidates;
+                                           std::uint32_t max_spans, RelocationTrace* trace) {
+    if (trace != nullptr) {
+        *trace = RelocationTrace{};
+        trace->prompt_tokens       = prompt_tokens;
+        trace->prefix_reuse_tokens = prefix_reuse_tokens;
+        trace->resident_kv_tokens  = resident_kv_tokens;
+        trace->max_spans           = max_spans;
+    }
     if (max_spans == 0 || prompt_tokens == 0 || prompt_tokens <= prefix_reuse_tokens) {
-        return candidates;
+        if (trace != nullptr) {
+            trace->early_exit = (max_spans == 0)       ? "max_spans == 0"
+                                : (prompt_tokens == 0) ? "empty prompt"
+                                                       : "prompt is not longer than the prefix frontier";
+        }
+        return {};
     }
 
     // The same limit the tail planner applies, for the same two reasons: the tail after the last
     // run is always prefilled, and the turn-rewrite boundary is the first token whose KV is stale.
     const std::uint32_t limit = relocation_limit(prompt_tokens, turn_rewrite_boundary);
+    if (trace != nullptr) {
+        trace->limit             = limit;
+        trace->boundary_supplied = turn_rewrite_boundary.has_value();
+        trace->spans_seen        = diff.spans.size();
+    }
 
+    std::vector<RelocatedSpan> candidates;
     for (const SurvivingSpan& span : diff.spans) {
+        // The reasons are the tail planner's own labels: one vocabulary for both selectors, so a
+        // reader does not have to learn which mode produced a line before knowing what it means.
+        const RelocationReject observed{.old_begin = span.old_begin,
+                                        .old_end   = span.old_end(),
+                                        .new_begin = span.new_begin,
+                                        .tokens    = span.tokens};
+        const auto drop = [&](const char* reason) {
+            if (trace != nullptr) {
+                RelocationReject rejected = observed;
+                rejected.reason           = reason;
+                trace->rejected.push_back(rejected);
+            }
+        };
         // The leading span is ordinary prefix reuse, already expressed by the planner's
         // reuse base; relocating it would account for the same tokens twice.
-        if (span.old_begin == 0 && span.new_begin == 0) { continue; }
+        if (span.old_begin == 0 && span.new_begin == 0) {
+            drop("leading span is prefix reuse");
+            continue;
+        }
         // Relocation needs the resident KV entry to still exist.
-        if (span.old_end() > resident_kv_tokens) { continue; }
+        if (span.old_end() > resident_kv_tokens) {
+            drop("source beyond the resident KV");
+            continue;
+        }
         // A destination at or below the prefix-reuse frontier is already covered by ordinary
         // prefix reuse. A span that starts below it and ends above it is dropped whole, because
         // splitting it would leave the reused part of the destination claimed by two paths.
-        if (span.new_begin < prefix_reuse_tokens) { continue; }
-        if (span.tokens == 0 || span.new_begin >= limit) { continue; }
+        if (span.new_begin < prefix_reuse_tokens) {
+            drop("destination below the prefix frontier");
+            continue;
+        }
+        if (span.tokens == 0) { drop("empty span"); continue; }
+        if (span.new_begin >= limit) {
+            drop("destination at or beyond the rewrite boundary");
+            continue;
+        }
         // Trimmed back to the last whole block ending before the limit. Trimming keeps the span
         // block aligned, and surviving spans are disjoint, so it cannot break a run's adjacency.
         const std::uint32_t room   = limit - span.new_begin;
         const std::uint32_t fit    = (room / kPromptEditBlockTokens) * kPromptEditBlockTokens;
         const std::uint32_t tokens = std::min(span.tokens, fit);
-        if (tokens == 0) { continue; }
+        if (tokens == 0) { drop("no whole block fits before the rewrite boundary"); continue; }
+        if (tokens < span.tokens) { drop("trimmed to whole blocks before the rewrite boundary"); }
         candidates.push_back(RelocatedSpan{.source_begin = span.old_begin,
                                            .dest_begin   = span.new_begin,
                                            .tokens       = tokens});
     }
+    if (trace != nullptr) { trace->candidates = candidates; }
+    if (candidates.empty()) {
+        if (trace != nullptr) { trace->declined = "no surviving span survived the limits"; }
+        return {};
+    }
 
-    // Longest survivors first so the cap discards the least useful reuse. Trimming happened above,
-    // so a span shortened by a limit is compared at the length it would actually relocate.
-    const std::size_t keep = std::min<std::size_t>(max_spans, candidates.size());
-    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep),
-                      candidates.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
-                          return a.tokens > b.tokens;
-                      });
-    candidates.resize(keep);
-
-    // The runtime consumes them in prompt order.
-    std::sort(candidates.begin(), candidates.end(),
-              [](const RelocatedSpan& a, const RelocatedSpan& b) {
-                  return a.dest_begin < b.dest_begin;
-              });
-    return candidates;
+    std::vector<RelocationReject>* rejected = trace != nullptr ? &trace->rejected : nullptr;
+    return cap_and_separate_destinations(std::move(candidates), prefix_reuse_tokens, max_spans,
+                                        rejected);
 }
 
 TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_t resident_kv_tokens,
                                        std::uint32_t prefix_reuse_tokens,
                                        std::uint32_t prompt_tokens, std::uint32_t max_spans,
                                        std::optional<std::uint32_t> turn_rewrite_boundary,
-                                       TailRelocationTrace* trace) {
+                                       RelocationTrace* trace) {
     TailRelocationPlan plan;
     if (trace != nullptr) {
-        *trace = TailRelocationTrace{};
+        *trace = RelocationTrace{};
         trace->prompt_tokens       = prompt_tokens;
         trace->prefix_reuse_tokens = prefix_reuse_tokens;
         trace->resident_kv_tokens  = resident_kv_tokens;
@@ -198,19 +312,22 @@ TailRelocationPlan plan_tail_relocation(const PromptEditDiff& diff, std::uint32_
 
     std::vector<RelocatedSpan> candidates;
     for (const SurvivingSpan& span : diff.spans) {
-        const TailRelocationReject observed{.old_begin = span.old_begin,
-                                            .old_end   = span.old_end(),
-                                            .new_begin = span.new_begin,
-                                            .tokens    = span.tokens};
+        const RelocationReject observed{.old_begin = span.old_begin,
+                                        .old_end   = span.old_end(),
+                                        .new_begin = span.new_begin,
+                                        .tokens    = span.tokens};
         const auto drop = [&](const char* reason) {
             if (trace != nullptr) {
-                TailRelocationReject rejected = observed;
+                RelocationReject rejected = observed;
                 rejected.reason              = reason;
                 trace->rejected.push_back(rejected);
             }
         };
         // The leading span is ordinary prefix reuse, already expressed by the planner's reuse base.
-        if (span.old_begin == 0 && span.new_begin == 0) { drop("leading span is prefix reuse"); continue; }
+        if (span.old_begin == 0 && span.new_begin == 0) {
+            drop("leading span is prefix reuse");
+            continue;
+        }
         // Relocation needs the resident KV entry to still exist.
         if (span.old_end() > resident_kv_tokens) {
             drop("source beyond the resident KV");
@@ -469,12 +586,16 @@ std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges) {
     // One range's partial chunk is already in the projection; every further range is a step the
     // single-span formula does not count.
     return ranges.size() > 1 ? static_cast<std::uint64_t>(ranges.size() - 1) : 0ULL;
-}bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
-                              std::span<const PrefillRange> ranges,
-                              std::uint32_t prefix_reuse_tokens,
-                              std::uint32_t prompt_tokens,
-                              bool source_may_shift) {
-    if (prompt_tokens <= prefix_reuse_tokens || ranges.empty()) { return false; }
+}
+
+const char* relocation_refusal(std::span<const RelocatedSpan> spans,
+                               std::span<const PrefillRange> ranges,
+                               std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens,
+                               bool source_may_shift) {
+    if (prompt_tokens <= prefix_reuse_tokens) {
+        return "prompt is not longer than the prefix frontier";
+    }
+    if (ranges.empty()) { return "no prefilled range"; }
 
     std::vector<RelocatedSpan> sorted(spans.begin(), spans.end());
     std::sort(sorted.begin(), sorted.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
@@ -482,29 +603,29 @@ std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges) {
     });
     for (std::size_t i = 0; i < sorted.size(); ++i) {
         const RelocatedSpan& span = sorted[i];
-        if (span.tokens == 0) { return false; }
+        if (span.tokens == 0) { return "empty span"; }
         // The re-pointing path moves the page table, so the source has to name a page that already
         // holds the content and must be a whole page. The copying path moves the payload, so its
         // source is just a token offset -- the freedom a shifted edit needs.
-        if (!source_may_shift &&
-            (span.source_begin % kPromptEditBlockTokens != 0 ||
-             span.dest_begin % kPromptEditBlockTokens != 0 ||
-             span.tokens % kPromptEditBlockTokens != 0)) {
-            return false;
+        if (!source_may_shift && (span.source_begin % kPromptEditBlockTokens != 0 ||
+                                  span.dest_begin % kPromptEditBlockTokens != 0 ||
+                                  span.tokens % kPromptEditBlockTokens != 0)) {
+            return "span is not whole blocks in both prompts";
         }
-        if (span.dest_begin < prefix_reuse_tokens || span.dest_end() > prompt_tokens - 1) {
-            return false;
+        if (span.dest_begin < prefix_reuse_tokens) {
+            return "span starts below the prefix frontier";
         }
+        if (span.dest_end() > prompt_tokens - 1) { return "span reaches the final prompt token"; }
         if (source_may_shift && prefix_reuse_tokens % kPromptEditBlockTokens != 0 &&
             span.dest_begin / kPromptEditBlockTokens ==
                 prefix_reuse_tokens / kPromptEditBlockTokens) {
-            return false;
+            return "span shares the prefix frontier's partial page";
         }
-        if (i != 0 && span.dest_begin < sorted[i - 1].dest_end()) { return false; }
+        if (i != 0 && span.dest_begin < sorted[i - 1].dest_end()) { return "spans overlap"; }
         if (source_may_shift && i != 0 &&
             span.dest_begin / kPromptEditBlockTokens <=
                 (sorted[i - 1].dest_end() - 1) / kPromptEditBlockTokens) {
-            return false;
+            return "spans share a destination page";
         }
     }
 
@@ -512,7 +633,7 @@ std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges) {
     // twice, none missed. The walk takes whichever of the next range and the next span begins at the
     // cursor, so an interleaved plan -- range, run, gap, run, range -- tiles the same way a
     // contiguous one does.
-    std::uint32_t cursor = prefix_reuse_tokens;
+    std::uint32_t cursor   = prefix_reuse_tokens;
     std::size_t next_range = 0;
     std::size_t next_span  = 0;
     while (next_range < ranges.size() || next_span < sorted.size()) {
@@ -522,15 +643,26 @@ std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges) {
         if (take_range) {
             if (next_range >= ranges.size() || ranges[next_range].empty() ||
                 ranges[next_range].begin != cursor) {
-                return false;
+                return "ranges and spans do not tile the suffix";
             }
             cursor = ranges[next_range++].end;
         } else {
-            if (sorted[next_span].dest_begin != cursor) { return false; }
+            if (sorted[next_span].dest_begin != cursor) {
+                return "ranges and spans do not tile the suffix";
+            }
             cursor = sorted[next_span++].dest_end();
         }
     }
-    return cursor == prompt_tokens;
+    if (cursor != prompt_tokens) { return "ranges and spans do not tile the suffix"; }
+    return nullptr;
+}
+
+bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
+                               std::span<const PrefillRange> ranges,
+                               std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens,
+                               bool source_may_shift) {
+    return relocation_refusal(spans, ranges, prefix_reuse_tokens, prompt_tokens,
+                              source_may_shift) == nullptr;
 }
 
 PromptEditDiff diff_prompt_edit(std::span<const TokenId> previous, std::span<const TokenId> current,
@@ -715,19 +847,11 @@ std::vector<RelocatedSpan> plan_shifted_relocations(const PromptEditDiff& diff,
                           .tokens       = dest_end - dest_begin});
     }
 
-    // The cap and the order match `plan_relocations`: longest survivors first, so the cap discards
-    // the least useful reuse, then prompt order, which is how the runtime consumes them.
-    const std::size_t keep = std::min<std::size_t>(max_spans, candidates.size());
-    std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(keep),
-                      candidates.end(), [](const RelocatedSpan& a, const RelocatedSpan& b) {
-                          return a.tokens > b.tokens;
-                      });
-    candidates.resize(keep);
-    std::sort(candidates.begin(), candidates.end(),
-              [](const RelocatedSpan& a, const RelocatedSpan& b) {
-                  return a.dest_begin < b.dest_begin;
-              });
-    return candidates;
+    // The cap and the destination-page rule are the same step both selectors share, and this is the
+    // selector that needs them: a destination that may sit mid-page is the only way two survivors can
+    // land in one page. The aligned mode cannot, and the shared step is then a no-op.
+    return cap_and_separate_destinations(std::move(candidates), prefix_reuse_tokens, max_spans,
+                                         nullptr);
 }
 
 std::uint32_t longest_shared_prefix_tokens(std::span<const TokenId> resident_tokens,

@@ -362,74 +362,43 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                       sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens)
                 : qwen3_6::detail::diff_prompt_edit(
                       sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
+        const std::uint32_t prompt_tokens_count =
+            static_cast<std::uint32_t>(prompt.token_ids.size());
+
+        // One trace per request, filled by whichever selector runs. The two disagree about the shape
+        // they can express, not about what a refusal means, so the diagnostic below reads the same
+        // fields for either mode.
+        qwen3_6::detail::RelocationTrace trace;
         std::vector<RelocatedSpan> plan_spans;
         if (base.scr_mode == ninfer::ScrRelocationMode::Segmented) {
             plan_spans = qwen3_6::detail::plan_relocations(
-                diff, sequence.text_kv_valid, plan->reuse_base,
-                static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
-                base.suffix_reuse_max_spans);
-            // Segmented has no per-candidate trace, and `plan_relocations` reports a decline the same
-            // way it reports having nothing to do, so a run that relocates no span out of many is
-            // indistinguishable from one the detector never fed. Print the two counts that tell them
-            // apart -- behind the same flag as the tail trace, and one line per request.
-            if (scr_diagnostics_enabled()) {
-                std::ostringstream seg;
-                seg << "[scr-diag] segmented prompt_tokens="
-                    << static_cast<std::uint32_t>(prompt.token_ids.size())
-                    << " reuse_base=" << plan->reuse_base
-                    << " resident_kv=" << sequence.text_kv_valid
-                    << " max_spans=" << base.suffix_reuse_max_spans
-                    << " survivors=" << diff.spans.size()
-                    << " shift=" << (source_may_shift ? "on" : "off")
-                    << " plan_spans=" << plan_spans.size();
-                std::cerr << seg.str() << '\n';
-                std::cerr.flush();
-            }
+                diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
+                base.turn_rewrite_boundary, base.suffix_reuse_max_spans, &trace);
         } else {
-            qwen3_6::detail::TailRelocationTrace trace;
             const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
-                diff, sequence.text_kv_valid, plan->reuse_base,
-                static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans,
-                base.turn_rewrite_boundary, &trace);
-            if (scr_diagnostics_enabled() && !tail.viable) {
-                // A refusal the planner made silently is the hardest kind to diagnose: the suite
-                // reports the path it took, never the reason it declined, and a run can relocate one
-                // request out of twelve for reasons that look identical to not having tried.
-                std::ostringstream declined;
-                declined << "[scr-diag] declined prompt_tokens=" << trace.prompt_tokens
-                         << " reuse_base=" << trace.prefix_reuse_tokens
-                         << " resident_kv=" << trace.resident_kv_tokens
-                         << " max_spans=" << trace.max_spans
-                         << " limit=" << trace.limit
-                         << " boundary=" << (trace.boundary_supplied ? "yes" : "no")
-                         << " spans_seen=" << trace.spans_seen
-                         << " candidates=" << trace.candidates.size();
-                if (trace.early_exit != nullptr) { declined << " early_exit=" << trace.early_exit; }
-                if (trace.declined != nullptr) { declined << " declined=" << trace.declined; }
-                for (const auto& reject : trace.rejected) {
-                    declined << " reject{" << reject.reason << " old=[" << reject.old_begin << ","
-                             << reject.old_end << ") new_begin=" << reject.new_begin
-                             << " tokens=" << reject.tokens << "}";
-                }
-                std::cerr << declined.str() << '\n';
-                std::cerr.flush();
-            }
-            if (tail.viable) {
-                plan_spans = tail.spans;
-            } else if (source_may_shift) {
-                // The re-pointing selector declined, and with the copied path enabled that is not the
-                // end of the story. Every dtype that reaches here reads the packed boundary range:
-                // the attention kernels that consume it -- BF16 already, and the INT8 ones, which
-                // choose the query frame for the keys inside a page's interval per key -- can
-                // therefore take the exact destination interval rather than a whole-page
-                // quantization of it. The aligned plan and the hardware-verified re-pointing path
-                // remain unchanged when either can express it.
-                plan_spans = qwen3_6::detail::plan_shifted_relocations(
-                    diff, sequence.text_kv_valid, plan->reuse_base,
-                    static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
-                    base.suffix_reuse_max_spans, /*destination_may_shift=*/true);
-            }
+                diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
+                base.suffix_reuse_max_spans, base.turn_rewrite_boundary, &trace);
+            if (tail.viable) { plan_spans = tail.spans; }
         }
+        const std::size_t selector_spans = plan_spans.size();
+
+        // The copied path, when the mode's selector expressed nothing. Every dtype that reaches here
+        // reads the packed boundary range -- the attention kernels that consume it choose the query
+        // frame for the keys inside a page's interval per key -- so the exact destination interval is
+        // expressible even when a whole-page quantization of it is not. Both modes need this, and for
+        // the same reason: with `NINFER_SCR_SOURCE_SHIFT` the detector reports survivors whose
+        // destinations are off the page grid, which is the shape neither re-pointing selector can
+        // express on its own. The fallback runs before the trim below so the plan it recovers is
+        // trimmed with everything else: a plan that skips the trim hands the second token-predicting
+        // layer a row paired with a token the edit replaced, which is what the trim exists to fix.
+        const bool used_fallback = plan_spans.empty() && source_may_shift;
+        if (used_fallback) {
+            plan_spans = qwen3_6::detail::plan_shifted_relocations(
+                diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
+                base.turn_rewrite_boundary, base.suffix_reuse_max_spans,
+                /*destination_may_shift=*/true);
+        }
+        const std::size_t fallback_spans = plan_spans.size();
 
         // The layer that predicts more than one token reads the same moved cache with a stem that
         // pairs row p with token p + 1, so a run ending where the prompts diverge leaves its last
@@ -441,14 +410,82 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             qwen3_6::detail::trim_relocated_run_tails(plan_spans,
                                                       qwen3_6::detail::kPromptEditBlockTokens);
         }
+        const std::size_t trimmed_spans = plan_spans.size();
 
         // The prefilled ranges, derived from the spans rather than carried next to them: one source
         // for both modes, and the tiling with the spans is what makes the accounting below honest.
-        const std::uint32_t prompt_tokens_count =
-            static_cast<std::uint32_t>(prompt.token_ids.size());
         std::vector<qwen3_6::detail::PrefillRange> plan_ranges =
             qwen3_6::detail::relocation_prefill_ranges(plan_spans, plan->reuse_base,
                                                        prompt_tokens_count);
+
+        // A plan the runtime cannot execute is refused rather than half-applied, and the refusal is
+        // printed whether or not diagnostics are enabled: reaching it means a selector produced spans
+        // the runtime cannot execute, and a silent refusal would hide it while still reporting
+        // cold-prefill reuse. The rule that refused it is named and the spans and ranges that failed
+        // it are dumped, because the counts alone cannot say whether a selector over-produced or the
+        // prompt is past what a per-page delta can express. Both selectors now enforce the destination
+        // rules themselves, so this is a tripwire rather than a control-flow branch.
+        const char* refused = nullptr;
+        if (!plan_spans.empty()) {
+            refused = qwen3_6::detail::relocation_refusal(plan_spans, plan_ranges, plan->reuse_base,
+                                                          prompt_tokens_count, source_may_shift);
+            if (refused != nullptr) {
+                std::ostringstream refusal;
+                refusal << "[scr] refused an inexpressible relocation plan: refused=" << refused
+                        << " reuse_base=" << plan->reuse_base
+                        << " prompt_tokens=" << prompt_tokens_count;
+                for (const RelocatedSpan& span : plan_spans) {
+                    refusal << " span{src=" << span.source_begin << " dst=" << span.dest_begin
+                            << " tokens=" << span.tokens << "}";
+                }
+                for (const qwen3_6::detail::PrefillRange& range : plan_ranges) {
+                    refusal << " range[" << range.begin << "," << range.end << ")";
+                }
+                std::cerr << refusal.str() << '\n';
+                std::cerr.flush();
+                plan_spans.clear();
+                plan_ranges.clear();
+            }
+        }
+
+        std::uint32_t relocated_tokens = 0;
+        for (const RelocatedSpan& span : plan_spans) { relocated_tokens += span.tokens; }
+
+        // One line per request, for both modes, after the trim and the expressibility check: what the
+        // detector fed the selector, what the selector kept, what the copied path recovered, and what
+        // was thrown away and why. Counts alone could not tell a selector that declined from one the
+        // detector never fed, and segmented had no reason channel at all, so a refused or degraded
+        // plan was invisible. Printed only under NINFER_SCR_DIAG.
+        if (scr_diagnostics_enabled()) {
+            std::ostringstream plan_line;
+            plan_line << "[scr-diag] plan mode="
+                      << (base.scr_mode == ninfer::ScrRelocationMode::Segmented ? "segmented"
+                                                                                : "tail")
+                      << " shift=" << (source_may_shift ? "on" : "off")
+                      << " prompt_tokens=" << trace.prompt_tokens
+                      << " reuse_base=" << trace.prefix_reuse_tokens
+                      << " resident_kv=" << trace.resident_kv_tokens
+                      << " max_spans=" << trace.max_spans
+                      << " limit=" << trace.limit
+                      << " boundary=" << (trace.boundary_supplied ? "yes" : "no")
+                      << " spans_seen=" << trace.spans_seen
+                      << " candidates=" << trace.candidates.size()
+                      << " selector=" << selector_spans
+                      << " fallback=" << (used_fallback ? std::to_string(fallback_spans) : "no")
+                      << " after_trim=" << trimmed_spans
+                      << " expressible=" << (refused == nullptr ? "yes" : "no")
+                      << " final=" << plan_spans.size() << " relocated=" << relocated_tokens;
+            if (trace.early_exit != nullptr) { plan_line << " early_exit=" << trace.early_exit; }
+            if (trace.declined != nullptr) { plan_line << " declined=" << trace.declined; }
+            for (const auto& reject : trace.rejected) {
+                plan_line << " reject{" << reject.reason << " old=[" << reject.old_begin << ","
+                          << reject.old_end << ") new_begin=" << reject.new_begin
+                          << " tokens=" << reject.tokens << "}";
+            }
+            std::cerr << plan_line.str() << '\n';
+            std::cerr.flush();
+        }
+
         if (!plan_spans.empty()) {
             // Overwriting `reuse` with SuffixRelocation here is what makes the MTP coupling the final
             // block's job rather than this block's: that block keys off the reuse path, and
@@ -456,48 +493,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // for the staged MTP prefill itself -- `prepare_mtp` is set further down, after the
             // turn-checkpoint decision, which may still downgrade this plan to a plain FullReset. The
             // assertion that the staged MTP prefill exists therefore lives after that block.
-            //
-            // A plan that is not expressible is refused rather than half-applied, and the refusal is
-            // printed whether or not diagnostics are enabled: reaching it means a selector produced
-            // spans the runtime cannot execute, which is a programming error rather than a prompt
-            // shape, and a silent fallback would hide it while still reporting cold-prefill reuse.
-            if (!qwen3_6::detail::relocation_is_expressible(plan_spans, plan_ranges, plan->reuse_base,
-                                                            prompt_tokens_count, source_may_shift)) {
-                std::cerr << "[scr] refused an inexpressible relocation plan: spans="
-                          << plan_spans.size() << " ranges=" << plan_ranges.size()
-                          << " reuse_base=" << plan->reuse_base
-                          << " prompt_tokens=" << prompt_tokens_count << '\n';
-                plan_spans.clear();
-                plan_ranges.clear();
-                // Segmented mode gets no fallback in its own branch above (tail mode has one there):
-                // when the all-offset detector feeds the re-pointing selector, a span it keeps may be
-                // expressible only as a copy. Try the shifted selector before giving up, or the plan
-                // degrades to a silent full_reset on exactly the off-grid edits the copied path
-                // exists for.
-                if (base.scr_mode == ninfer::ScrRelocationMode::Segmented && source_may_shift) {
-                    plan_spans = qwen3_6::detail::plan_shifted_relocations(
-                        diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
-                        base.turn_rewrite_boundary, base.suffix_reuse_max_spans,
-                        /*destination_may_shift=*/true);
-                    plan_ranges = qwen3_6::detail::relocation_prefill_ranges(
-                        plan_spans, plan->reuse_base, prompt_tokens_count);
-                    if (!plan_spans.empty() &&
-                        !qwen3_6::detail::relocation_is_expressible(
-                            plan_spans, plan_ranges, plan->reuse_base, prompt_tokens_count,
-                            source_may_shift)) {
-                        plan_spans.clear();
-                        plan_ranges.clear();
-                    }
-                }
-            }
-        }
-        if (!plan_spans.empty()) {
-            std::uint64_t relocated = 0;
-            for (const RelocatedSpan& span : plan_spans) { relocated += span.tokens; }
             plan->reuse                           = ReusePath::SuffixRelocation;
             plan->relocated_prefill_ranges        = std::move(plan_ranges);
             plan->relocated_spans                 = std::move(plan_spans);
-            plan->summary.relocated_prompt_tokens = static_cast<std::uint32_t>(relocated);
+            plan->summary.relocated_prompt_tokens = relocated_tokens;
         }
     }
 

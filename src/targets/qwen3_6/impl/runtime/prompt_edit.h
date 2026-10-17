@@ -145,6 +145,43 @@ struct RelocatedSpan {
     [[nodiscard]] std::uint32_t dest_end() const noexcept { return dest_begin + tokens; }
 };
 
+// Why a surviving span could not be relocated. Stable labels: they appear in the diagnostic and are
+// what a reader matches against to tell "the edit left nothing to reuse" from "the reuse was found
+// and then thrown away by a limit". Both selectors report through this type, so the same label means
+// the same thing whichever mode was asked for the plan.
+struct RelocationReject {
+    const char* reason = "";
+    std::uint32_t old_begin = 0;
+    std::uint32_t old_end   = 0;
+    std::uint32_t new_begin = 0;
+    std::uint32_t tokens    = 0;
+};
+
+// What a relocation selector decided, whether or not it relocated anything. Filled on every call so
+// that a decline is as inspectable as an application: the relocation diagnostic only prints when a
+// relocation is applied, which left every refusal invisible and made a suite that relocated one
+// request out of twelve indistinguishable from one that relocated nothing.
+//
+// Both selectors fill it. `plan_relocations` used to have no channel at all, so segmented could only
+// be observed through the counts the caller could derive itself -- `spans_seen` against the size of
+// its own result -- which says whether the selector declined but never why.
+struct RelocationTrace {
+    std::uint32_t prompt_tokens       = 0;
+    std::uint32_t prefix_reuse_tokens = 0;
+    std::uint32_t resident_kv_tokens  = 0;
+    std::uint32_t max_spans           = 0;
+    // The token no span may reach, and whether a turn-rewrite boundary supplied it. A boundary far
+    // below the prompt end is the usual reason a long prompt relocates only a fraction of itself.
+    std::uint32_t limit            = 0;
+    bool boundary_supplied         = false;
+    const char* early_exit         = nullptr;
+    std::size_t spans_seen         = 0;
+    std::vector<RelocationReject> rejected;
+    std::vector<RelocatedSpan> candidates;
+    // Set when candidates existed but none was selected.
+    const char* declined = nullptr;
+};
+
 // The last token a relocated run may reach. It is the prompt end less
 // `kMinimumForwardedTailTokens`, so the tail after the last run is always prefilled, further
 // reduced to `turn_rewrite_boundary` when one is supplied and earlier. Smaller prompts than the
@@ -194,20 +231,25 @@ void trim_relocated_run_tails(std::vector<RelocatedSpan>& spans, std::uint32_t t
 //     rewritten there, and a span carrying tokens at or after it would reuse KV that is stale by
 //     definition. A span overrunning either limit is trimmed back to the last whole block ending
 //     before it rather than dropped, so a run keeps the part that is still valid.
+//   * No two kept spans share a logical destination page, and no span begins in the page that holds
+//     an unaligned prefix frontier. The packed range plane names at most one relocated interval per
+//     page, so two spans landing in one page cannot both be described and the plan would be refused
+//     whole. The aligned detector cannot produce such a pair -- every destination it reports is a
+//     whole page -- but the all-offset detector can, because a shifted run keeps its own token offset
+//     at both ends. Both selectors enforce it through the same selection step, and the runtime checks
+//     it again on whatever either returns as a tripwire rather than a branch.
 //
-// Trimming happens before the cap is applied, so a span shortened by a limit is compared at the
-// length it would actually relocate.
+// Trimming happens before anything else, so a span shortened by a limit is compared at the length it
+// would actually relocate. Of what remains the longest spans are kept, up to `max_spans`; a span that
+// collides with a longer one already kept is left to be re-prefilled rather than displacing it, so
+// the cap counts relocated spans and not candidates. The result is returned in prompt order.
 //
-// Of the survivors the `max_spans` longest are kept and the rest are left to be re-prefilled, which
-// bounds how much approximation one edit introduces. The result is returned in prompt order.
-//
-// A `max_spans` of zero returns no spans.
-[[nodiscard]] std::vector<RelocatedSpan> plan_relocations(const PromptEditDiff& diff,
-                                                         std::uint32_t resident_kv_tokens,
-                                                         std::uint32_t prefix_reuse_tokens,
-                                                         std::uint32_t prompt_tokens,
-                                                         std::optional<std::uint32_t> turn_rewrite_boundary,
-                                                         std::uint32_t max_spans);
+// A `max_spans` of zero returns no spans. `trace`, when supplied, is filled whether or not anything
+// is relocated, and carries a stable reason for every span that was not.
+[[nodiscard]] std::vector<RelocatedSpan> plan_relocations(
+    const PromptEditDiff& diff, std::uint32_t resident_kv_tokens, std::uint32_t prefix_reuse_tokens,
+    std::uint32_t prompt_tokens, std::optional<std::uint32_t> turn_rewrite_boundary,
+    std::uint32_t max_spans, RelocationTrace* trace = nullptr);
 
 // The source-shifting selector: every survivor `diff_prompt_edit_shifted` found, left off-grid at the
 // source. Destination pages are quantized unless `destination_may_shift` is true and the attention
@@ -222,8 +264,9 @@ void trim_relocated_run_tails(std::vector<RelocatedSpan>& spans, std::uint32_t t
 // When destinations are quantized, up to 63 tokens at each end are recomputed. A run with no whole
 // destination page returns nothing in that mode; boundary-aware mode can relocate any nonempty run.
 //
-// In either mode the returned spans never share a logical destination page with each other. That is
-// not a property of the selector passing the checks in `relocation_is_expressible` -- it is what
+// In either mode the returned spans never share a logical destination page with each other, and none
+// begins in the page holding an unaligned prefix frontier: both selectors enforce that through the
+// same selection step. It is not a property of the checks in `relocation_is_expressible` -- it is what
 // lets the packed range plane name one interval per page at all, so a caller that merges, splits or
 // otherwise combines these spans downstream has to preserve it.
 [[nodiscard]] std::vector<RelocatedSpan> plan_shifted_relocations(
@@ -247,38 +290,6 @@ struct PrefillRange {
 // This is the shape the roadmap calls Scope A, and it is the widest plan the runtime can act on
 // without prefilling a disjoint set of many ranges: the relocated spans are contiguous, so exactly
 // two prefilled ranges remain.
-// Why a surviving span could not be relocated. Stable labels: they appear in the diagnostic and are
-// what a reader matches against to tell "the edit left nothing to reuse" from "the reuse was found
-// and then thrown away by a limit".
-struct TailRelocationReject {
-    const char* reason = "";
-    std::uint32_t old_begin = 0;
-    std::uint32_t old_end   = 0;
-    std::uint32_t new_begin = 0;
-    std::uint32_t tokens    = 0;
-};
-
-// What the planner decided, whether or not it relocated anything. Filled on every call so that a
-// decline is as inspectable as an application: the relocation diagnostic only prints when a relocation
-// is applied, which left every refusal invisible and made a suite that relocated one request out of
-// twelve indistinguishable from one that relocated nothing.
-struct TailRelocationTrace {
-    std::uint32_t prompt_tokens       = 0;
-    std::uint32_t prefix_reuse_tokens = 0;
-    std::uint32_t resident_kv_tokens  = 0;
-    std::uint32_t max_spans           = 0;
-    // The token no span may reach, and whether a turn-rewrite boundary supplied it. A boundary far
-    // below the prompt end is the usual reason a long prompt relocates only a fraction of itself.
-    std::uint32_t limit            = 0;
-    bool boundary_supplied        = false;
-    const char* early_exit        = nullptr;
-    std::size_t spans_seen         = 0;
-    std::vector<TailRelocationReject> rejected;
-    std::vector<RelocatedSpan> candidates;
-    // Set when candidates existed but none was selected.
-    const char* declined = nullptr;
-};
-
 struct TailRelocationPlan {
     // False when no contiguous surviving run is usable; the caller must then treat the prompt as an
     // ordinary prefix-reuse append.
@@ -335,7 +346,7 @@ struct TailRelocationPlan {
                                                       std::uint32_t max_spans,
                                                       std::optional<std::uint32_t> turn_rewrite_boundary =
                                                           std::nullopt,
-                                                      TailRelocationTrace* trace = nullptr);
+                                                      RelocationTrace* trace = nullptr);
 
 // Sentinel for a logical page with no resident physical page, so it has to come from the pool when a
 // remap is applied. The value matches PagedKVAllocation's acquire sentinel; the runtime static_asserts
@@ -445,6 +456,19 @@ relocation_prefill_ranges(std::span<const RelocatedSpan> spans, std::uint32_t pr
 // the two-range case was found.
 [[nodiscard]] std::uint64_t relocation_prefill_splits(std::span<const PrefillRange> ranges);
 
+// Why a relocation plan is not expressible, as a stable label, or `nullptr` when it is.
+//
+// The rule and its name live together here so they cannot drift: `relocation_is_expressible` is
+// exactly `relocation_refusal(...) == nullptr`, and the refusal the runtime prints is the label this
+// returns. Before this existed the runtime could only say that a plan had been refused, never which
+// of the conditions had refused it, which is the difference between a selector that over-produced
+// and a prompt the runtime genuinely cannot express.
+[[nodiscard]] const char* relocation_refusal(std::span<const RelocatedSpan> spans,
+                                             std::span<const PrefillRange> ranges,
+                                             std::uint32_t prefix_reuse_tokens,
+                                             std::uint32_t prompt_tokens,
+                                             bool source_may_shift = false);
+
 // Whether a relocation plan is expressible at all. It is when every span is block aligned in both
 // prompts, starts at or after the prefix frontier, ends before the final prompt token, and the
 // reported ranges tile `[prefix_reuse_tokens, prompt_tokens)` together with the spans. A plan that
@@ -456,6 +480,8 @@ relocation_prefill_ranges(std::span<const RelocatedSpan> spans, std::uint32_t pr
 // sources name pages that already hold the content and must therefore be whole pages; true is the
 // copying path, where the source is a token offset like any other. Destinations are whole pages on
 // both, because that is what a page table and a per-page delta can express.
+//
+// This is the predicate form of `relocation_refusal`, which names the condition that failed.
 [[nodiscard]] bool relocation_is_expressible(std::span<const RelocatedSpan> spans,
                                             std::span<const PrefillRange> ranges,
                                             std::uint32_t prefix_reuse_tokens,

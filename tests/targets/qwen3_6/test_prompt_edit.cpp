@@ -444,6 +444,237 @@ void test_plan_relocations_respects_limits() {
            "a boundary past the final token matches no boundary");
 }
 
+// The segmented selector reported a decline with no reason channel at all: the runtime could see how
+// many survivors the detector produced and how many spans came back, but not which of the two
+// happened. The trace is what tells "the detector never saw anything" from "the selector saw the reuse
+// and threw it away", and it is the same type the tail planner fills.
+void test_plan_relocations_reports_a_trace() {
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::RelocationTrace;
+    using ninfer::targets::qwen3_6::detail::RelocationReject;
+
+    // Scope A: [P R S] -> [P S], so exactly one survivor plus the leading prefix.
+    Tokens previous;
+    append(previous, segment(1, 2));
+    append(previous, segment(2, 2));
+    append(previous, segment(3, 2));
+    Tokens current;
+    append(current, segment(1, 2));
+    append(current, segment(3, 2));
+    append(current, segment(4, 1));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    RelocationTrace trace;
+    const auto spans = plan_relocations(diff, resident, 0, prompt, std::nullopt, 6, &trace);
+    expect(spans.size() == 1, "the trace fixture still relocates its survivor");
+    expect(trace.prompt_tokens == prompt, "the trace reports the prompt length");
+    expect(trace.prefix_reuse_tokens == 0 && trace.resident_kv_tokens == resident,
+           "the trace reports the reuse frontier and the resident frontier");
+    expect(trace.max_spans == 6, "the trace reports the cap it was given");
+    expect(trace.limit == prompt - 16, "the trace reports the limit the plan was planned against");
+    expect(!trace.boundary_supplied, "no boundary was supplied");
+    expect(trace.spans_seen == 2, "the trace counts every span the detector produced");
+    expect(trace.candidates.size() == 1, "the trace keeps the candidates the limits let through");
+    expect(trace.declined == nullptr, "a plan that relocated something did not decline");
+    expect(trace.early_exit == nullptr, "the selector did not exit early");
+    expect(trace.rejected.size() == 1, "one span was rejected: the leading prefix");
+    if (trace.rejected.size() == 1) {
+        const RelocationReject& reject = trace.rejected.front();
+        expect(std::string_view(reject.reason) == "leading span is prefix reuse",
+               "the rejection names why the leading span is not relocation");
+        expect(reject.old_begin == 0 && reject.new_begin == 0 && reject.tokens == block_tokens(2),
+               "the rejection describes the span it refused");
+    }
+
+    // A trace is filled whether or not anything was relocated, and each degeneracy has its own name.
+    RelocationTrace capped;
+    expect(plan_relocations(diff, resident, 0, prompt, std::nullopt, 0, &capped).empty(),
+           "a zero cap still relocates nothing");
+    expect(capped.early_exit != nullptr &&
+               std::string_view(capped.early_exit) == "max_spans == 0",
+           "a zero cap is named as the reason");
+
+    RelocationTrace frontier;
+    expect(plan_relocations(diff, resident, prompt, prompt, std::nullopt, 6, &frontier).empty(),
+           "a prompt that is entirely prefix reuse relocates nothing");
+    expect(frontier.early_exit != nullptr &&
+               std::string_view(frontier.early_exit) ==
+                   "prompt is not longer than the prefix frontier",
+           "a prompt at the frontier is named as the reason");
+
+    // Every survivor refused by the limits is a decline, and it says so.
+    RelocationTrace all_refused;
+    const auto base = block_tokens(4);
+    expect(plan_relocations(diff, resident, base, prompt, std::nullopt, 6, &all_refused).empty(),
+           "a frontier past every survivor relocates nothing");
+    expect(all_refused.candidates.empty(), "and no candidate survives the limits");
+    expect(all_refused.declined != nullptr &&
+               std::string_view(all_refused.declined) == "no surviving span survived the limits",
+           "a decline is named as a decline");
+    expect(all_refused.spans_seen == 2, "the decline still reports what the detector produced");
+    expect(all_refused.rejected.size() == 2, "and why each span was refused");
+}
+
+// The packed range plane names at most one relocated interval per destination page, so two spans
+// landing in one page cannot both be described. The aligned detector cannot produce such a pair, but
+// the all-offset one can, and a plan that breaks the rule is refused whole by the runtime -- giving up
+// every span in it rather than the one that broke it. The selector has to keep the most valuable
+// survivor and drop the rest itself.
+void test_plan_relocations_keeps_one_span_per_destination_page() {
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::plan_shifted_relocations;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_refusal;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::RelocationTrace;
+
+    // Two survivors whose destinations do not overlap but do share page 2: the first ends at 164 and
+    // the second begins there, so no page boundary separates them. Page 2 is [128, 192).
+    PromptEditDiff diff;
+    diff.spans = {
+        SurvivingSpan{.old_begin = 0, .new_begin = 64, .tokens = 100},
+        SurvivingSpan{.old_begin = 256, .new_begin = 164, .tokens = 16},
+    };
+    diff.reusable_tokens = 116;
+
+    const std::uint32_t prompt = block_tokens(8);
+
+    // The two-span plan is one the runtime would refuse, which is what the selector is avoiding.
+    const std::vector<RelocatedSpan> both{
+        RelocatedSpan{.source_begin = 0, .dest_begin = 64, .tokens = 100},
+        RelocatedSpan{.source_begin = 256, .dest_begin = 164, .tokens = 16}};
+    expect(std::string_view(relocation_refusal(both, relocation_prefill_ranges(both, 0, prompt), 0,
+                                               prompt, true)) == "spans share a destination page",
+           "the runtime refuses two spans that share a destination page");
+
+    RelocationTrace trace;
+    const auto kept = plan_relocations(diff, prompt, 0, prompt, std::nullopt, 6, &trace);
+    expect(kept.size() == 1, "only one of the two conflicting spans is relocated");
+    if (kept.size() == 1) {
+        expect(kept.front().source_begin == 0 && kept.front().dest_begin == 64 &&
+                   kept.front().tokens == 100,
+               "the longer survivor is the one kept");
+    }
+    expect(relocation_is_expressible(kept, relocation_prefill_ranges(kept, 0, prompt), 0, prompt,
+                                     true),
+           "the plan the selector returns is one the runtime can execute");
+    expect(trace.rejected.size() == 1, "the dropped span is reported, not silently lost");
+    if (trace.rejected.size() == 1) {
+        expect(std::string_view(trace.rejected.front().reason) ==
+                   "destination page already claimed by a longer span",
+               "and it says why");
+        expect(trace.rejected.front().new_begin == 164 && trace.rejected.front().tokens == 16,
+               "and describes the span it dropped");
+    }
+
+    // A page the reused prefix only partly covers belongs to the prefix: the frontier page can carry
+    // the prefix's own interval, so a span may not begin inside it. Only reachable when the frontier
+    // itself is not page aligned, which is why the rule watches for that rather than applying always.
+    PromptEditDiff straddling;
+    straddling.spans = {SurvivingSpan{.old_begin = 0, .new_begin = 40, .tokens = block_tokens(1)}};
+    straddling.reusable_tokens = block_tokens(1);
+
+    RelocationTrace partial;
+    expect(plan_relocations(straddling, prompt, 40, prompt, std::nullopt, 6, &partial).empty(),
+           "a span inside the unaligned prefix frontier's page is not relocated");
+    expect(partial.rejected.size() == 1 &&
+               std::string_view(partial.rejected.front().reason) ==
+                   "destination in the prefix frontier's partial page",
+           "and the reason names the frontier page");
+
+    // The same span is fine once the frontier is page aligned, so the rule costs nothing in the
+    // aligned case every default run takes.
+    const auto aligned = plan_relocations(straddling, prompt, 0, prompt, std::nullopt, 6);
+    expect(aligned.size() == 1, "the rule is inert when the frontier is a whole page");
+
+    // The copied-path selector is the one that can actually produce an off-grid destination, so it is
+    // the one the collision rule matters for: without it the fallback returned both spans and the
+    // runtime refused the whole plan, losing the reuse the fallback exists to recover.
+    const auto copied = plan_shifted_relocations(diff, prompt, 0, prompt, std::nullopt, 6, true);
+    expect(copied.size() == 1, "the copied-path selector separates the same collision");
+    expect(relocation_is_expressible(copied, relocation_prefill_ranges(copied, 0, prompt), 0,
+                                     prompt, true),
+           "and the plan it returns is one the runtime can execute");
+}
+
+// The refusal has to name the condition, not just report that the plan was refused: a selector that
+// over-produced and a prompt the runtime cannot express need different fixes. The label and the
+// predicate are the same code path, so they cannot disagree.
+void test_relocation_refusal_names_the_rule() {
+    using ninfer::targets::qwen3_6::detail::PrefillRange;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+    using ninfer::targets::qwen3_6::detail::relocation_refusal;
+
+    const auto label = [](const char* refusal) {
+        return std::string_view(refusal == nullptr ? "(expressible)" : refusal);
+    };
+    // Derived ranges, so a case only has to name its spans and the arc it expects them to hold.
+    const auto refuse = [&](const std::vector<RelocatedSpan>& spans, std::uint32_t base,
+                            std::uint32_t prompt, bool source_may_shift) {
+        return label(relocation_refusal(spans, relocation_prefill_ranges(spans, base, prompt), base,
+                                        prompt, source_may_shift));
+    };
+    const auto span = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = source, .dest_begin = dest, .tokens = tokens};
+    };
+
+    // Every case is also checked against the predicate, so the two entry points stay one rule.
+    const std::vector<RelocatedSpan> run{span(0, block_tokens(1), block_tokens(1))};
+    const std::uint32_t three_blocks = block_tokens(3);
+    expect(refuse(run, 0, three_blocks, true) == "(expressible)",
+           "a whole-page span with a head and a tail is expressible");
+    expect(relocation_is_expressible(run, relocation_prefill_ranges(run, 0, three_blocks), 0,
+                                     three_blocks, true),
+           "and the predicate agrees");
+
+    expect(label(relocation_refusal(run, {}, block_tokens(2), block_tokens(2), true)) ==
+               "prompt is not longer than the prefix frontier",
+           "an empty suffix is named");
+    expect(label(relocation_refusal(run, {}, 0, block_tokens(2), true)) == "no prefilled range",
+           "a plan that prefills nothing is named");
+    expect(refuse({span(0, block_tokens(1), 0)}, 0, block_tokens(2), true) == "empty span",
+           "an empty span is named");
+    expect(refuse({span(7, block_tokens(1), block_tokens(1))}, 0, block_tokens(2), false) ==
+               "span is not whole blocks in both prompts",
+           "the re-pointing path's block alignment is named");
+    expect(refuse({span(7, block_tokens(1), block_tokens(1))}, 0, three_blocks, true) ==
+               "(expressible)",
+           "the same off-grid source is fine when the payload is copied");
+    expect(refuse({span(0, block_tokens(1), block_tokens(1))}, block_tokens(2), block_tokens(3),
+                  true) == "span starts below the prefix frontier",
+           "a destination inside the prefix reuse is named");
+    expect(refuse({span(0, block_tokens(3), block_tokens(1))}, 0, block_tokens(3), true) ==
+               "span reaches the final prompt token",
+           "a span reaching the final token is named");
+    expect(refuse({span(0, 40, block_tokens(1))}, 40, block_tokens(4), true) ==
+               "span shares the prefix frontier's partial page",
+           "a span inside an unaligned frontier page is named");
+    expect(refuse({span(0, block_tokens(1), block_tokens(1)),
+                   span(block_tokens(3), block_tokens(1) + 7, 64)},
+                  0, block_tokens(4), true) == "spans overlap",
+           "overlapping destinations are named");
+    expect(refuse({span(0, 64, 100), span(256, 164, 16)}, 0, block_tokens(8), true) ==
+               "spans share a destination page",
+           "two spans in one destination page are named");
+
+    // Ranges that do not tile the suffix, by a gap or past the end.
+    const std::vector<PrefillRange> gapped{PrefillRange{0, block_tokens(1)}};
+    expect(label(relocation_refusal(run, gapped, 0, three_blocks, true)) ==
+               "ranges and spans do not tile the suffix",
+           "a gap between the ranges and the spans is named");
+    const std::vector<PrefillRange> overrun{PrefillRange{0, block_tokens(1)},
+                                            PrefillRange{block_tokens(2), block_tokens(5)}};
+    expect(label(relocation_refusal(run, overrun, 0, three_blocks, true)) ==
+               "ranges and spans do not tile the suffix",
+           "ranges running past the prompt are named");
+}
+
 void test_relocation_prefill_ranges() {
     using ninfer::targets::qwen3_6::detail::PrefillRange;
     using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
@@ -1567,6 +1798,9 @@ int main() {
     test_plan_relocations();
     test_plan_relocations_keeps_longest();
     test_plan_relocations_respects_limits();
+    test_plan_relocations_reports_a_trace();
+    test_plan_relocations_keeps_one_span_per_destination_page();
+    test_relocation_refusal_names_the_rule();
     test_relocation_prefill_ranges();
     test_relocation_prefill_splits();
     test_relocation_is_expressible();
