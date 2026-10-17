@@ -694,6 +694,19 @@ int test_completion_usage_mapping_and_bounds() {
     failures += check(mapped.completion_tokens == 3, "mapped completion tokens");
     failures += check(mapped.cached_tokens == 7, "mapped cached prompt tokens");
 
+    // A relocated run is a cache hit too: it is served from resident KV, so it adds to the cached
+    // count and comes out of the computed prefill alongside the prefix hit.
+    GenerationOutcome relocated;
+    relocated.prompt_tokens                   = 10;
+    relocated.completion_tokens               = 3;
+    relocated.metrics.prefix_cache_hit_tokens = 4;
+    relocated.metrics.prefix_relocated_tokens = 3;
+    failures += check(make_completion_usage(relocated).cached_tokens == 7,
+                      "relocated run adds to cached prompt tokens");
+    const CompletionTimings relocated_timings = make_completion_timings(relocated);
+    failures += check(relocated_timings.prompt_n == 3 && relocated_timings.cache_n == 7,
+                      "relocated run is reused, not prefilled");
+
     const Json cache_miss =
         Json::parse(make_chat_completion_response("id-cold", "m", 111, "", "", "stop", {10, 0}));
     failures += check(cache_miss.at("usage").at("prompt_tokens_details").at("cached_tokens") == 0,

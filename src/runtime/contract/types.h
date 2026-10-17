@@ -70,8 +70,9 @@ struct RequestPlanSummary {
 struct BeginSummary {
     std::uint32_t prompt_tokens        = 0;
     std::uint32_t reused_prompt_tokens = 0;
-    // A subset of reused_prompt_tokens served by relocating a surviving span rather than by prefix
-    // reuse. Carried separately because prefix reuse and Suffix Cache Reuse are indistinguishable
+    // Prompt tokens served by relocating a surviving span rather than by prefix reuse. Disjoint
+    // from and additive with `reused_prompt_tokens`; reporting sums the two for the client-facing
+    // cache hit. Carried separately because prefix reuse and Suffix Cache Reuse are indistinguishable
     // from `reused_prompt_tokens` alone, and a Suffix Cache Reuse measurement that cannot see its own
     // relocation reports nothing.
     std::uint32_t relocated_prompt_tokens = 0;

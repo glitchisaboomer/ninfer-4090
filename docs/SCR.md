@@ -46,6 +46,15 @@ We implement SCR to make prefill more efficient for context language models (CLM
 * **`src/ops/`** (`sm_89` kernels):
 * `gqa_attention_decode_bf16.cuh`, `gqa_attention_prefill_bf16.cuh`, and INT8 variants (`_i8.cuh`).
 
+**Reporting.** A relocated run is served from resident KV, so it is a cache hit on the wire even
+though it is not a prefix hit: `usage.prompt_tokens_details.cached_tokens` (Chat Completions, in the
+non-streaming body and the streaming usage chunk) and `usage.input_tokens_details.cached_tokens`
+(Responses) report the ordinary prefix hit **plus** the relocated run, and the result never exceeds
+`prompt_tokens`. The two mechanisms stay separable for measurement: the request JSONL log carries
+`prefix_cache_hit_tokens`, `prefix_relocated_tokens`, and `prefix_reuse_path`; `/metrics` exposes
+`ninfer:prefix_cache_hit_tokens_total` and `ninfer:prefix_relocated_tokens_total`; and the `timings`
+block reports the same combined count in `cache_n` with `prompt_n` net of it.
+
 
 
 ---

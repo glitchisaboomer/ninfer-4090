@@ -92,6 +92,19 @@ int main() {
     const auto clamped = parse(metrics.render(1));
     failures += check(clamped.at("llamacpp:prompt_tokens_total") == 1300.0, "underflow clamped");
 
+    // A relocated run is a cache hit too: it is served from resident KV, so none of it is computed
+    // prefill, but it is counted separately from the prefix hit.
+    GenerationOutcome relocated = outcome(1200, 800, 100, 0.1, 2.0, 0, 0);
+    relocated.metrics.prefix_relocated_tokens = 300;
+    metrics.record(relocated);
+    const auto with_relocation = parse(metrics.render(1));
+    failures += check(with_relocation.at("llamacpp:prompt_tokens_total") == 1400.0,
+                      "relocated run excluded from computed prefill");
+    failures += check(with_relocation.at("ninfer:prefix_cache_hit_tokens_total") == 1750.0,
+                      "prefix hits stay separate from relocation");
+    failures += check(with_relocation.at("ninfer:prefix_relocated_tokens_total") == 300.0,
+                      "relocated tokens counted separately");
+
     std::printf("%s serve metrics\n", failures == 0 ? "OK" : "FAIL");
     return failures == 0 ? 0 : 1;
 }
