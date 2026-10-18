@@ -40,7 +40,12 @@ CompletionUsage make_completion_usage(const GenerationOutcome& outcome) {
 
 CompletionTimings make_completion_timings(const GenerationOutcome& outcome) {
     CompletionTimings timings;
-    const int reused = reused_prompt_tokens(outcome.metrics);
+    // The same clamp `make_completion_usage` applies, so `/v1` usage and `timings` cannot disagree
+    // about one request. A reused count past the prompt is a planner bug rather than a request
+    // shape, but the two figures are read side by side, and one of them reporting more cached tokens
+    // than the prompt had is a disagreement a reader would have to resolve from the code.
+    const int reused =
+        std::clamp(reused_prompt_tokens(outcome.metrics), 0, outcome.prompt_tokens);
     // What the prefill computed, not what the prompt contained. Reused covers both mechanisms, so
     // this is the honest figure for Suffix Cache Reuse instead of a rate no prefill achieved.
     const int prompt_eval = std::max(0, outcome.prompt_tokens - reused);
@@ -54,7 +59,7 @@ CompletionTimings make_completion_timings(const GenerationOutcome& outcome) {
     timings.predicted_per_second = outcome.metrics.decode_seconds > 0.0
         ? static_cast<double>(outcome.completion_tokens) / outcome.metrics.decode_seconds
         : 0.0;
-    timings.cache_n = static_cast<std::uint32_t>(std::max(0, reused));
+    timings.cache_n = static_cast<std::uint32_t>(reused);
     return timings;
 }
 
