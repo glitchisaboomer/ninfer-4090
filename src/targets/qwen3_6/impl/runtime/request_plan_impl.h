@@ -260,8 +260,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // The final prompt token is always prefilled, because prompt logits can only come from a
             // real forward pass. A base at the prompt end would instead sample from the hidden state of
             // the last token the resident sequence generated, which is a different position entirely.
+            // `size() - 1` would wrap to 0xFFFFFFFF on an empty prompt and ask the detector for a
+            // reuse base past every page. An empty prompt cannot reach this path today -- the
+            // frontend rejects one before a plan exists -- but this is the only place that turns a
+            // `size_t` length into the `uint32_t` base the rest of the plan uses, so spell the zero
+            // case out rather than leave a wrap standing in for it.
             const std::uint32_t reusable =
-                static_cast<std::uint32_t>(prompt.token_ids.size() - 1ULL);
+                prompt.token_ids.empty()
+                    ? 0u
+                    : static_cast<std::uint32_t>(prompt.token_ids.size() - 1ULL);
             const std::uint32_t shared = qwen3_6::detail::longest_shared_prefix_tokens(
                 sequence.ledger, prompt.token_ids, resident_kv, reusable);
             if (shared >= qwen3_6::detail::kPromptEditBlockTokens &&
