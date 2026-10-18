@@ -18,6 +18,21 @@
 // This lives in its own binary rather than in test_engine_prefix_real.cpp because it leaves a long
 // prompt resident, and the cases there were recorded against the sequence state they established for
 // themselves.
+//
+// The KV format, the reuse route and the edit shape are selectable, so this single-span edit can be
+// run on the same format and route as the multi-span failure. `NINFER_MULTISPAN_KV` picks the KV
+// format (`bf16`, `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`; default bf16) and `NINFER_SCR_SOURCE_SHIFT=1`
+// selects the route that copies a run whose source does not sit on the page grid. The deleted
+// stretch is `NINFER_MIDPROMPT_KEEP` sentences out of `NINFER_MIDPROMPT_REPEATS`, dropping
+// `NINFER_MIDPROMPT_DROP`, and `NINFER_MIDPROMPT_MODE=segmented` selects the multi-run planner:
+//
+//   $env:NINFER_MULTISPAN_KV="rk4v4-e8"; $env:NINFER_SCR_SOURCE_SHIFT="1"
+//   $env:NINFER_MIDPROMPT_MODE="segmented"
+//   .\build-ninja\tests\ninfer_qwen3_6_27b_mid_prompt_edit_test.exe
+//
+// If this single-span edit fails on the format and route the multi-span case fails on, the fault
+// needs only one relocated run and not several -- which points at the quantized prefill kernel
+// reading a page a relocated run only partly fills (see docs/SCR.md §5), not at the multi-run plan.
 #include "ninfer/engine.h"
 
 #include <cmath>
@@ -67,12 +82,43 @@ const char* reuse_path_name(ninfer::PrefixReusePath path) {
     return "unknown";
 }
 
+// The KV format, read from the same variable the multi-span sibling reads, so the two binaries can
+// be pointed at one format without a second name to remember.
+ninfer::KvCacheStorage kv_storage_from_env() {
+    const char* value = std::getenv("NINFER_MULTISPAN_KV");
+    if (value == nullptr || *value == '\0') { return ninfer::KvCacheStorage::BFloat16; }
+    const std::string name(value);
+    if (name == "bf16") { return ninfer::KvCacheStorage::BFloat16; }
+    if (name == "int8") { return ninfer::KvCacheStorage::Int8Group64; }
+    if (name == "rk8v4") { return ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
+    if (name == "rk4v4") { return ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64; }
+    if (name == "rk2v4-e8") { return ninfer::KvCacheStorage::RK2V4E8; }
+    if (name == "rk4v4-e8") { return ninfer::KvCacheStorage::RK4V4E8; }
+    std::cerr << "mid-prompt edit: unknown NINFER_MULTISPAN_KV=" << name << ", using bf16\n";
+    return ninfer::KvCacheStorage::BFloat16;
+}
+
+ninfer::ScrRelocationMode scr_mode_from_env() {
+    const char* value = std::getenv("NINFER_MIDPROMPT_MODE");
+    if (value != nullptr && std::string(value) == "segmented") {
+        return ninfer::ScrRelocationMode::Segmented;
+    }
+    return ninfer::ScrRelocationMode::Tail;
+}
+
+int env_int(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') { return fallback; }
+    return std::atoi(value);
+}
+
 ninfer::EngineOptions engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = 4096;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk             = 1024;
+    options.kv_cache                  = kv_storage_from_env();
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -84,21 +130,30 @@ int exercise(const char* artifact) {
 
     // Roughly 1,800 tokens, of which a third is deleted from the middle: the shape of a user
     // trimming a long pasted log. The survivors after the gap keep their content but land at new
-    // positions, and the chat template's tail is unchanged.
-    constexpr int kRepeats = 60;
-    constexpr int kKeep    = 20; // sentences before the deleted block
-    constexpr int kDrop    = 20; // sentences deleted from the middle
+    // positions, and the chat template's tail is unchanged. Overridable so a run can vary how far
+    // the survivors shift -- the deleted token count decides whether a relocated run starts partway
+    // through a page.
+    const int repeats = env_int("NINFER_MIDPROMPT_REPEATS", 60);
+    const int kKeep   = env_int("NINFER_MIDPROMPT_KEEP", 20); // sentences before the deleted block
+    const int kDrop   = env_int("NINFER_MIDPROMPT_DROP", 20); // sentences deleted from the middle
+    if (repeats < 1 || kKeep < 0 || kDrop < 0 || repeats - kKeep - kDrop < 0) {
+        std::cerr << "mid-prompt edit: NINFER_MIDPROMPT_REPEATS/KEEP/DROP leave no prompt to build\n";
+        return 1;
+    }
 
-    const std::string full  = prose_block(kRepeats);
+    const std::string full  = prose_block(repeats);
     std::string edited_text = prose_block(kKeep);
-    edited_text += prose_block(kRepeats - kKeep - kDrop);
+    edited_text += prose_block(repeats - kKeep - kDrop);
     edited_text += "Which entry was rolled back? ";
 
-    auto options = [](bool reuse) {
+    const ninfer::ScrRelocationMode mode = scr_mode_from_env();
+    auto options = [mode](bool reuse) {
         ninfer::RequestOptions result;
         result.execution.requested_output_tokens = 8;
         result.execution.sampling.temperature    = 0.0F;
         result.execution.allow_prefix_reuse      = reuse;
+        result.execution.scr_mode                = mode;
+        result.execution.suffix_reuse_max_spans  = 6;
         result.stop.include_model_defaults       = false;
         return result;
     };
@@ -144,7 +199,10 @@ int exercise(const char* artifact) {
         first_logprob_delta = std::fabs(cold.generated_logprobs[0] - reused.generated_logprobs[0]);
     }
 
-    std::cout << "mid-prompt edit: path=" << reuse_path_name(reused.prefix_reuse_path)
+    std::cout << "mid-prompt edit: mode="
+              << (mode == ninfer::ScrRelocationMode::Segmented ? "segmented" : "tail")
+              << " repeats=" << repeats << " keep=" << kKeep << " drop=" << kDrop
+              << " path=" << reuse_path_name(reused.prefix_reuse_path)
               << " reused=" << reused.reused_prompt_tokens
               << " relocated=" << reused.relocated_prompt_tokens
               << " computed=" << reused.computed_prefill_tokens << " of "
@@ -180,9 +238,10 @@ int exercise(const char* artifact) {
         std::cerr << "mid-prompt edit: reuse moved the first token's logprob by "
                   << first_logprob_delta << " nats (budget " << kFirstTokenBudgetNats
                   << ") and agreed on " << agreed << " of 8 tokens (minimum " << kMinAgreedTokens
-                  << "); the retained recurrent state summarises text the edited prompt no longer "
-                     "has, so a result this far out means the continuation is no longer an "
-                     "approximation of the cold one\n";
+                  << "); the continuation is no longer an approximation of the cold one, either "
+                     "because the retained recurrent state summarises text the edited prompt no "
+                     "longer has or because the relocated KV read back wrong (vary "
+                     "NINFER_MULTISPAN_KV and NINFER_SCR_SOURCE_SHIFT to tell which)\n";
         return 1;
     }
     return 0;
@@ -191,11 +250,29 @@ int exercise(const char* artifact) {
 } // namespace
 
 int main() {
+    // `NINFER_MULTISPAN_ALIGNED=1` forces the aligned route, matching the multi-span sibling. Left
+    // unset, this test keeps the aligned default it has always run with, and
+    // `NINFER_SCR_SOURCE_SHIFT=1` selects the route that copies a run whose source is not on the
+    // page grid. The runtime reads the flag once per process, so it has to be set before the first
+    // request.
+    const char* aligned = std::getenv("NINFER_MULTISPAN_ALIGNED");
+    if (aligned != nullptr && *aligned != '\0' && *aligned != '0') {
+#if defined(_WIN32)
+        _putenv_s("NINFER_SCR_SOURCE_SHIFT", "0");
+#else
+        setenv("NINFER_SCR_SOURCE_SHIFT", "0", 1);
+#endif
+    }
+
     const char* artifact = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_QWEN3_6_27B_WEIGHTS is not set\n";
         return 77; // CTest SKIP_RETURN_CODE
     }
+    const char* shift = std::getenv("NINFER_SCR_SOURCE_SHIFT");
+    std::cout << "mid-prompt edit: source_shift="
+              << ((shift != nullptr && *shift != '\0' && *shift != '0') ? "on" : "off")
+              << " kv=" << static_cast<int>(kv_storage_from_env()) << '\n';
     if (const int result = exercise(artifact); result != 0) { return result; }
     std::cout << "ok\n";
     return 0;
