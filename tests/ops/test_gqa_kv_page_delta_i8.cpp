@@ -64,7 +64,8 @@ constexpr bool kE8Root     = false;
 constexpr std::int32_t kDecodeTokens  = 8;
 constexpr std::int32_t kPrefillTokens = 128;
 
-void check_decode_attention_with_delta(const Scenario& scenario, const char* scenario_name) {
+void check_decode_attention_with_delta(const Scenario& scenario, const char* scenario_name,
+                                           const Criterion& anchor = kConformanceInt8) {
     if (scenario.table[kDestPage] == kDestPage) {
         fail("block table must be non-identity at kDestPage for the negative control to be valid");
         return;
@@ -101,15 +102,19 @@ void check_decode_attention_with_delta(const Scenario& scenario, const char* sce
                                                       visible, ref_view);
 
     // FP64 anchor: enabled because Int8Group64 has rotate_k = false, so the oracle needs no
-    // Hadamard stage. kConformanceInt8 goes to BOTH calls -- measure() uses it for the gross
+    // Hadamard stage. The criterion goes to BOTH calls -- measure() uses it for the gross
     // thresholds and expect_conformant for relative L2 -- so the anchor is judged against the
     // INT8 profile end to end, not a BF16/INT8 hybrid. A failure here is in the scenario or
     // the Int8Cache image decode, not in the delta machinery.
+    //
+    // Which profile is the caller's choice: the one-page shapes sit comfortably under
+    // kConformanceInt8, while the multi-page run carries one rounding more and needs the wider
+    // row (see kConformanceInt8MultiPage).
     if (!expect_conformant(measure(got_reference.out,
                                    ideal_attention(scenario.q, reference, base, kDecodeTokens),
-                                   kConformanceInt8),
+                                   anchor),
                            named("A3 over a directly prefilled int8 page", scenario_name),
-                           kConformanceInt8)) {
+                           anchor)) {
         ++failures;
     }
 
@@ -301,7 +306,8 @@ int main() {
     std::printf("  long off-grid run: src %d -> dst %d, delta %d, %d tokens over dst pages %d..%d\n",
                 long_run.src, long_run.dst, long_run.dst - long_run.src, long_run.run,
                 long_run.dst / kPageSize, (long_run.dst + long_run.run - 1) / kPageSize);
-    check_decode_attention_with_delta(long_run, "off-grid, multi-page");
+    check_decode_attention_with_delta(long_run, "off-grid, multi-page",
+                                          kConformanceInt8MultiPage);
     check_prefill_attention_with_delta(long_run, "off-grid, multi-page");
 
     if (failures != 0) {

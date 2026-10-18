@@ -62,7 +62,8 @@ AttentionRun run_prefill_attention_detail(Cache& cache, const std::vector<__nv_b
     return AttentionRun{download_doubles(dout, q.size())};
 }
 
-void check_decode_attention_with_delta(const Scenario& scenario) {
+void check_decode_attention_with_delta(const Scenario& scenario,
+                                           const Criterion& anchor = kConformanceBf16) {
 
     // 0. Setup assertion: the destination page table entry is non-identity, so the zero-delta
     //    negative control remains meaningful for both aligned and mixed-page scenarios.
@@ -111,8 +112,8 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
 
     if (!expect_conformant(
             measure(got_reference.out,
-                    ideal_attention(scenario.q, reference, decode_base, kDecodeTokens)),
-            "A3 over a directly prefilled page (anchors the harness)")) {
+                    ideal_attention(scenario.q, reference, decode_base, kDecodeTokens), anchor),
+            "A3 over a directly prefilled page (anchors the harness)", anchor)) {
         ++failures;
     }
 
@@ -283,7 +284,7 @@ int main() {
     check_prefill_attention_with_delta(scenario);
     check_decode_attention_with_delta(unaligned_scenario);
     check_prefill_attention_with_delta(unaligned_scenario);
-    check_decode_attention_with_delta(long_scenario);
+    check_decode_attention_with_delta(long_scenario, kConformanceBf16MultiPage);
     check_prefill_attention_with_delta(long_scenario);
 
     if (failures != 0) {

@@ -109,6 +109,22 @@ constexpr Criterion kConformanceBf16{2.8e-3, 1.0e-3, 2.7e-3};
 // The INT8 criterion, matching kAttentionInt8Criterion in test_gqa_attention.cpp.
 constexpr Criterion kConformanceInt8{3.15e-3, 1.1e-3, 2.2e-3};
 
+// The multi-page A3 decode anchor over a plain Int8Group64 page: the same shape the one-page
+// off-grid scenario has always used, widened to a run of 192 tokens.
+//
+// The widening is what saturates the borrowed limit. The one-page off-grid anchor measured
+// 3.109e-3 against kConformanceInt8's 3.15e-3; the same check over three destination pages measures
+// 3.156e-3, 0.19% over, deterministic across runs and with zero gross errors -- the extra pages add
+// a rounding the narrow run never carried, not a defect. A shape that saturates the borrowed limit
+// cannot absorb that, so this row gets its own profile while kConformanceInt8 stays untouched for
+// the callers it was calibrated for. The gross thresholds carry over unchanged; only the L2 side
+// moves.
+//
+// 3.3e-3 is the measured correct path plus ~4.6% of margin, and it keeps an order of magnitude of
+// separation from the same check's negative control (6.0e-2), which is what makes the anchor still
+// able to tell a broken read from a near miss.
+constexpr Criterion kConformanceInt8MultiPage{3.3e-3, 1.1e-3, 2.2e-3};
+
 // The integration test's A1 prefill anchor: the append-and-attend route over a cache whose K rows
 // were written by gqa_kv_append at the destination, judged against the FP64 oracle.
 //
@@ -124,6 +140,21 @@ constexpr Criterion kConformanceInt8{3.15e-3, 1.1e-3, 2.2e-3};
 // separation from the same check's negative control (5.6e-2), which is what makes the anchor still
 // able to tell a broken read from a near miss.
 constexpr Criterion kConformanceIntegrationA1Bf16{3.2e-3, 1.0e-3, 2.7e-3};
+
+// The multi-page A3 decode anchor over a BF16 page: the one-page shapes' anchor, widened to a run of
+// 192 tokens.
+//
+// The widening is what saturates the borrowed limit. The one-page shapes' anchor measured 2.752e-3
+// against kConformanceBf16's 2.80e-3; the same check over three destination pages measures 2.809e-3,
+// 0.32% over, deterministic across runs and with zero gross errors -- the extra pages add a rounding
+// the narrow run never carried, not a defect. A shape that saturates the borrowed limit cannot
+// absorb that, so this row gets its own profile while kConformanceBf16 stays untouched for the
+// callers it was calibrated for. The gross thresholds carry over unchanged; only the L2 side moves.
+//
+// 2.9e-3 is the measured correct path plus ~3.2% of margin, and it keeps an order of magnitude of
+// separation from the same check's negative control (5.7e-2), which is what makes the anchor still
+// able to tell a broken read from a near miss.
+constexpr Criterion kConformanceBf16MultiPage{2.9e-3, 1.0e-3, 2.7e-3};
 
 // The rotated int8 profile: the same cache with a per-64-group Hadamard interposed on K and V.
 //

@@ -46,13 +46,29 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
     tile[off]     = code;
 }
 
-// Dynamic staging the partial-page boundary path adds on top of the K/V arena: the shifted rotary
-// group tile (kGqaKvShiftB16PerRow b16 lanes per row) plus its one scale per row. The launcher sizes
-// its dynamic-smem request with this, so the arena layout below and the launch stay in step.
+// Byte size of the Q scale tile: Br * Groups floats, 16-byte aligned so the region after it stays
+// vector-aligned.
+template <typename Geometry, int TokenTile>
+inline constexpr std::size_t gqa_attention_decode_i8_scale_bytes() {
+    constexpr int Br = ((TokenTile * Geometry::GroupSize + 15) / 16) * 16;
+    return (static_cast<std::size_t>(Br) * kGqaKvQuantGroups * sizeof(float) + 15u) & ~static_cast<std::size_t>(15u);
+}
+
+// Dynamic staging the partial-page boundary path adds on top of the K/V arena, and the Q scale
+// tile it needs beside it. The launcher sizes its dynamic-smem request with this, so the arena
+// layout below and the launch stay in step.
+//
+// Two independent regions, in this order:
+//   * the shifted rotary group tile (kGqaKvShiftB16PerRow b16 lanes per row) plus its one scale per
+//     row, which a partial page needs to hold group 0 in both frames at once;
+//   * one float per (row, group) of the staged Q tile, which used to overlay p_s. That overlay made
+//     the P tile's lifetime depend on whether a page transition re-staged Q, so it now has its own
+//     storage and the obligation is gone.
 template <typename Geometry, int TokenTile>
 inline constexpr std::size_t gqa_attention_decode_i8_shift_bytes() {
     constexpr int Br = ((TokenTile * Geometry::GroupSize + 15) / 16) * 16;
-    return static_cast<std::size_t>(Br) * (kGqaKvShiftB16PerRow * 2 + sizeof(float));
+    return static_cast<std::size_t>(Br) * (kGqaKvShiftB16PerRow * 2 + sizeof(float)) +
+           gqa_attention_decode_i8_scale_bytes<Geometry, TokenTile>();
 }
 
 // Decode-specialized producer/consumer kernel for T=1..6. One producer warp per
@@ -96,7 +112,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PVKs                 = Bc / 16;
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
-    constexpr float Log2E         = 1.4426950408889634074f;
+    // Where the Q scale tile sits in the dynamic arena: after the K/V arena when there is one, then
+    // after the shifted rotary group tile. Restated here rather than factored out because the kernel
+    // body cannot call a function template whose KeyBlock and DynamicArena it already has as its own
+    // parameters; the total the launcher requests comes from gqa_attention_decode_i8_shift_bytes, so
+    // the two agree by construction on the size and differ only in where this one stops.
+    constexpr std::size_t kDynamicScaleOffsetBytes =
+        (DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0ULL) +
+        static_cast<std::size_t>(Br) * (kGqaKvShiftB16PerRow * 2 + sizeof(float));
+    constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask   = 0xffffffffu;
 
     static_assert(TokenTile >= 1 && TokenTile <= 8);
@@ -127,7 +151,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     std::int8_t* v_i8     = r_s + Bc * D;
     __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * D);
     __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
-    float* q_scale_tmp    = reinterpret_cast<float*>(p_s);
+    // One float per (row, group) of the staged Q tile. Deliberately its own storage rather than an
+    // overlay on p_s: p_s is written by the producer warps every key block and read by the consumer
+    // warps after the barrier, while this is rewritten whenever the page frame changes and read by
+    // the producers. Overlaying the two made the lifetime of every P element depend on whether a
+    // page transition happened to re-stage Q -- a barrier obligation that cannot be expressed in the
+    // loop, and which was missing, so a relocated multi-page run read a P tile the next block's
+    // staging had already overwritten.
+    //
+    // It trails the dynamic arena rather than the static tiles: at TokenTile 5/6 (Br 48) the static
+    // segment is already at its 48 KiB ceiling, and this is exactly the kind of staging that
+    // overflows it. The launcher sizes the request with gqa_attention_decode_i8_scale_bytes, so the
+    // layout here and the launch stay in step.
+    float* q_scale_s      = reinterpret_cast<float*>(dynamic_r_s + kDynamicScaleOffsetBytes);
     __shared__ float alpha_s[Br];
     __shared__ __align__(16) __half k_scale_s[Bc * Groups];
     __shared__ __align__(16) __half v_scale_s[Bc * Groups];
@@ -427,19 +463,27 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         ninfer::ops::cp_commit();
     };
 
-    int physical_page = block_table[first_tile >> kPagedKVPageShift];
-    issue_kv_tile(first_tile, physical_page);
-
+    // Zero the staging arenas before anything is issued into them. The order matters: the
+    // cp_async copies below write k_i8/v_i8/k_scale_s/v_scale_s, and the Q staging writes q_i8,
+    // q_scale_s, q_shift_i8 and q_shift_scale. Issuing the tile first, as this did until the
+    // partial-page scale tile got its own storage, put an async copy's destination writes in the
+    // same window as these ordinary stores -- racecheck flagged the pair as a write/write hazard on
+    // the shared memory. The fills are ordinary stores, so one barrier after them is enough to keep
+    // them ahead of both the async copies and the Q staging that follows.
     for (int i = tid; i < (Br * D) / 16; i += Threads) {
         store_vec(reinterpret_cast<int4*>(q_i8) + i, make_int4(0, 0, 0, 0));
     }
-    for (int i = tid; i < Br * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
+    for (int i = tid; i < Br * Groups; i += Threads) { q_scale_s[i] = 0.0f; }
     // The shifted rotary group gets the same treatment, so a page without a delta plane -- or a
     // padding row -- reads zeros instead of whatever the previous tile left in the arena.
     for (int i = tid; i < ShiftBytes / 16; i += Threads) {
         store_vec(reinterpret_cast<int4*>(q_shift_i8) + i, make_int4(0, 0, 0, 0));
     }
     for (int i = tid; i < Br; i += Threads) { q_shift_scale[i] = 0.0f; }
+    __syncthreads();
+
+    int physical_page = block_table[first_tile >> kPagedKVPageShift];
+    issue_kv_tile(first_tile, physical_page);
 
     auto stage_and_quantize_q = [&](std::int32_t delta) {
         for (int unit = warp; unit < RowCount * Groups; unit += Wc) {
@@ -467,7 +511,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
             gqa_small_t_i8_store_swz(q_i8, row, d0, DB16, gqa_kv_quant_code(x0, inv));
             gqa_small_t_i8_store_swz(q_i8, row, d1, DB16, gqa_kv_quant_code(x1, inv));
-            if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
+            if (lane == 0) { q_scale_s[row * Groups + grp] = qs; }
         }
     };
 
@@ -532,7 +576,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    // Every lane of a four-lane quad wants the same q scale, and q_scale_tmp is
+    // Every lane of a four-lane quad wants the same q scale, and q_scale_s is
     // zero-filled over the whole Br x Groups tile, so each lane reads its own row
     // straight out of shared memory. The former "read on lid == 0, then
     // __shfl_sync(.., gid * 4)" broadcast cost a dynamic-index shuffle per group,
@@ -546,8 +590,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const int producer_row0 = warp * 16 + gid;
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
-            q_scale_r0[g] = q_scale_tmp[producer_row0 * Groups + g];
-            q_scale_r1[g] = q_scale_tmp[(producer_row0 + 8) * Groups + g];
+            q_scale_r0[g] = q_scale_s[producer_row0 * Groups + g];
+            q_scale_r1[g] = q_scale_s[(producer_row0 + 8) * Groups + g];
         }
     };
     refresh_q_scale_regs();
@@ -564,6 +608,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // Unconditional, and before the re-stage below. The consumer warps finish the block by
+        // reading p_s and v_bf16 into the PV mma; a page transition then rewrites the Q tiles and
+        // their scales. Leaving this inside the frame-change branch made the barrier conditional on
+        // whether a relocation happened to shift the frame, so an interior page of a multi-page run
+        // -- uniform delta, no frame change -- ran the re-stage with no barrier at all. The cost is
+        // one barrier per key block, which the block's own producer/consumer split already pays.
+        __syncthreads();
         if (delta_row != nullptr && kb != 0) {
             const int page                = k0 >> kPagedKVPageShift;
             const std::int32_t page_delta = delta_row[page];

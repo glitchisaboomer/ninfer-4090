@@ -131,8 +131,9 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v_scale = cache.v_scale_pages;
     const auto launch =
         [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
-        // The shifted rotary group a partial page stages rides in the dynamic arena, so every INT8
-        // configuration opts in now -- including the ones whose K/V arena is a static tile.
+        // The shifted rotary group a partial page stages, and the Q scale tile that no longer
+        // overlays p_s, both ride in the dynamic arena -- so every INT8 configuration opts in now,
+        // including the ones whose K/V arena is a static tile.
         constexpr std::size_t kDynamicBytes =
             (DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0ULL) +
             gqa_attention_decode_i8_shift_bytes<Geometry, TokenTile>();
