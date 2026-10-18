@@ -88,7 +88,7 @@ Keys aren't re-written with new rotations; they keep their original source rotat
 Verified on RTX 4090 (`sm_89`, CUDA 13.3, GCC 11, Linux):
 
 * `ninfer_gqa_attention_test`, `ninfer_gqa_kv_page_delta_test` (BF16), `_i8_test`, `_rotated_test`, `ninfer_scr_relocation_integration_test` all pass.
-* CTest: 98/98 pass (6 tests skipped due to missing model weights).
+* CTest: 100/100 pass (8 skipped: the weight-dependent tests, no model weights here).
 * **Accuracy:** Partial-page relative L2 vs direct prefill is $\sim 1.86\times 10^{-3}$ to $3.42\times 10^{-3}$ (well under the $2.0\times 10^{-2}$ limit).
 * **Cost:** Partial-page decode is $1.007\times$ the baseline (essentially noise).
 
@@ -132,6 +132,42 @@ moved against that run, in nats.
 These runs all took the copying route. The route that re-points whole blocks was measured earlier
 and is not re-measured here; `NINFER_MULTISPAN_ALIGNED=1` selects it for a future run.
 
+### Prefill is not bit-reproducible
+
+Two cold prefills of the same prompt do not agree, whether they run in one Engine or in two. Six
+prompts differed by 0.0003 to 0.003 nats at position 0 with identical server flags, and the number
+moves from run to run. It has nothing to do with reuse: the same disagreement reproduces with reuse
+switched off.
+
+The cause was localized with a per-layer residual trace to the Q5 residual epilogue, which splits its
+K dimension across two CTAs that both add into the same bf16 output element, so two otherwise
+identical prefills can round differently in whichever order those CTAs land.
+`NINFER_Q5_RESIDUAL_SPLITS=1` selects the single-writer schedule and makes prefills bit-identical
+(three prefills of one prompt, zero divergent layers, confirmed on hardware 2026-10-11). It is an
+override rather than the default because halving the K CTAs at `t <= 16` has not been benchmarked. A second, decode-side source is the w8 split-K
+atomics in the MTP path, so with speculation on, decode rounds are not reproducible either; that one
+costs pacing, not correctness, because drafts are verified against the base model.
+
+For every measurement in this document it is the floor, and it decides how the numbers are read:
+
+* Read the first-token log-probability difference, not the agreement count. A ~1e-3 nats difference
+  is enough to flip a near-tie, which is why the counts move between runs (and between the 15 runs
+  above) while the deltas stay put.
+* Compare a hash of a chunk, not a sum of magnitudes. A magnitude total can show two states differ,
+  but never that they agree; `prefill_trace.h` folds a hash for exactly that reason.
+* `NINFER_PREFILL_TRACE=1` traces one chunk per layer, but only against a baseline the same Engine
+  recorded, so two Engines cold-prefilling one prompt are invisible to it. `NINFER_PREFILL_TRACE_CROSS=1`
+  publishes each completed chunk to a process-wide table keyed by shape and compares against the last
+  one from any Engine, which is the only view that sees that pair.
+* `ninfer_qwen3_6_27b_prefill_determinism_test` is the tripwire. Its default tolerance is `1e-6`, so
+  it **fails** while the divergence exists: that is the intended state, not a broken test.
+  `NINFER_PREFILL_DET_TOL` overrides it, and `0` demands bit-identity.
+
+Still open: the k2 fixture's reuse divergence is an order of magnitude worse than the other k values
+(0.0801 nats) while the amount relocated does not predict it. A reproducible prefill floor is a
+precondition for diagnosing that — until it exists, a real quality regression and sensitivity in a
+prompt that happens to place a near-tie look the same.
+
 **Superseded note.** Until this revision, this section recorded the opposite result — the quantized
 formats at 0/8 to 3/8 matching, 0.18 to 1.16 nats off, blamed on the quantized prefill kernel —
 and §6 named fixing that kernel as the next task. That measurement was taken at 15:24 on the same
@@ -148,13 +184,6 @@ time. The numbers above replace it.
 ## 6. Deferred Work
 
 * BF16 prefill uses a fragile `INT32_MIN` sentinel to roll back in-place rotations (INT8 avoids this by staging a separate shifted rotary group).
-* The BF16 prefill boundary path rotates the query tile in place and then reloads it without a
-  barrier before either step, so one warp can overwrite the tile another warp is still reading. Two
-  barriers are missing around `recompute_boundary_scores` in `gqa_attention_prefill_bf16.cuh` (one
-  before the in-place rotation, one before the reload). Both are legal there — all 128 threads reach
-  the function and it is not guarded by a warp check — and both only run on a partly-filled page,
-  which is why green runs have not exercised them. This was recorded in a handoff document that was
-  deleted when these notes were consolidated; it is recorded here so that does not happen twice.
 * `ScrRelocationMode::Segmented` floors a span that overruns the last whole block before the limit, so up to 63 tokens per such run are re-prefilled even with `NINFER_SCR_SOURCE_SHIFT` set, where the copied path could take the partial block. The fallback does not rescue it while another span was selected; `[scr-diag] plan` reports it as `trimmed to whole blocks before the rewrite boundary`.
 * Oracles test single dispatch shapes (8 decode, 128 prefill); other kernel variants (`TokenTile`, `MultiBatch`, `Masked`) inherit the boundary path without end-to-end test coverage.
 
