@@ -773,20 +773,9 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 }
                 // The rotary group's other frame, and the scale that frame quantized to. Read only on
                 // the one group that has two frames, so an ordinary page pays nothing for them.
-                unsigned af_shift[GroupKc][4];
                 float ss0 = 0.0f;
                 float ss1 = 0.0f;
                 if (boundary && grp == 0) {
-#pragma unroll
-                    for (int kk = 0; kk < GroupKc; ++kk) {
-                        const int acol = kk * 16 + a_coloff;
-                        ldmatrix_x4(af_shift[kk][0], af_shift[kk][1], af_shift[kk][2],
-                                    af_shift[kk][3],
-                                    smem_addr(&q_shift_b16[(row_base + a_rowoff) *
-                                                               kGqaKvShiftB16PerRow +
-                                                           gqa_kv_shift_swz(row_base + a_rowoff,
-                                                                            acol)]));
-                    }
                     ss0 = lid == 0 ? q_shift_scale[row_base + gid] : 0.0f;
                     ss1 = lid == 0 ? q_shift_scale[row_base + gid + 8] : 0.0f;
                     ss0 = __shfl_sync(FullMask, ss0, gid * 4);
@@ -809,8 +798,20 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                                bf[1]);
                         // The same K fragment serves both frames of group 0; only the query differs.
                         if (boundary && grp == 0) {
-                            mma_s8(s0, s1, s2, s3, af_shift[kk][0], af_shift[kk][1],
-                                   af_shift[kk][2], af_shift[kk][3], bf[0], bf[1]);
+                            // The rotated frame's Q fragment is loaded here rather than hoisted out
+                            // of the n-tile loop: two fragments held across all QKNt n-tiles is 8
+                            // registers this kernel cannot spare under __maxnreg__(120), and the
+                            // spill it bought was paid on every page. Reloading it per n-tile only
+                            // costs shared-memory reads on a partly-filled page.
+                            unsigned shift_frag[4];
+                            const int acol = kk * 16 + a_coloff;
+                            ldmatrix_x4(shift_frag[0], shift_frag[1], shift_frag[2], shift_frag[3],
+                                        smem_addr(&q_shift_b16[(row_base + a_rowoff) *
+                                                                   kGqaKvShiftB16PerRow +
+                                                               gqa_kv_shift_swz(
+                                                                   row_base + a_rowoff, acol)]));
+                            mma_s8(s0, s1, s2, s3, shift_frag[0], shift_frag[1], shift_frag[2],
+                                   shift_frag[3], bf[0], bf[1]);
                         }
                     }
                     const int keya = nt * 8 + 2 * lid;
@@ -1034,20 +1035,9 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 }
                 // The rotary group's other frame, and the scale that frame quantized to. Read only on
                 // the one group that has two frames, so an ordinary page pays nothing for them.
-                unsigned af_shift[GroupKc][4];
                 float ss0 = 0.0f;
                 float ss1 = 0.0f;
                 if (boundary && grp == 0) {
-#pragma unroll
-                    for (int kk = 0; kk < GroupKc; ++kk) {
-                        const int acol = kk * 16 + a_coloff;
-                        ldmatrix_x4(af_shift[kk][0], af_shift[kk][1], af_shift[kk][2],
-                                    af_shift[kk][3],
-                                    smem_addr(&q_shift_b16[(row_base + a_rowoff) *
-                                                               kGqaKvShiftB16PerRow +
-                                                           gqa_kv_shift_swz(row_base + a_rowoff,
-                                                                            acol)]));
-                    }
                     ss0 = lid == 0 ? q_shift_scale[row_base + gid] : 0.0f;
                     ss1 = lid == 0 ? q_shift_scale[row_base + gid + 8] : 0.0f;
                     ss0 = __shfl_sync(FullMask, ss0, gid * 4);
@@ -1070,8 +1060,20 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                                bf[1]);
                         // The same K fragment serves both frames of group 0; only the query differs.
                         if (boundary && grp == 0) {
-                            mma_s8(s0, s1, s2, s3, af_shift[kk][0], af_shift[kk][1],
-                                   af_shift[kk][2], af_shift[kk][3], bf[0], bf[1]);
+                            // The rotated frame's Q fragment is loaded here rather than hoisted out
+                            // of the n-tile loop: two fragments held across all QKNt n-tiles is 8
+                            // registers this kernel cannot spare under __maxnreg__(120), and the
+                            // spill it bought was paid on every page. Reloading it per n-tile only
+                            // costs shared-memory reads on a partly-filled page.
+                            unsigned shift_frag[4];
+                            const int acol = kk * 16 + a_coloff;
+                            ldmatrix_x4(shift_frag[0], shift_frag[1], shift_frag[2], shift_frag[3],
+                                        smem_addr(&q_shift_b16[(row_base + a_rowoff) *
+                                                                   kGqaKvShiftB16PerRow +
+                                                               gqa_kv_shift_swz(
+                                                                   row_base + a_rowoff, acol)]));
+                            mma_s8(s0, s1, s2, s3, shift_frag[0], shift_frag[1], shift_frag[2],
+                                   shift_frag[3], bf[0], bf[1]);
                         }
                     }
                     const int keya = nt * 8 + 2 * lid;
