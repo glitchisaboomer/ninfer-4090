@@ -128,3 +128,5 @@ INT8 destinations aren't restricted to whole pages anymore.
 | `tests/ops/test_scr_copied_relocation.cpp` | Copied-relocation oracle. |
 | `tests/test_scr_e2e_shape.py` + `tools/scr_e2e_check.py` | Host-only relocation fixtures and plan-shape checks: Scope A, interleaved (two survivors), and the off-grid edit that forces the copied route. |
 | `tests/targets/qwen3_6_27b/test_engine_prefill_determinism.cpp` | Prefill reproducibility (needs weights). |
+| `tests/targets/qwen3_6_27b/test_engine_mid_prompt_edit.cpp` | What a single-span mid-prompt edit costs the retained recurrent state (~1,800 tokens, ~600 deleted; needs weights). |
+| `tests/targets/qwen3_6_27b/test_engine_multi_span_edit.cpp` | The multi-span counterpart: one deep cut, three shallow cuts, and three deep cuts (~10k deleted) in one process, so the retained-state and multi-span-plan effects can be told apart. Reports agreement, first-token logprob delta and MTP counts; fails only if the reuse leg stops relocating (needs weights). |

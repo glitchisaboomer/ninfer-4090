@@ -185,6 +185,14 @@ ninfer_add_test(ninfer_qwen3_6_27b_mid_prompt_edit_test
   SOURCES targets/qwen3_6_27b/test_engine_mid_prompt_edit.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_mid_prompt_edit_test PROPERTIES SKIP_RETURN_CODE 77)
+# The multi-span counterpart: three interleaved survivors after a long mid-prompt edit, the shape a
+# live session reported as 0% MTP acceptance and an early EOS. Measurement first -- it prints the
+# cold/reused agreement, the first-token logprob delta and the MTP counts per case, and fails only
+# when the reuse leg stopped relocating, which would make the case say nothing.
+ninfer_add_test(ninfer_qwen3_6_27b_multi_span_edit_test
+  SOURCES targets/qwen3_6_27b/test_engine_multi_span_edit.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_multi_span_edit_test PROPERTIES SKIP_RETURN_CODE 77)
 # Guards prefill reproducibility. Position 0's logprob comes from the forward pass alone, so a
 # disagreement between two cold prefills of one fixed prompt is prefill disagreeing with itself.
 ninfer_add_test(ninfer_qwen3_6_27b_prefill_determinism_test
