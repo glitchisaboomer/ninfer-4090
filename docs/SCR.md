@@ -114,6 +114,9 @@ prompt, in nats.
   (`gqa_attention_prefill_i8.cuh`); bf16, which is correct, is served by its own kernel. The fault
   is therefore there, in the handling of a page a relocated run only partly fills — not in the
   planner, the page copy, or the published shift.
+* Case A of the same binary (`NINFER_MULTISPAN_CASE=A`) deletes one contiguous stretch into a single
+  surviving run and fails the same way on the shifted route, so a single moved run is enough; the
+  multi-span plan is not required.
 * The agreement counts move from run to run because prefill is not bit-reproducible
   (`test_engine_prefill_determinism`): the choice is already marginal, so the ~1e-3 noise flips
   it. The first-token difference stays well above that floor, so read it, not the count.
@@ -159,4 +162,4 @@ INT8 destinations aren't restricted to whole pages anymore.
 | `tests/test_scr_e2e_shape.py` + `tools/scr_e2e_check.py` | Host-only relocation fixtures and plan-shape checks: Scope A, interleaved (two survivors), and the off-grid edit that forces the copied route. |
 | `tests/targets/qwen3_6_27b/test_engine_prefill_determinism.cpp` | Prefill reproducibility (needs weights). |
 | `tests/targets/qwen3_6_27b/test_engine_mid_prompt_edit.cpp` | What a single-span mid-prompt edit costs the retained recurrent state (~1,800 tokens, ~600 deleted; needs weights). |
-| `tests/targets/qwen3_6_27b/test_engine_multi_span_edit.cpp` | The multi-span counterpart: one deep cut, three shallow cuts, and three deep cuts (~10k deleted) in one process, so the retained-state and multi-span-plan effects can be told apart. Reports agreement, first-token logprob delta and MTP counts; fails only if the reuse leg stops relocating (needs weights). Measured 2026-10-18: passes on the aligned route for every KV format and on the shifted route for bf16, fails on the shifted route for the quantized formats — see §5. |
+| `tests/targets/qwen3_6_27b/test_engine_multi_span_edit.cpp` | The multi-span counterpart: one deep cut, three shallow cuts, and three deep cuts (~10k deleted) in one process, so the retained-state and multi-span-plan effects can be told apart. Reports agreement, first-token logprob delta and MTP counts; fails only if the reuse leg stops relocating (needs weights). Measured 2026-10-18: passes on the aligned route for every KV format and on the shifted route for bf16, fails on the shifted route for the quantized formats — see §5. `NINFER_MULTISPAN_CASE` runs one case on its own; case A is the one-span probe. |

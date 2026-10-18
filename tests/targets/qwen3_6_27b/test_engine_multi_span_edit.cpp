@@ -36,6 +36,11 @@
 // so the fault is in the quantized kernel reading a page a relocated run only partly fills. The
 // agreement count still moves run to run because prefill is not reproducible
 // (test_engine_prefill_determinism), so read `first_logprob_delta`, not the count.
+//
+// `NINFER_MULTISPAN_CASE` selects one case by letter or name (`A`, `A-one-span-large`, ...) so the
+// one-span case can be run on its own; unset runs all three. Case A deletes one contiguous stretch
+// into a single surviving run, so it is the single-span probe -- and it fails on the shifted route
+// the same way the multi-span cases do.
 #include "ninfer/engine.h"
 
 #include <algorithm>
@@ -255,6 +260,15 @@ Outcome run_case(ninfer::Engine& engine, const Case& test) {
     return outcome;
 }
 
+// `NINFER_MULTISPAN_CASE` selects among the cases below, by letter or by name, so the one-span case
+// can be run on its own without paying for the multi-span ones. Unset runs every case.
+bool case_selected(const Case& test) {
+    const char* requested = std::getenv("NINFER_MULTISPAN_CASE");
+    if (requested == nullptr || *requested == '\0') { return true; }
+    const std::string wanted(requested);
+    return wanted == test.name || (wanted.size() == 1 && test.name[0] == wanted[0]);
+}
+
 int exercise(const char* artifact) {
     ninfer::Engine engine(engine_options(artifact));
 
@@ -268,13 +282,21 @@ int exercise(const char* artifact) {
     };
 
     int failures = 0;
+    int selected = 0;
     for (const Case& test : cases) {
+        if (!case_selected(test)) { continue; }
+        ++selected;
         const Outcome outcome = run_case(engine, test);
         if (!outcome.valid) {
             std::cerr << "multi-span edit: case " << test.name << " is not a valid measurement: "
                       << outcome.problem << '\n';
             ++failures;
         }
+    }
+    if (selected == 0) {
+        std::cerr << "multi-span edit: NINFER_MULTISPAN_CASE=" << std::getenv("NINFER_MULTISPAN_CASE")
+                  << " matched no case (A-one-span-large, B-three-span-small, C-three-span-large)\n";
+        return 1;
     }
     return failures == 0 ? 0 : 1;
 }
