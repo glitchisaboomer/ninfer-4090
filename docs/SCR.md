@@ -92,56 +92,69 @@ Verified on RTX 4090 (`sm_89`, CUDA 13.3, GCC 11, Linux):
 * **Accuracy:** Partial-page relative L2 vs direct prefill is $\sim 1.86\times 10^{-3}$ to $3.42\times 10^{-3}$ (well under the $2.0\times 10^{-2}$ limit).
 * **Cost:** Partial-page decode is $1.007\times$ the baseline (essentially noise).
 
-**Not covered:** Weights-dependent tests, `Segmented` runtime mode, prefill timing for boundary paths, long-context scaling, MSVC builds.
+**Not covered:** Windows/MSVC builds; prefill timing for a page a kept run only partly fills;
+contexts well beyond 20k.
 
-### The partly filled page reads back wrong on the quantized formats (measured 2026-10-18)
+### What a mid-prompt edit costs, measured at `228e10b5` (2026-10-18)
 
-`ninfer_qwen3_6_27b_multi_span_edit_test` was run on the host (RTX 4090) with `bf16`, `int8`,
-`rk4v4` and `rk4v4-e8` KV, on both relocation routes. Numbers are greedy agreement over the eight
-generated tokens and the first-token logprob difference against a cold prefill of the edited
-prompt, in nats.
+`ninfer_qwen3_6_27b_multi_span_edit_test` was run on the host (RTX 4090) with five of the six KV
+formats (`rk2v4-e8` was not run), on the route that copies a kept run into new pages because it no
+longer starts on a 64-token block boundary. Each row reports two numbers: how many of the eight
+generated tokens match a run that reused nothing, and how far the first token's log-probability
+moved against that run, in nats.
 
-| route | bf16 | int8 | rk4v4 | rk4v4-e8 |
-| --- | --- | --- | --- | --- |
-| aligned (whole pages) | 8/8 · 0.01 | — | — | 8/8 · 0.001–0.03 |
-| shifted (run starts off a page) | 8/8 · 0.01 | 0/8 · 0.18–0.79 | 0/8–3/8 · 0.33–1.16 | 0/8–8/8 · 0.33–1.07 |
+| KV format | one deep cut | three small cuts | three deep cuts |
+| --- | --- | --- | --- |
+| `bf16` | 8/8 · 0.061 | 8/8 · 0.006 | 8/8 · 0.004 |
+| `int8` | 8/8 · 0.054 | 8/8 · 0.005 | 8/8 · 0.002 |
+| `rk8v4` | 8/8 · 0.040 | 8/8 · 0.002 | 8/8 · 0.011 |
+| `rk4v4` | 8/8 · 0.058 | 8/8 · 0.005 | 8/8 · 0.005 |
+| `rk4v4-e8` | 8/8 · 0.047 | 8/8 · 0.003 | 8/8 · 0.007 |
 
-* bf16 is correct on the shifted route with the same plan, the same physical pages and the same
-  per-page shift metadata the other formats read.
-* The quantized formats are correct on the aligned route, which never leaves a page holding only
-  part of a relocated run.
-* Every format that fails (`int8`, `rk4v4`, `rk4v4-e8`) is served by the quantized prefill kernel
-  (`gqa_attention_prefill_i8.cuh`); bf16, which is correct, is served by its own kernel. The fault
-  is therefore there, in the handling of a page a relocated run only partly fills — not in the
-  planner, the page copy, or the published shift.
-* Case A of the same binary (`NINFER_MULTISPAN_CASE=A`) deletes one contiguous stretch into a single
-  surviving run and fails the same way on the shifted route, so a single moved run is enough; the
-  multi-span plan is not required.
-* The agreement counts move from run to run because prefill is not bit-reproducible
-  (`test_engine_prefill_determinism`): the choice is already marginal, so the ~1e-3 noise flips
-  it. The first-token difference stays well above that floor, so read it, not the count.
-* The off-grid run both oracles built was exactly one page long (`kRelocatedRun = 64`), so it left
-  two partial pages and nothing in between — no *whole* relocated page anywhere. A shifted edit of
-  more than one page can leave the other shape: a run longer than a page, so its destination pages
-  are a partial head, whole pages in between, and a partial tail. That shape is now built
-  (`build_unaligned_long_scenario`, three pages at offset 8) and checked by all three oracles — bf16
-  as the control, int8 and the rotated variants as the suspects — so it can be run without the
-  model. Run `ninfer_gqa_kv_page_delta_test`, `ninfer_gqa_kv_page_delta_i8_test` and
-  `ninfer_gqa_kv_page_delta_rotated_test`.
-* Open question the oracles cannot answer: whether case A's destination is off-grid at all. The span
-  the planner publishes is the ground truth, and `NINFER_SCR_DIAG=1` prints it:
-  `[scr-diag] ... span{src=… dst=… tok=… delta=… src_pages=… dst_pages=…} ranges=N [b,e)…`. A `dst`
-  that ends in the page offset (not a multiple of 64) means the run's ends are partial pages; a
-  `dst` on the grid means every relocated page is whole and the fault is elsewhere.
+* Every run kept its reused tokens rather than quietly recomputing the whole prompt, and every run
+  matched the cold result on all eight tokens.
+* Ten repeats of the one-deep-cut case on `rk4v4-e8` landed between 0.021 and 0.046 nats, so the
+  spread between runs is about 0.03 nats and the token counts never moved. Any regression budget
+  has to sit above that spread; 0.12 nats clears it and still catches the 0.2–1.1 nats failures
+  that were recorded before the fix below.
+* The run the edit kept started 27 tokens into a 64-token block, so its destination held a
+  partly-used block at each end with 195 full blocks between them. That is the hardest shape for
+  this feature, and it is the one the quantized formats were previously reported to get wrong.
+  Of a 20,109-token prompt the reuse covered 12,544 tokens, with 27 tokens before it and the last
+  114 recomputed.
+* The quantized formats were not worse than `bf16`. `bf16` had the largest first-token shift of the
+  five (0.061, against 0.047 for `rk4v4-e8`), so there is no gap left between `bf16` and the
+  quantized formats for a kernel to explain.
+* The second-token layer (MTP) drafted 5–6 tokens and had 4 accepted in every run, and the kept
+  state was carried forward rather than cleared, which is what §3 asks for. The 2026-10-17 live
+  session's collapse to 0% acceptance does not reproduce here.
+
+These runs all took the copying route. The route that re-points whole blocks was measured earlier
+and is not re-measured here; `NINFER_MULTISPAN_ALIGNED=1` selects it for a future run.
+
+**Superseded note.** Until this revision, this section recorded the opposite result — the quantized
+formats at 0/8 to 3/8 matching, 0.18 to 1.16 nats off, blamed on the quantized prefill kernel —
+and §6 named fixing that kernel as the next task. That measurement was taken at 15:24 on the same
+day, five and a half hours before `228e10b5` rewrote the quantized *decode* kernel (the query scale
+tile moved off the tile it was overwriting, and a missing barrier was added). Nothing re-ran the
+engine test afterwards, so the note described a build that no longer existed. Its reasoning did not
+hold on its own either: it argued the prefill kernel must be at fault because `bf16` uses a
+different prefill kernel, but `bf16` also uses a different decode kernel, so that observation could
+not separate the two — and the quantized decode kernel was the one that was actually broken at the
+time. The numbers above replace it.
 
 ---
 
 ## 6. Deferred Work
 
-* The quantized prefill kernel (`gqa_attention_prefill_i8.cuh`) reads a page that a relocated run
-  only partly fills incorrectly, on every format it serves (`int8`, `rk4v4`, `rk4v4-e8`). bf16's
-  own kernel is correct. Measured 2026-10-18; see §5. This is the next task.
 * BF16 prefill uses a fragile `INT32_MIN` sentinel to roll back in-place rotations (INT8 avoids this by staging a separate shifted rotary group).
+* The BF16 prefill boundary path rotates the query tile in place and then reloads it without a
+  barrier before either step, so one warp can overwrite the tile another warp is still reading. Two
+  barriers are missing around `recompute_boundary_scores` in `gqa_attention_prefill_bf16.cuh` (one
+  before the in-place rotation, one before the reload). Both are legal there — all 128 threads reach
+  the function and it is not guarded by a warp check — and both only run on a partly-filled page,
+  which is why green runs have not exercised them. This was recorded in a handoff document that was
+  deleted when these notes were consolidated; it is recorded here so that does not happen twice.
 * `ScrRelocationMode::Segmented` floors a span that overruns the last whole block before the limit, so up to 63 tokens per such run are re-prefilled even with `NINFER_SCR_SOURCE_SHIFT` set, where the copied path could take the partial block. The fallback does not rescue it while another span was selected; `[scr-diag] plan` reports it as `trimmed to whole blocks before the rewrite boundary`.
 * Oracles test single dispatch shapes (8 decode, 128 prefill); other kernel variants (`TokenTile`, `MultiBatch`, `Masked`) inherit the boundary path without end-to-end test coverage.
 
@@ -172,4 +185,4 @@ INT8 destinations aren't restricted to whole pages anymore.
 | `tests/test_scr_e2e_shape.py` + `tools/scr_e2e_check.py` | Host-only relocation fixtures and plan-shape checks: Scope A, interleaved (two survivors), and the off-grid edit that forces the copied route. |
 | `tests/targets/qwen3_6_27b/test_engine_prefill_determinism.cpp` | Prefill reproducibility (needs weights). |
 | `tests/targets/qwen3_6_27b/test_engine_mid_prompt_edit.cpp` | What a single-span mid-prompt edit costs the retained recurrent state (~1,800 tokens, ~600 deleted; needs weights). |
-| `tests/targets/qwen3_6_27b/test_engine_multi_span_edit.cpp` | The multi-span counterpart: one deep cut, three shallow cuts, and three deep cuts (~10k deleted) in one process, so the retained-state and multi-span-plan effects can be told apart. Reports agreement, first-token logprob delta and MTP counts; fails only if the reuse leg stops relocating (needs weights). Measured 2026-10-18: passes on the aligned route for every KV format and on the shifted route for bf16, fails on the shifted route for the quantized formats — see §5. `NINFER_MULTISPAN_CASE` runs one case on its own; case A is the one-span probe. |
+| `tests/targets/qwen3_6_27b/test_engine_multi_span_edit.cpp` | The multi-span counterpart: one deep cut, three shallow cuts, and three deep cuts (~10k deleted) in one process, so the retained-state and multi-span-plan effects can be told apart. Reports agreement, first-token logprob delta and MTP counts; fails only if the reuse leg stops relocating (needs weights). Measured at `228e10b5`: every KV format matches the cold run on all three cases on the copying route — see §5. `NINFER_MULTISPAN_CASE` runs one case on its own; case A is the one-span probe. |

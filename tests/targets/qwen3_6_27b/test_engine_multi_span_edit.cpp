@@ -29,18 +29,26 @@
 // NINFER_MULTISPAN_ALIGNED=1) selects the aligned re-pointing route instead. The two are separate
 // processes because the flag is latched on first use.
 //
-// Measured 2026-10-18 on the host with bf16, int8, rk4v4 and rk4v4-e8 KV. The aligned route agrees
-// with a cold prefill on every case (first-token difference 0.001 to 0.03 nats). The shifted route
-// is correct on bf16 and wrong on int8, rk4v4 and rk4v4-e8 by 0.2 to 1.1 nats. bf16 reads the same
-// plan, the same pages and the same shift metadata as the others, through its own prefill kernel,
-// so the fault is in the quantized kernel reading a page a relocated run only partly fills. The
-// agreement count still moves run to run because prefill is not reproducible
-// (test_engine_prefill_determinism), so read `first_logprob_delta`, not the count.
+// Measured at 228e10b5 on the host, in five of the six KV formats (rk2v4-e8 was not run), on the
+// route that copies a kept run into new pages: every case matched a cold run on all eight generated
+// tokens, and the first token's log-probability moved by 0.002 to 0.061 nats. Ten repeats of the
+// one-deep-cut case on rk4v4-e8 stayed between 0.021 and 0.046 nats, so that is the spread to budget
+// above.
+//
+// An earlier version of this comment reported the quantized formats failing on this route by 0.2 to
+// 1.1 nats and blamed the quantized prefill kernel. That run predated 228e10b5, which rewrote the
+// quantized decode kernel (a query tile that was being overwritten, plus a missing barrier), and the
+// failure does not reproduce. The reasoning behind it did not hold either: bf16 uses a different
+// decode kernel as well as a different prefill one, so the comparison could not separate the two.
+//
+// The count alone is still not something to gate on -- prefill is not reproducible
+// (test_engine_prefill_determinism) -- so read `first_logprob_delta`, and use
+// NINFER_MULTISPAN_MIN_AGREED / NINFER_MULTISPAN_FIRST_NAT to impose a budget. A budget of 8 agreed
+// and 0.12 nats clears the observed spread and still catches the old failure.
 //
 // `NINFER_MULTISPAN_CASE` selects one case by letter or name (`A`, `A-one-span-large`, ...) so the
 // one-span case can be run on its own; unset runs all three. Case A deletes one contiguous stretch
-// into a single surviving run, so it is the single-span probe -- and it fails on the shifted route
-// the same way the multi-span cases do.
+// into a single surviving run, so it is the single-span probe.
 #include "ninfer/engine.h"
 
 #include <algorithm>
