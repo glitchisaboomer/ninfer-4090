@@ -30,6 +30,12 @@ We implement SCR to make prefill more efficient for context language models (CLM
 * `ExecutionOptions::suffix_reuse_max_spans` (default `6`)
 * `ExecutionOptions::scr_mode` (default `Tail`)
 
+* **No switch for the copied route.** Off-grid relocation is selected only when the server's environment
+  carries `NINFER_SCR_SOURCE_SHIFT`; there is no `ExecutionOptions` field and no CLI flag for it, so a
+  default run takes the aligned route. That is deliberate rather than an oversight: the route has an
+  accuracy record (§5, five KV formats) but no prefill/decode timing of its own, and promoting it means
+  an option, a `--help` entry, and that timing first. `NINFER_SCR_DIAG` is the companion diagnostic.
+
 
 * **`src/targets/qwen3_6/impl/runtime/prompt_edit.h`** (Planner, host-only):
 * `plan_tail_relocation(...)`, `plan_shifted_relocations(...)`, `plan_copied_page_remap(...)`, pool demand pricing helpers.
@@ -94,6 +100,26 @@ Verified on RTX 4090 (`sm_89`, CUDA 13.3, GCC 11, Linux):
 
 **Not covered:** Windows/MSVC builds; prefill timing for a page a kept run only partly fills;
 contexts well beyond 20k.
+
+### What the boundary path costs in registers
+
+The boundary-aware score path is compiled into the prefill kernels whether or not a request relocates,
+so a spill regression there is paid by ordinary whole-page prefills. `ptxas -v` on the two prefill
+translation units, at the PR's base commit (`2e68327c`), at its head (`228e10b5`), and here:
+
+| kernel | registers: base → head → now | spill: base → head → now |
+| --- | --- | --- |
+| `gqa_attention_prefill_bf16_kernel`, boundary metadata | 251 → 255 → 255 | 0 → 96 B → 0 |
+| `gqa_attention_prefill_bf16_kernel`, plain metadata | 255 → 255 → 255 | 0 → 8 B → 0 |
+| `gqa_attention_prefill_bf16_kernel`, direct metadata | 252 → 255 → 254 | 0 → 0 → 0 |
+| `gqa_attention_prefill_i8_kernel`, worst of 24 instances | 120 → 120 → 120 | 456 → 524 B → 436 B |
+
+The head column is a real regression the boundary work introduced, and it is gone here: the bf16 path
+accumulates one n-tile at a time (32 registers of `shifted` down to 4) and the INT8 path loads its
+rotated Q fragment inside the n-tile loop instead of hoisting it (8 down to 4). The INT8 kernel sits
+under `__maxnreg__(120)` and spilled before this change too; it now spills less than the base commit,
+436 B across the worst instance against 456 B. Neither gain is a timing claim, and no timing is
+measured here -- the boundary path needs weights to run.
 
 ### What a mid-prompt edit costs, measured at `228e10b5` (2026-10-18)
 
