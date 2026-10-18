@@ -94,10 +94,40 @@ Verified on RTX 4090 (`sm_89`, CUDA 13.3, GCC 11, Linux):
 
 **Not covered:** Weights-dependent tests, `Segmented` runtime mode, prefill timing for boundary paths, long-context scaling, MSVC builds.
 
+### The partly filled page reads back wrong on the quantized formats (measured 2026-10-18)
+
+`ninfer_qwen3_6_27b_multi_span_edit_test` was run on the host (RTX 4090) with `bf16`, `int8`,
+`rk4v4` and `rk4v4-e8` KV, on both relocation routes. Numbers are greedy agreement over the eight
+generated tokens and the first-token logprob difference against a cold prefill of the edited
+prompt, in nats.
+
+| route | bf16 | int8 | rk4v4 | rk4v4-e8 |
+| --- | --- | --- | --- | --- |
+| aligned (whole pages) | 8/8 · 0.01 | — | — | 8/8 · 0.001–0.03 |
+| shifted (run starts off a page) | 8/8 · 0.01 | 0/8 · 0.18–0.79 | 0/8–3/8 · 0.33–1.16 | 0/8–8/8 · 0.33–1.07 |
+
+* bf16 is correct on the shifted route with the same plan, the same physical pages and the same
+  per-page shift metadata the other formats read.
+* The quantized formats are correct on the aligned route, which never leaves a page holding only
+  part of a relocated run.
+* Every format that fails (`int8`, `rk4v4`, `rk4v4-e8`) is served by the quantized prefill kernel
+  (`gqa_attention_prefill_i8.cuh`); bf16, which is correct, is served by its own kernel. The fault
+  is therefore there, in the handling of a page a relocated run only partly fills — not in the
+  planner, the page copy, or the published shift.
+* The agreement counts move from run to run because prefill is not bit-reproducible
+  (`test_engine_prefill_determinism`): the choice is already marginal, so the ~1e-3 noise flips
+  it. The first-token difference stays well above that floor, so read it, not the count.
+* `tests/ops/test_gqa_kv_page_delta_i8.cpp` and `test_gqa_kv_page_delta_rotated.cpp` pass, so the
+  shapes those oracles build are handled; the multi-span shifted plan builds a partly filled page
+  they do not cover.
+
 ---
 
 ## 6. Deferred Work
 
+* The quantized prefill kernel (`gqa_attention_prefill_i8.cuh`) reads a page that a relocated run
+  only partly fills incorrectly, on every format it serves (`int8`, `rk4v4`, `rk4v4-e8`). bf16's
+  own kernel is correct. Measured 2026-10-18; see §5. This is the next task.
 * BF16 prefill uses a fragile `INT32_MIN` sentinel to roll back in-place rotations (INT8 avoids this by staging a separate shifted rotary group).
 * `ScrRelocationMode::Segmented` floors a span that overruns the last whole block before the limit, so up to 63 tokens per such run are re-prefilled even with `NINFER_SCR_SOURCE_SHIFT` set, where the copied path could take the partial block. The fallback does not rescue it while another span was selected; `[scr-diag] plan` reports it as `trimmed to whole blocks before the rewrite boundary`.
 * Oracles test single dispatch shapes (8 decode, 128 prefill); other kernel variants (`TokenTile`, `MultiBatch`, `Masked`) inherit the boundary path without end-to-end test coverage.
@@ -129,4 +159,4 @@ INT8 destinations aren't restricted to whole pages anymore.
 | `tests/test_scr_e2e_shape.py` + `tools/scr_e2e_check.py` | Host-only relocation fixtures and plan-shape checks: Scope A, interleaved (two survivors), and the off-grid edit that forces the copied route. |
 | `tests/targets/qwen3_6_27b/test_engine_prefill_determinism.cpp` | Prefill reproducibility (needs weights). |
 | `tests/targets/qwen3_6_27b/test_engine_mid_prompt_edit.cpp` | What a single-span mid-prompt edit costs the retained recurrent state (~1,800 tokens, ~600 deleted; needs weights). |
-| `tests/targets/qwen3_6_27b/test_engine_multi_span_edit.cpp` | The multi-span counterpart: one deep cut, three shallow cuts, and three deep cuts (~10k deleted) in one process, so the retained-state and multi-span-plan effects can be told apart. Reports agreement, first-token logprob delta and MTP counts; fails only if the reuse leg stops relocating (needs weights). |
+| `tests/targets/qwen3_6_27b/test_engine_multi_span_edit.cpp` | The multi-span counterpart: one deep cut, three shallow cuts, and three deep cuts (~10k deleted) in one process, so the retained-state and multi-span-plan effects can be told apart. Reports agreement, first-token logprob delta and MTP counts; fails only if the reuse leg stops relocating (needs weights). Measured 2026-10-18: passes on the aligned route for every KV format and on the shifted route for bf16, fails on the shifted route for the quantized formats — see §5. |

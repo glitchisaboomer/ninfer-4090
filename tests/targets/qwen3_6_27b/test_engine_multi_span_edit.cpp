@@ -28,6 +28,14 @@
 // NINFER_SCR_SOURCE_SHIFT=0 (or running with it unset in the environment and setting
 // NINFER_MULTISPAN_ALIGNED=1) selects the aligned re-pointing route instead. The two are separate
 // processes because the flag is latched on first use.
+//
+// Measured 2026-10-18 on the host with bf16, int8, rk4v4 and rk4v4-e8 KV. The aligned route agrees
+// with a cold prefill on every case (first-token difference 0.001 to 0.03 nats). The shifted route
+// is correct on bf16 and wrong on int8, rk4v4 and rk4v4-e8 by 0.2 to 1.1 nats. bf16 reads the same
+// plan, the same pages and the same shift metadata as the others, through its own prefill kernel,
+// so the fault is in the quantized kernel reading a page a relocated run only partly fills. The
+// agreement count still moves run to run because prefill is not reproducible
+// (test_engine_prefill_determinism), so read `first_logprob_delta`, not the count.
 #include "ninfer/engine.h"
 
 #include <algorithm>
