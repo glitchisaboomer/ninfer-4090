@@ -1121,6 +1121,11 @@ struct Scenario {
     std::int32_t logical_pages        = kLogicalPages;
     std::int32_t src                  = kSourcePage * kPageSize;
     std::int32_t dst                  = kDestPage * kPageSize;
+    // Tokens in the relocated run. The one-page default leaves the destination a single page
+    // (aligned) or two partial pages (off-grid); a caller that wants whole destination pages
+    // *between* the two partial ends -- the shape a live edit of more than one page produces --
+    // passes a longer run.
+    std::int32_t run                  = kRelocatedRun;
     std::vector<__nv_bfloat16> raw_k; // pre-RoPE, [head][token][d]
     std::vector<__nv_bfloat16> k_src; // bf16(rope(raw, src + t))
     std::vector<__nv_bfloat16> k_dst; // bf16(rope(raw, dst + t))
@@ -1133,31 +1138,34 @@ struct Scenario {
 // `src` may start off-grid -- the surviving run of an edit can begin partway through a page -- and
 // the destination offsets are what the fixture then compares against.
 inline Scenario build_scenario_at(const FreqTable& freq, std::int32_t logical_pages,
-                                  std::int32_t src, std::int32_t dst) {
+                                  std::int32_t src, std::int32_t dst,
+                                  std::int32_t run = kRelocatedRun) {
     Scenario scenario;
     scenario.logical_pages = logical_pages;
     scenario.src           = src;
     scenario.dst           = dst;
+    scenario.run           = run;
     // A non-identity permutation, so logical page N is not physical page N and the Op has to consult
     // the block table. 7 is coprime with every page count used here, so this stays a permutation.
     scenario.table.resize(static_cast<std::size_t>(logical_pages));
     for (std::int32_t i = 0; i < logical_pages; ++i) {
         scenario.table[static_cast<std::size_t>(i)] = (i * 7 + 3) % logical_pages;
     }
-    // reassign_pages: the destination logical page now points at the surviving physical page.
+    // reassign_pages: every destination page the run covers is re-pointed at the source page
+    // holding the same slice of it. A run that starts off-grid continues on the next destination
+    // page, and a run longer than a page continues for as many pages as it spans. The caller
+    // passes a `src` and `dst` whose page offsets agree, so the two grids line up page for page
+    // and the re-pointing names the right source for every covered page.
     const std::int32_t dst_page = dst / kPageSize;
     const std::int32_t src_page = src / kPageSize;
-    scenario.table[static_cast<std::size_t>(dst_page)] =
-        scenario.table[static_cast<std::size_t>(src_page)];
-    // A run that starts off-grid continues on the next destination page, which is the source run's
-    // own continuation. An aligned run covers one page completely and needs no second alias.
-    if (dst % kPageSize + kRelocatedRun > kPageSize) {
-        scenario.table[static_cast<std::size_t>(dst_page + 1)] =
-            scenario.table[static_cast<std::size_t>(src_page + 1)];
+    const std::int32_t covered  = (dst % kPageSize + run + kPageSize - 1) / kPageSize;
+    for (std::int32_t i = 0; i < covered; ++i) {
+        scenario.table[static_cast<std::size_t>(dst_page + i)] =
+            scenario.table[static_cast<std::size_t>(src_page + i)];
     }
 
     const std::size_t elems =
-        static_cast<std::size_t>(kHeadDim) * kKvHeads * static_cast<std::size_t>(kRelocatedRun);
+        static_cast<std::size_t>(kHeadDim) * kKvHeads * static_cast<std::size_t>(run);
     scenario.raw_k.resize(elems);
     scenario.k_src.resize(elems);
     scenario.k_dst.resize(elems);
@@ -1167,7 +1175,7 @@ inline Scenario build_scenario_at(const FreqTable& freq, std::int32_t logical_pa
     std::normal_distribution<double> normal(0.0, 1.0);
     std::array<double, kHeadDim> row{};
     std::array<double, kHeadDim> rotated{};
-    for (std::int32_t t = 0; t < kRelocatedRun; ++t) {
+    for (std::int32_t t = 0; t < run; ++t) {
         for (std::int32_t head = 0; head < kKvHeads; ++head) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 row[static_cast<std::size_t>(d)] = normal(rng);
@@ -1238,7 +1246,7 @@ inline Scenario build_large_delta_unaligned_scenario(const FreqTable& freq, std:
 // A cache holding what a direct prefill at the destination would have written, reachable as a value.
 inline Cache make_reference_cache(const Scenario& scenario) {
     Cache cache(scenario.logical_pages, scenario.table, kKvHeads);
-    append_chunk(cache, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
+    append_chunk(cache, scenario.k_dst, scenario.v, scenario.dst, scenario.run);
     return cache;
 }
 
@@ -1256,7 +1264,7 @@ struct DeltaMetadata {
 inline DeltaMetadata make_delta_metadata(const Scenario& scenario) {
     const RelocatedCopySpan span{static_cast<std::uint32_t>(scenario.src),
                                  static_cast<std::uint32_t>(scenario.dst),
-                                 static_cast<std::uint32_t>(kRelocatedRun)};
+                                 static_cast<std::uint32_t>(scenario.run)};
     const auto mapping_pages = static_cast<std::size_t>(scenario.logical_pages);
     const auto page_ranges   = plan_rope_delta_page_ranges(
         std::span<const RelocatedCopySpan>(&span, 1), mapping_pages);
@@ -1306,40 +1314,26 @@ constexpr std::int64_t unaligned_cache_offset(std::int32_t physical_page, std::i
 // at the source positions, placed in the destination pages at the destination offsets,
 // with V byte-identical to a direct prefill's.
 inline void place_unaligned_relocation(Cache& cache, const Scenario& scenario) {
-    const std::int32_t dst_page  = scenario.dst / kPageSize;
-    const std::int32_t dst_slot  = scenario.dst % kPageSize;
-    const std::int32_t phys_page = cache.table_host[static_cast<std::size_t>(dst_page)];
-    const std::size_t bytes      = static_cast<std::size_t>(kHeadDim) * sizeof(__nv_bfloat16);
-    for (std::int32_t token = 0; token < kRelocatedRun; ++token) {
-        const std::int32_t slot = dst_slot + token;
-        if (slot >= kPageSize) { break; } // the run's tail lands on the next page, below
+    const std::int32_t dst_page = scenario.dst / kPageSize;
+    const std::int32_t dst_slot = scenario.dst % kPageSize;
+    const std::size_t bytes     = static_cast<std::size_t>(kHeadDim) * sizeof(__nv_bfloat16);
+    // Walk the run token by token and resolve each token's destination page through the block table,
+    // so a run that spans any number of pages is placed on the pages the mapping actually names. The
+    // previous form handled a head page and one continuation; this handles every page the run
+    // crosses and reduces to the same bytes for the one-page run.
+    for (std::int32_t token = 0; token < scenario.run; ++token) {
+        const std::int32_t grid = dst_slot + token;
+        const std::int32_t page = dst_page + grid / kPageSize;
+        const std::int32_t slot = grid % kPageSize;
+        const std::int32_t phys = cache.table_host[static_cast<std::size_t>(page)];
         for (std::int32_t head = 0; head < kKvHeads; ++head) {
             const std::size_t src_index = act_index(head, token, kKvHeads, 0);
             cache.k.copy_from_host(&scenario.k_src[src_index], bytes,
-                                   unaligned_cache_offset(phys_page, head, slot, 0) *
+                                   unaligned_cache_offset(phys, head, slot, 0) *
                                        sizeof(__nv_bfloat16));
             cache.v.copy_from_host(&scenario.v[src_index], bytes,
-                                   unaligned_cache_offset(phys_page, head, slot, 0) *
+                                   unaligned_cache_offset(phys, head, slot, 0) *
                                        sizeof(__nv_bfloat16));
-        }
-    }
-    // The tail that crossed into the second destination page. The second page is the
-    // one the destination mapping's next logical page names, which is the page the
-    // block table already points at the run's continuation.
-    const std::int32_t tail = kRelocatedRun - (kPageSize - dst_slot);
-    if (tail > 0) {
-        const std::int32_t phys_next = cache.table_host[static_cast<std::size_t>(dst_page + 1)];
-        for (std::int32_t token = 0; token < tail; ++token) {
-            for (std::int32_t head = 0; head < kKvHeads; ++head) {
-                const std::size_t src_index =
-                    act_index(head, kPageSize - dst_slot + token, kKvHeads, 0);
-                cache.k.copy_from_host(&scenario.k_src[src_index], bytes,
-                                       unaligned_cache_offset(phys_next, head, token, 0) *
-                                           sizeof(__nv_bfloat16));
-                cache.v.copy_from_host(&scenario.v[src_index], bytes,
-                                       unaligned_cache_offset(phys_next, head, token, 0) *
-                                           sizeof(__nv_bfloat16));
-            }
         }
     }
 }
@@ -1351,7 +1345,7 @@ inline void place_unaligned_relocation(Cache& cache, const Scenario& scenario) {
 // describes. It is also why the BF16 placer's byte-level copy has no INT8 counterpart to reuse: the
 // quantization is per row, so the placement and the quantized plane cannot disagree.
 inline void place_unaligned_relocation_i8(Int8Cache& cache, const Scenario& scenario) {
-    append_chunk(cache, scenario.k_src, scenario.v, scenario.dst, kRelocatedRun);
+    append_chunk(cache, scenario.k_src, scenario.v, scenario.dst, scenario.run);
 }
 
 // The off-grid variant of the scenario: both ends of the run fall inside a destination page, so each
@@ -1371,7 +1365,7 @@ inline Scenario build_unaligned_scenario(const FreqTable& freq) {
     // suite prints.
     std::array<double, kHeadDim> raw{};
     std::array<double, kHeadDim> rotated{};
-    for (std::int32_t token = 0; token < kRelocatedRun; ++token) {
+    for (std::int32_t token = 0; token < scenario.run; ++token) {
         for (std::int32_t head = 0; head < kKvHeads; ++head) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 raw[static_cast<std::size_t>(d)] =
@@ -1390,4 +1384,20 @@ inline Scenario build_unaligned_scenario(const FreqTable& freq) {
         }
     }
     return scenario;
+}
+
+// The shape a live edit of more than one page leaves: a run longer than a page, so its destination
+// pages are a partial head, one or more *whole* interior pages, and a partial tail. Both ends keep
+// the same token offset (8), which is what the source-shift detector produces -- the run slides by a
+// whole number of pages plus that offset -- so the interior pages are whole and only the two ends
+// are partial. The one-page off-grid scenario above never gives the kernel a whole relocated page
+// *between* two partial ones, so it cannot see the transitions this shape builds: partial -> whole
+// (base unrotated -> base at the delta) and whole -> partial (base back to unrotated while the
+// shifted rotary group is re-staged).
+inline Scenario build_unaligned_long_scenario(const FreqTable& freq) {
+    // 3 pages of run at offset 8: head page [8, 64), two whole pages, tail page [0, 8). `src` is
+    // `dst + 384`, the same -384 shift the aligned scenario uses, and lands at offset 8 as well, so
+    // the two grids line up page for page.
+    const std::int32_t dst = kDestPage * kPageSize + 8;
+    return build_scenario_at(freq, kLogicalPages, dst + 384, dst, 3 * kPageSize);
 }

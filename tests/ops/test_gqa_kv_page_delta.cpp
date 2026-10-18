@@ -72,7 +72,7 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
     }
 
     const FreqTable freq = default_inv_freq();
-    const std::int32_t decode_base = scenario.dst + kRelocatedRun - kDecodeTokens;
+    const std::int32_t decode_base = scenario.dst + scenario.run - kDecodeTokens;
     const std::uint32_t visible = static_cast<std::uint32_t>(decode_base + kDecodeTokens);
 
     // 1. Build a cache with K at source positions (no physical re-rotation)
@@ -147,7 +147,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
 
     const FreqTable freq      = default_inv_freq();
     constexpr std::int32_t kPrefillTokens = 128;
-    const std::int32_t prefill_base = scenario.dst + kRelocatedRun;
+    const std::int32_t prefill_base = scenario.dst + scenario.run;
     const std::uint32_t visible =
         static_cast<std::uint32_t>(prefill_base + kPrefillTokens);
 
@@ -231,7 +231,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
     DeviceBuffer zero_buf = upload_i32(zero_deltas);
 
     Cache stale_cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(stale_cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+    append_chunk(stale_cache, scenario.k_src, scenario.v, scenario.src, scenario.run);
 
     PagedKVLayerView stale_layer_view = stale_cache.view();
     stale_layer_view.rope_deltas  = Tensor(zero_buf.p, DType::I32, {kLogicalPages});
@@ -266,15 +266,25 @@ int main() {
     const FreqTable freq = default_inv_freq();
     const Scenario scenario = build_scenario(freq);
     const Scenario unaligned_scenario = build_unaligned_scenario(freq);
+    // A run longer than a page: whole relocated pages sit between the two partial ends. The BF16
+    // prefill path is the control that must keep agreeing with the FP64 oracle on it, which pins any
+    // op-level failure of the same shape to the quantized kernel rather than to the fixture.
+    const Scenario long_scenario = build_unaligned_long_scenario(freq);
 
     std::printf("GQA KV page-delta oracle checks\n");
     std::printf("  run of %d tokens: src %d -> dst %d, delta %d, block table permuted\n", kRelocatedRun,
                 scenario.src, scenario.dst, scenario.dst - scenario.src);
+    std::printf("  long off-grid run: src %d -> dst %d, delta %d, %d tokens over dst pages %d..%d\n",
+                long_scenario.src, long_scenario.dst, long_scenario.dst - long_scenario.src,
+                long_scenario.run, long_scenario.dst / kPageSize,
+                (long_scenario.dst + long_scenario.run - 1) / kPageSize);
 
     check_decode_attention_with_delta(scenario);
     check_prefill_attention_with_delta(scenario);
     check_decode_attention_with_delta(unaligned_scenario);
     check_prefill_attention_with_delta(unaligned_scenario);
+    check_decode_attention_with_delta(long_scenario);
+    check_prefill_attention_with_delta(long_scenario);
 
     if (failures != 0) {
         std::printf("GQA KV page-delta oracle checks FAILED (%d)\n", failures);

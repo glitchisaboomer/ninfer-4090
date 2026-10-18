@@ -120,9 +120,19 @@ prompt, in nats.
 * The agreement counts move from run to run because prefill is not bit-reproducible
   (`test_engine_prefill_determinism`): the choice is already marginal, so the ~1e-3 noise flips
   it. The first-token difference stays well above that floor, so read it, not the count.
-* `tests/ops/test_gqa_kv_page_delta_i8.cpp` and `test_gqa_kv_page_delta_rotated.cpp` pass, so the
-  shapes those oracles build are handled; the multi-span shifted plan builds a partly filled page
-  they do not cover.
+* The off-grid run both oracles built was exactly one page long (`kRelocatedRun = 64`), so it left
+  two partial pages and nothing in between — no *whole* relocated page anywhere. A shifted edit of
+  more than one page can leave the other shape: a run longer than a page, so its destination pages
+  are a partial head, whole pages in between, and a partial tail. That shape is now built
+  (`build_unaligned_long_scenario`, three pages at offset 8) and checked by all three oracles — bf16
+  as the control, int8 and the rotated variants as the suspects — so it can be run without the
+  model. Run `ninfer_gqa_kv_page_delta_test`, `ninfer_gqa_kv_page_delta_i8_test` and
+  `ninfer_gqa_kv_page_delta_rotated_test`.
+* Open question the oracles cannot answer: whether case A's destination is off-grid at all. The span
+  the planner publishes is the ground truth, and `NINFER_SCR_DIAG=1` prints it:
+  `[scr-diag] ... span{src=… dst=… tok=… delta=… src_pages=… dst_pages=…} ranges=N [b,e)…`. A `dst`
+  that ends in the page offset (not a multiple of 64) means the run's ends are partial pages; a
+  `dst` on the grid means every relocated page is whole and the fault is elsewhere.
 
 ---
 
@@ -151,9 +161,9 @@ INT8 destinations aren't restricted to whole pages anymore.
 
 | Test | Purpose |
 | --- | --- |
-| `tests/ops/test_gqa_kv_page_delta.cpp` | Delta oracle (whole/partial, both routes, negative controls). |
-| `tests/ops/test_gqa_kv_page_delta_i8.cpp` | INT8 aligned/off-grid tests. |
-| `tests/ops/test_gqa_kv_page_delta_rotated.cpp` | Rotated variants (`rk8v4`, `rk4v4`, `rk4v4-e8`). |
+| `tests/ops/test_gqa_kv_page_delta.cpp` | Delta oracle (whole/partial, both routes, negative controls; a run longer than a page as the control for the multi-page shape). |
+| `tests/ops/test_gqa_kv_page_delta_i8.cpp` | INT8 aligned/off-grid tests, including a run longer than a page (partial head, whole pages, partial tail). |
+| `tests/ops/test_gqa_kv_page_delta_rotated.cpp` | Rotated variants (`rk8v4`, `rk4v4`, `rk4v4-e8`), including the multi-page off-grid run. |
 | `tests/ops/test_scr_relocation_integration.cpp` | End-to-end cache bytes check. |
 | `tests/test_paged_kv_delta_layout.cpp` | Packed range encoding & planner math. |
 | `tests/test_paged_kv_copied_relocation.cpp` | Copier oracle (`relocate_copied_pages`, device): a published mapping shorter than the resident one, the equal-length control, a growing mapping whose new destinations come from the pool, and the refusals. |

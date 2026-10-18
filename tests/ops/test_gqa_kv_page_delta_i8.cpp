@@ -71,7 +71,7 @@ void check_decode_attention_with_delta(const Scenario& scenario, const char* sce
     }
 
     const FreqTable freq         = default_inv_freq();
-    const std::int32_t base      = scenario.dst + kRelocatedRun - kDecodeTokens;
+    const std::int32_t base      = scenario.dst + scenario.run - kDecodeTokens;
     const std::uint32_t visible  = static_cast<std::uint32_t>(base + kDecodeTokens);
     const DeltaMetadata metadata = make_delta_metadata(scenario);
     const std::int32_t pages     = scenario.logical_pages;
@@ -95,7 +95,7 @@ void check_decode_attention_with_delta(const Scenario& scenario, const char* sce
 
     Int8Cache reference(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                         kPackedK, kE8Lattice, kE8Root);
-    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
+    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, scenario.run);
     PagedKVLayerView ref_view = reference.view();
     auto got_reference = run_cached_attention_view_i8(reference, scenario.q, base, kDecodeTokens,
                                                       visible, ref_view);
@@ -152,7 +152,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const char* sc
     }
 
     const FreqTable freq        = default_inv_freq();
-    const std::int32_t base     = scenario.dst + kRelocatedRun;
+    const std::int32_t base     = scenario.dst + scenario.run;
     const std::uint32_t visible = static_cast<std::uint32_t>(base + kPrefillTokens);
     const std::int32_t pages    = scenario.logical_pages;
 
@@ -207,7 +207,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const char* sc
     // Reference: a direct prefill at the destination, then the same tail chunk.
     Int8Cache reference(pages, scenario.table, kKvHeads, kPackedV, kRotateK, kRotateV,
                         kPackedK, kE8Lattice, kE8Root);
-    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
+    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, scenario.run);
     auto got_reference = run_prefill_attention_i8(prefill_q, tail_k, tail_v, base, kPrefillTokens,
                                                   visible, reference.batch_view());
 
@@ -293,6 +293,16 @@ int main() {
     check_prefill_attention_with_delta(delta_9340, "large delta, aligned");
     check_decode_attention_with_delta(delta_split, "large delta, off-grid");
     check_prefill_attention_with_delta(delta_split, "large delta, off-grid");
+
+    // The engine's shape: a run longer than a page, so whole relocated pages sit between the two
+    // partial ends. The one-page off-grid scenario above never produces a whole relocated page, so
+    // only this one exercises the partial -> whole -> partial transitions in the score path.
+    const Scenario long_run = build_unaligned_long_scenario(freq);
+    std::printf("  long off-grid run: src %d -> dst %d, delta %d, %d tokens over dst pages %d..%d\n",
+                long_run.src, long_run.dst, long_run.dst - long_run.src, long_run.run,
+                long_run.dst / kPageSize, (long_run.dst + long_run.run - 1) / kPageSize);
+    check_decode_attention_with_delta(long_run, "off-grid, multi-page");
+    check_prefill_attention_with_delta(long_run, "off-grid, multi-page");
 
     if (failures != 0) {
         std::printf("GQA KV page-delta INT8 oracle checks FAILED (%d)\n", failures);

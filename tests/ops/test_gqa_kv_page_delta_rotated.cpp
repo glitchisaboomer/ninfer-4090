@@ -162,7 +162,7 @@ void check_packed_plane_decode(const Scenario& scenario, const Variant& variant,
                     variant.rotate_v, variant.packed_k, variant.e8_lattice, variant.e8_root);
     // No delta plane here, and none is involved in the write path either: a delta only ever rotates
     // Q, so the codes this reads are exactly what the append in step 1 wrote.
-    append_chunk(cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+    append_chunk(cache, scenario.k_src, scenario.v, scenario.src, scenario.run);
 
     constexpr std::int32_t head  = 0;
     constexpr std::int32_t token = 0;
@@ -240,7 +240,7 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
         return;
     }
 
-    const std::int32_t base      = scenario.dst + kRelocatedRun - kDecodeTokens;
+    const std::int32_t base      = scenario.dst + scenario.run - kDecodeTokens;
     const std::uint32_t visible  = static_cast<std::uint32_t>(base + kDecodeTokens);
     const DeltaMetadata metadata = make_delta_metadata(scenario);
     const std::int32_t pages     = scenario.logical_pages;
@@ -285,7 +285,7 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
 
     Int8Cache reference(pages, scenario.table, kKvHeads, variant.packed_v, variant.rotate_k,
                         variant.rotate_v, variant.packed_k, variant.e8_lattice, variant.e8_root);
-    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
+    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, scenario.run);
     PagedKVLayerView ref_view = reference.view();
     auto got_reference = run_cached_attention_view_i8(reference, scenario.q, base, kDecodeTokens,
                                                       visible, ref_view);
@@ -358,7 +358,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const Variant&
     // The tail starts where the run ends, so in the off-grid scenario its first page is the run's
     // second destination page: that page then holds relocated keys in its leading slots and freshly
     // prefilled ones after them, which is the mixed page a boundary-aware prefill has to read.
-    const std::int32_t base     = scenario.dst + kRelocatedRun;
+    const std::int32_t base     = scenario.dst + scenario.run;
     const std::uint32_t visible = static_cast<std::uint32_t>(base + kPrefillTokens);
     const DeltaMetadata metadata = make_delta_metadata(scenario);
     const std::int32_t pages     = scenario.logical_pages;
@@ -429,7 +429,7 @@ void check_prefill_attention_with_delta(const Scenario& scenario, const Variant&
     // 6. Reference: direct prefill at the destination, then the same tail chunk
     Int8Cache reference(pages, scenario.table, kKvHeads, variant.packed_v, variant.rotate_k,
                         variant.rotate_v, variant.packed_k, variant.e8_lattice, variant.e8_root);
-    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
+    append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, scenario.run);
     auto got_reference = run_prefill_attention_i8(prefill_q, tail_k, tail_v, base, kPrefillTokens,
                                                   visible, reference.batch_view());
 
@@ -507,6 +507,9 @@ int main() {
     const Scenario delta_3021  = build_large_delta_scenario(freq, -3021);
     const Scenario delta_9340  = build_large_delta_scenario(freq, -9340);
     const Scenario delta_split = build_large_delta_unaligned_scenario(freq, -9340);
+    // A run longer than a page, so whole relocated pages sit between the two partial ends -- the
+    // only shape that drives the partial -> whole -> partial transitions in the score path.
+    const Scenario long_run = build_unaligned_long_scenario(freq);
 
     std::printf("GQA KV page-delta rotated INT8 oracle checks\n");
     for (const Variant& variant : kVariants) {
@@ -567,6 +570,16 @@ int main() {
                                           freq);
         check_prefill_attention_with_delta(delta_split, variant, "large delta 9340, off-grid",
                                            freq);
+    }
+
+    // The multi-page off-grid run, on every variant: a partial head, whole interior pages, and a
+    // partial tail, which the one-page off-grid scenario above cannot build.
+    std::printf("  long off-grid run: src %d -> dst %d, delta %d, %d tokens over dst pages %d..%d\n",
+                long_run.src, long_run.dst, long_run.dst - long_run.src, long_run.run,
+                long_run.dst / kPageSize, (long_run.dst + long_run.run - 1) / kPageSize);
+    for (const Variant& variant : kVariants) {
+        check_decode_attention_with_delta(long_run, variant, "off-grid, multi-page", freq);
+        check_prefill_attention_with_delta(long_run, variant, "off-grid, multi-page", freq);
     }
 
     if (failures != 0) {
