@@ -1389,6 +1389,11 @@ void test_plan_copied_page_remap_acquires_every_relocated_page() {
     if (partial_remap.size() == 6) {
         expect(partial_remap[2] == kRemapAcquirePage && partial_remap[3] == kRemapAcquirePage,
                "both pages touched by a partial destination span are acquired");
+        // The span is [129, 257), so its last token (256) lies in page 4: a destination that starts
+        // and ends inside a page still owns every page its *end* touches, not only the pages it
+        // fills. That tail is what a duration-based count gets wrong, and the copy writes it.
+        expect(partial_remap[4] == kRemapAcquirePage,
+               "the page its final partial token falls in is acquired as well");
     }
     const std::vector<RelocatedSpan> beyond{
         RelocatedSpan{.source_begin = 0, .dest_begin = block_tokens(6), .tokens = block_tokens(2)}};

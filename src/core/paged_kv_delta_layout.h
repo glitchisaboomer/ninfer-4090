@@ -512,17 +512,36 @@ struct RelocatedPageSubstitution {
     return ranges;
 }
 
+// The packed interval plane, from ranges that were already planned. The two planes a mapping
+// publishes -- one shift per page and one interval per page -- have to describe the same shifts, so
+// both are derived from a single `plan_rope_delta_page_ranges` answer rather than each recomputing it
+// from the spans: a second planning pass is a second chance to disagree, and a disagreement here
+// would rotate the wrong half of a page silently.
 [[nodiscard]] inline std::vector<std::uint32_t> encode_rope_delta_page_ranges(
-    std::span<const RelocatedCopySpan> spans, std::size_t mapping_pages) {
-    const std::vector<RopeDeltaPageRange> ranges =
-        plan_rope_delta_page_ranges(spans, mapping_pages);
-    std::vector<std::uint32_t> packed(mapping_pages, kRopeDeltaRangeEmpty);
+    std::span<const RopeDeltaPageRange> ranges) {
+    std::vector<std::uint32_t> packed(ranges.size(), kRopeDeltaRangeEmpty);
     for (std::size_t page = 0; page < ranges.size(); ++page) {
         if (ranges[page].begin != ranges[page].end) {
             packed[page] = pack_rope_delta_page_range(ranges[page].begin, ranges[page].end);
         }
     }
     return packed;
+}
+
+[[nodiscard]] inline std::vector<std::uint32_t> encode_rope_delta_page_ranges(
+    std::span<const RelocatedCopySpan> spans, std::size_t mapping_pages) {
+    return encode_rope_delta_page_ranges(plan_rope_delta_page_ranges(spans, mapping_pages));
+}
+
+// The shift plane parallel to a mapping, from the same ranges the interval plane is packed from:
+// page `p` carries its range's delta, or `kRopeDeltaNone` where no range covers it.
+[[nodiscard]] inline std::vector<std::int32_t> rope_delta_plane_from_ranges(
+    std::span<const RopeDeltaPageRange> ranges) {
+    std::vector<std::int32_t> deltas(ranges.size(), kRopeDeltaNone);
+    for (std::size_t page = 0; page < ranges.size(); ++page) {
+        if (ranges[page].begin != ranges[page].end) { deltas[page] = ranges[page].delta; }
+    }
+    return deltas;
 }
 
 } // namespace ninfer

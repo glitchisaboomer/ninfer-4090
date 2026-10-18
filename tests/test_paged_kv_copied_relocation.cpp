@@ -22,11 +22,13 @@
 //       call dropped is returned and a page it took is not leaked
 //   C6  a rejection leaves the mapping and the pool exactly as they were
 //
-// The byte comparisons are whole-page because the scenario's moves are whole pages: the plane is
+// Most byte comparisons are whole-page because those scenarios' moves are whole pages: the plane is
 // required to be dense (asserted below), so a move of 64 tokens at offset 0 carries every byte of
-// its page and the two pages must be identical afterwards. No tolerance and no range arithmetic --
-// this is the copier's own claim, checked against the pool's bytes rather than against a re-derived
-// offset table that would duplicate the code under test.
+// its page and the two pages must be identical afterwards. The off-grid case near the end is the
+// exception and the one the copied path exists for: its destination page is written only over the
+// span's token interval, so it compares per token, and it also checks the tokens *outside* that
+// interval against the page's bytes from before the call. No tolerance and no re-derived offset
+// table that would duplicate the code under test.
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -174,7 +176,8 @@ int main() {
                                       .tokens       = 2 * ninfer::kPagedKVPageSize}};
         std::vector<std::int32_t> mapping(resident.begin(), resident.begin() + 1);
         mapping.resize(4, ninfer::kPagedKVAquirePage);
-        const std::vector<std::int32_t> deltas(mapping.size(), ninfer::kRopeDeltaNone);
+        const std::vector<ninfer::RopeDeltaPageRange> ranges =
+            ninfer::plan_rope_delta_page_ranges(spans, mapping.size());
 
         // What the change is: the sources are bounded by the *resident* mapping's length. The bound
         // the runtime used to pass -- the published length for both ends -- refuses this run, and
@@ -209,7 +212,7 @@ int main() {
         std::vector<std::byte> keep0 = read_page(resident[0]);
         std::vector<std::byte> keep3 = read_page(resident[3]);
 
-        alloc.relocate_copied_pages(mapping, deltas, spans, ctx.stream);
+        alloc.relocate_copied_pages(mapping, ranges, spans, ctx.stream);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
 
         const std::vector<std::int32_t> published = ids_of(alloc);
@@ -300,11 +303,12 @@ int main() {
             ninfer::RelocatedCopySpan{.source_begin = 3 * ninfer::kPagedKVPageSize,
                                       .dest_begin   = ninfer::kPagedKVPageSize,
                                       .tokens       = ninfer::kPagedKVPageSize}};
-        const std::vector<std::int32_t> deltas(mapping.size(), ninfer::kRopeDeltaNone);
+        const std::vector<ninfer::RopeDeltaPageRange> ranges =
+            ninfer::plan_rope_delta_page_ranges(spans, mapping.size());
 
         const std::vector<std::byte> source_bytes = read_page(before[3]);
 
-        alloc.relocate_copied_pages(mapping, deltas, spans, ctx.stream);
+        alloc.relocate_copied_pages(mapping, ranges, spans, ctx.stream);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
 
         const std::vector<std::int32_t> published = ids_of(alloc);
@@ -335,11 +339,11 @@ int main() {
 
         const auto expect_reject = [&](const char* what,
                                        const std::vector<std::int32_t>& mapping,
-                                       std::span<const std::int32_t> deltas,
+                                       std::span<const ninfer::RopeDeltaPageRange> ranges,
                                        std::span<const ninfer::RelocatedCopySpan> plan_spans) {
             bool threw = false;
             try {
-                alloc.relocate_copied_pages(mapping, deltas, plan_spans, ctx.stream);
+                alloc.relocate_copied_pages(mapping, ranges, plan_spans, ctx.stream);
             } catch (const std::exception&) {
                 threw = true;
             }
@@ -354,17 +358,17 @@ int main() {
         };
 
         const std::vector<std::int32_t> ok(before.size(), ninfer::kPagedKVAquirePage);
-        const std::vector<std::int32_t> ok_deltas(ok.size(), ninfer::kRopeDeltaNone);
-        const std::vector<std::int32_t> short_deltas(ok.size() - 1, ninfer::kRopeDeltaNone);
+        const std::vector<ninfer::RopeDeltaPageRange> ok_ranges(ok.size());
+        const std::vector<ninfer::RopeDeltaPageRange> short_ranges(ok.size() - 1);
         const std::vector<std::int32_t> oversized(kEntitlement + 1, ninfer::kPagedKVAquirePage);
-        const std::vector<std::int32_t> oversized_deltas(oversized.size(), ninfer::kRopeDeltaNone);
+        const std::vector<ninfer::RopeDeltaPageRange> oversized_ranges(oversized.size());
         const std::vector<std::int32_t> empty_mapping;
 
-        expect_reject("an empty mapping", empty_mapping, std::span<const std::int32_t>(),
-                      spans);
-        expect_reject("a mapping past the entitlement", oversized, oversized_deltas, spans);
-        expect_reject("a delta plane not parallel to the mapping", ok, short_deltas, spans);
-        expect_reject("no spans to copy", ok, ok_deltas,
+        expect_reject("an empty mapping", empty_mapping,
+                      std::span<const ninfer::RopeDeltaPageRange>(), spans);
+        expect_reject("a mapping past the entitlement", oversized, oversized_ranges, spans);
+        expect_reject("a range plane not parallel to the mapping", ok, short_ranges, spans);
+        expect_reject("no spans to copy", ok, ok_ranges,
                       std::span<const ninfer::RelocatedCopySpan>());
         note("refusals: ok (each left the mapping and the pool untouched)");
     }
@@ -381,17 +385,18 @@ int main() {
         const std::uint32_t free_before        = pool.free_pages();
         std::vector<std::int32_t> mapping      = before;
         mapping.resize(before.size() + 2, ninfer::kPagedKVAquirePage);
-        const std::vector<std::int32_t> deltas(mapping.size(), ninfer::kRopeDeltaNone);
         // One whole resident page copied into the first new destination, so the growth still
         // exercises the copier rather than only the acquire.
         const std::vector<ninfer::RelocatedCopySpan> spans{
             ninfer::RelocatedCopySpan{.source_begin = 1 * ninfer::kPagedKVPageSize,
                                       .dest_begin   = 4 * ninfer::kPagedKVPageSize,
                                       .tokens       = ninfer::kPagedKVPageSize}};
+        const std::vector<ninfer::RopeDeltaPageRange> ranges =
+            ninfer::plan_rope_delta_page_ranges(spans, mapping.size());
 
         const std::vector<std::byte> source_bytes = read_page(before[1]);
 
-        alloc.relocate_copied_pages(mapping, deltas, spans, ctx.stream);
+        alloc.relocate_copied_pages(mapping, ranges, spans, ctx.stream);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
 
         const std::vector<std::int32_t> published = ids_of(alloc);
@@ -416,6 +421,134 @@ int main() {
               "C5 both new destinations were bought from the pool and nothing else moved");
         note("growth: ok (" + std::to_string(published.size()) + " pages, " +
              std::to_string(pool.free_pages()) + " free)");
+    }
+
+    // -------------------------------------------------- an off-grid destination: partial pages --
+    // The shape this path exists for and the one no case above covers: the surviving run starts
+    // partway through a page, so its first and last destination pages are written only in part and a
+    // move stops at whichever page boundary comes first. The span below needs three segments -- one
+    // for the 37 tokens of its first destination page and two for its second, split where the source
+    // page ends -- which is the `move.dest_token != 0` and split-at-both-boundaries arithmetic the
+    // copier was extended for and that nothing here exercised.
+    {
+        const std::vector<std::int32_t> before = ids_of(alloc);
+        const std::uint32_t page_tokens  = ninfer::kPagedKVPageSize;
+        const std::size_t token_bytes    = static_cast<std::size_t>(pool.plane(0).nb[1]);
+
+        // Destination tokens 91..190 of the new prompt, source tokens 192..291 of the resident one:
+        // an edit of -101 tokens, which is exactly the shape an off-grid edit produces.
+        const std::uint32_t dest_begin   = page_tokens + 27;
+        const std::uint32_t source_begin = 3 * page_tokens;
+        const std::vector<ninfer::RelocatedCopySpan> spans{ninfer::RelocatedCopySpan{
+            .source_begin = source_begin, .dest_begin = dest_begin, .tokens = 100}};
+
+        std::vector<std::int32_t> mapping(before.begin(), before.begin() + 1);
+        mapping.resize(3, ninfer::kPagedKVAquirePage);
+        const std::vector<ninfer::RopeDeltaPageRange> ranges =
+            ninfer::plan_rope_delta_page_ranges(spans, mapping.size());
+
+        // The moves laid out by hand, so this stays an oracle: (dest page, dest token, source page,
+        // source token, tokens). The first destination page takes the span's first 37 tokens from
+        // the head of source page 3; the second takes the rest of that page and then the head of
+        // page 4.
+        struct ExpectedMove {
+            std::uint32_t dest_page;
+            std::uint32_t dest_token;
+            std::uint32_t source_page;
+            std::uint32_t source_token;
+            std::uint32_t tokens;
+        };
+        const ExpectedMove expected[] = {{1, 27, 3, 0, 37}, {2, 0, 3, 37, 27}, {2, 27, 4, 0, 36}};
+        constexpr std::size_t kExpectedMoves = sizeof(expected) / sizeof(expected[0]);
+
+        const std::vector<ninfer::RelocatedPageMove> moves =
+            moves_of(spans, {.source = before.size(), .destination = mapping.size()});
+        check(moves.size() == kExpectedMoves, "an off-grid destination splits into three moves");
+        for (std::size_t index = 0; index < moves.size() && index < kExpectedMoves; ++index) {
+            const ninfer::RelocatedPageMove& move = moves[index];
+            const ExpectedMove& expect_move       = expected[index];
+            check(move.dest_page == static_cast<std::int32_t>(expect_move.dest_page) &&
+                      move.dest_token == expect_move.dest_token &&
+                      move.source_page == static_cast<std::int32_t>(expect_move.source_page) &&
+                      move.source_token == expect_move.source_token &&
+                      move.tokens == expect_move.tokens,
+                  "the copier's move " + std::to_string(index) +
+                      " starts and ends where the page boundaries say it must");
+        }
+
+        // Every page group's bytes before the call, so the tokens a partial destination must leave
+        // alone can be checked against what was there rather than against a guess.
+        std::vector<std::vector<std::byte>> pre(kPageGroups);
+        for (std::size_t page = 0; page < kPageGroups; ++page) {
+            pre[page] = read_page(static_cast<std::int32_t>(page));
+        }
+
+        alloc.relocate_copied_pages(mapping, ranges, spans, ctx.stream);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+        const std::vector<std::int32_t> published = ids_of(alloc);
+        check(published.size() == mapping.size(),
+              "C1 the off-grid relocation publishes the requested length");
+        check(published[0] == before[0], "C1 the page the mapping keeps is kept");
+
+        for (const ExpectedMove& expect_move : expected) {
+            const std::int32_t dest_page = published[expect_move.dest_page];
+            const std::int32_t src_page  = before[expect_move.source_page];
+            const std::vector<std::byte> dest_bytes = read_page(dest_page);
+            const std::vector<std::byte> src_bytes  = read_page(src_page);
+            bool equal = true;
+            for (std::uint32_t token = 0; token < expect_move.tokens; ++token) {
+                const auto* dest_token =
+                    dest_bytes.data() +
+                    static_cast<std::size_t>(expect_move.dest_token + token) * token_bytes;
+                const auto* src_token =
+                    src_bytes.data() +
+                    static_cast<std::size_t>(expect_move.source_token + token) * token_bytes;
+                if (std::memcmp(dest_token, src_token, token_bytes) != 0) { equal = false; }
+            }
+            check(equal, "C3 a partial destination page carries every token its move brings");
+            check(dest_page != src_page, "C2 no destination is a page the copies read");
+        }
+
+        // C4 for a partial page: the 27 tokens ahead of the span in its first destination page were
+        // never written, so they must still be the bytes that page group held before the call.
+        const std::int32_t first_dest = published[1];
+        const std::vector<std::byte> first_dest_bytes = read_page(first_dest);
+        const std::vector<std::byte>& first_dest_pre = pre[static_cast<std::size_t>(first_dest)];
+        bool head_untouched = true;
+        for (std::uint32_t token = 0; token < 27; ++token) {
+            const auto* now = first_dest_bytes.data() + static_cast<std::size_t>(token) * token_bytes;
+            const auto* was = first_dest_pre.data() + static_cast<std::size_t>(token) * token_bytes;
+            if (std::memcmp(now, was, token_bytes) != 0) { head_untouched = false; }
+        }
+        check(head_untouched,
+              "C4 the tokens ahead of the span in its first destination page were not written");
+
+        // Both planes, from one set of ranges: the interval attention reads and the shift it
+        // counter-rotates with describe the same tokens and the same delta.
+        const std::vector<std::uint32_t> intervals = read_u32(pool.rope_delta_range_row(0), 3);
+        check(ninfer::rope_delta_page_range_begin(intervals[1]) == 27 &&
+                  ninfer::rope_delta_page_range_end(intervals[1]) == 64,
+              "the first destination page's interval covers the tokens its move wrote");
+        check(ninfer::rope_delta_page_range_begin(intervals[2]) == 0 &&
+                  ninfer::rope_delta_page_range_end(intervals[2]) == 63,
+              "the second destination page's interval covers the tokens its two moves wrote");
+        if (pool.rope_delta_row(0).data != nullptr) {
+            std::vector<std::int32_t> shifts(mapping.size());
+            CUDA_CHECK(cudaMemcpy(shifts.data(), pool.rope_delta_row(0).data,
+                                  mapping.size() * sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost));
+            check(shifts[1] == static_cast<std::int32_t>(dest_begin) -
+                                   static_cast<std::int32_t>(source_begin) &&
+                      shifts[2] == shifts[1],
+                  "the shift plane carries the delta the interval plane describes");
+            check(shifts[0] == ninfer::kRopeDeltaNone,
+                  "a page no span covers carries no shift");
+        }
+        check(pool.free_pages() + published.size() == kPageGroups,
+              "C5 the ownership partition balances after an off-grid relocation");
+        note("off-grid destination: ok (3 moves, " + std::to_string(pool.free_pages()) +
+             " free)");
     }
 
     if (failures != 0) {

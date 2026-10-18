@@ -315,8 +315,13 @@ public:
     //
     // Throws `std::bad_alloc` when the pool cannot supply the pages the copies need, before anything
     // is published, so a caller that priced the relocation first can fall back safely.
+    // `ranges` is the interval plane the plan already derived with
+    // `plan_rope_delta_page_ranges`, parallel to `mapping`. Both planes this call publishes -- the
+    // interval plane read by attention and the shift plane it counter-rotates with -- are derived
+    // from it, so the copier cannot plan a different shift than the one the relocation was priced
+    // and admitted with.
     void relocate_copied_pages(std::span<const std::int32_t> mapping,
-                               std::span<const std::int32_t> deltas,
+                               std::span<const RopeDeltaPageRange> ranges,
                                std::span<const RelocatedCopySpan> spans, cudaStream_t stream);
 
     void bind_row(std::int32_t row, cudaStream_t stream = nullptr);

@@ -264,8 +264,18 @@ void PagedKVPool::clear_rope_delta_row(std::int32_t row, cudaStream_t stream) {
     // tile the plane, which is what makes one memset over one row safe.
     auto* row_base = static_cast<unsigned char*>(rope_deltas_.data) + span.offset;
     CUDA_CHECK(cudaMemsetAsync(row_base, 0, span.bytes, stream));
-    auto* range_base = static_cast<unsigned char*>(rope_delta_ranges_.data) + span.offset;
-    CUDA_CHECK(cudaMemsetAsync(range_base, 0xff, span.bytes, stream));
+    // The range plane's own geometry, not the delta plane's: the two happen to have the same shape
+    // today, so reusing one span would clear the right bytes, but the coupling is invisible and a
+    // future shape change would corrupt a neighbouring region with no compile error. Deriving each
+    // from its own tensor costs one function call, and the check below turns a divergence into a
+    // refusal instead of a memset over the wrong range.
+    const RopeDeltaRowSpan range_span =
+        rope_delta_row_span_i32(rope_delta_ranges_.ne[0], table_row_count(), row);
+    if (range_span.offset != span.offset || range_span.bytes != span.bytes) {
+        throw std::logic_error("Paged KV rope-delta planes do not share a row geometry");
+    }
+    auto* range_base = static_cast<unsigned char*>(rope_delta_ranges_.data) + range_span.offset;
+    CUDA_CHECK(cudaMemsetAsync(range_base, 0xff, range_span.bytes, stream));
 }
 
 Tensor PagedKVPool::block_table_row(std::int32_t row) const {
@@ -792,7 +802,7 @@ void PagedKVAllocation::reassign_pages(std::span<const std::int32_t> mapping,
 }
 
 void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapping,
-                                              std::span<const std::int32_t> deltas,
+                                              std::span<const RopeDeltaPageRange> ranges,
                                               std::span<const RelocatedCopySpan> spans,
                                               cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot relocate into an empty Paged KV allocation"); }
@@ -802,8 +812,8 @@ void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapp
     if (mapping.size() > page_entitlement_) {
         throw std::invalid_argument("Paged KV relocation exceeds the page entitlement");
     }
-    if (deltas.size() != mapping.size()) {
-        throw std::invalid_argument("Paged KV relocation delta plane does not parallel its mapping");
+    if (ranges.size() != mapping.size()) {
+        throw std::invalid_argument("Paged KV relocation range plane does not parallel its mapping");
     }
     if (spans.empty()) {
         throw std::invalid_argument("Paged KV relocation carries no spans to copy");
@@ -828,8 +838,13 @@ void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapp
     const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(
         spans, RelocatedPageCounts{.source      = sources.size(),
                                    .destination = mapping.size()});
-    std::vector<std::uint32_t> planned_ranges =
-        encode_rope_delta_page_ranges(spans, mapping.size());
+    // Both planes come from the caller's ranges, which is the same answer the plan published to
+    // decide the relocation: the copier does not plan them a second time from the spans. If it did,
+    // the interval plane it publishes and the shift plane the plan priced would be two derivations
+    // of one fact, and the failure mode of a drift is a silently wrong rotation rather than a
+    // refusal.
+    std::vector<std::uint32_t> planned_ranges = encode_rope_delta_page_ranges(ranges);
+    std::vector<std::int32_t> planned_deltas   = rope_delta_plane_from_ranges(ranges);
     std::vector<std::int32_t> protected_pages;
     protected_pages.reserve(moves.size());
     for (const RelocatedPageMove& move : moves) {
@@ -918,7 +933,7 @@ void PagedKVAllocation::relocate_copied_pages(std::span<const std::int32_t> mapp
     if (!substitution.held_for_copy.empty()) { pool_->return_pages(substitution.held_for_copy); }
 
     page_ids_ = std::move(final_ids);
-    rope_deltas_.assign(deltas.begin(), deltas.end());
+    rope_deltas_ = std::move(planned_deltas);
     rope_delta_ranges_ = std::move(planned_ranges);
     if (bound_row_ >= 0) { publish_mapping(stream); }
 }

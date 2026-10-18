@@ -838,15 +838,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // That helper is host-tested (tests/test_paged_kv_delta_layout.cpp) and lives in a
                 // CUDA-free header; re-deriving the same subtraction here would let the two drift,
                 // and the drift would surface as a silently wrong shift rather than as a failure.
+                //
+                // Only the re-pointing route needs it built here. The copied route's planes are
+                // derived by the allocation from `copy_ranges`, the ranges planned once below, so
+                // the shift plane it publishes is the one the plan priced rather than a second
+                // derivation that could disagree with the interval plane.
                 std::vector<std::int32_t> deltas(remap.size(), kRopeDeltaNone);
+                std::vector<RopeDeltaPageRange> copy_ranges;
                 if (copying) {
-                    const std::vector<RopeDeltaPageRange> page_ranges =
-                        plan_rope_delta_page_ranges(copy_spans, remap.size());
-                    for (std::size_t page = 0; page < page_ranges.size(); ++page) {
-                        if (page_ranges[page].begin != page_ranges[page].end) {
-                            deltas[page] = page_ranges[page].delta;
-                        }
-                    }
+                    copy_ranges = plan_rope_delta_page_ranges(copy_spans, remap.size());
                 } else {
                     for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
                         // Spans are page-aligned by construction: `diff_prompt_edit` hashes whole
@@ -970,10 +970,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     // in the same pass as before. `relocate_copied_pages` drains the stream before it
                     // releases the pages it read, so a page handed to the pool is not still being
                     // copied from when another lane's prefill takes it.
-                    sequence.kv->text.relocate_copied_pages(remap, deltas, copy_spans, device.stream);
+                    sequence.kv->text.relocate_copied_pages(remap, copy_ranges, copy_spans,
+                                                            device.stream);
                     if (!backend_remap.empty()) {
-                        sequence.kv->backend->relocate_copied_pages(backend_remap, deltas, copy_spans,
-                                                                    device.stream);
+                        sequence.kv->backend->relocate_copied_pages(backend_remap, copy_ranges,
+                                                                    copy_spans, device.stream);
                     }
                 } else {
                     sequence.kv->text.reassign_pages(remap, deltas, device.stream);
