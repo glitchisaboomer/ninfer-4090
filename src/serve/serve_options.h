@@ -47,8 +47,8 @@ struct ServeOptions {
     std::uint32_t vision_max_tokens        = 8192;
     bool use_cuda_graph                    = true;
     bool allow_prefix_reuse = true;
-    // Suffix Cache Reuse is opt-in and deliberately not advertised in --help tuning until
-    // correctness validation (roadmap Phase 5.5) has been run against real artifacts.
+    // Suffix Cache Reuse is opt-in and deliberately not advertised in --help tuning until the
+    // reuse comparison of `docs/SCR.md` §5 has been run against real artifacts.
     bool enable_suffix_cache_reuse       = false;
     std::uint32_t suffix_reuse_max_spans = kDefaultSuffixReuseMaxSpans;
     // Kept as a bool rather than the engine enum so this header stays free of engine types; it is

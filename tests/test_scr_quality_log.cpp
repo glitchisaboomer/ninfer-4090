@@ -1,4 +1,4 @@
-// Phase 5.5 of docs/SCR.md, served end: the request JSONL log is the only channel that
+// `docs/SCR.md` §5, served end: the request JSONL log is the only channel that
 // carries per-token logprobs out of ninfer-serve, so the reader that turns it into scoring input is
 // the place a quality run can silently go wrong. These checks are all host-side: no CUDA, no model,
 // no server. The logprobs are fabricated, which is what makes the expected divergence exactly

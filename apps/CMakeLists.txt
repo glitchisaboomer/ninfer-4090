@@ -10,7 +10,7 @@ target_link_libraries(ninfer PRIVATE
   ninfer_product_load_progress
   ninfer_product_prompt_input)
 
-# Phase 5.5 of docs/SCR.md measures Suffix Cache Reuse by driving two ninfer-serve runs
+# `docs/SCR.md` §5 measures Suffix Cache Reuse by driving two ninfer-serve runs
 # (SCR on and off) over one chat-shaped prompt suite and scoring both request logs with the
 # target's own thresholds. It is a client of the server, so it belongs beside it.
 add_executable(ninfer-scr-quality scr_quality/main.cpp)

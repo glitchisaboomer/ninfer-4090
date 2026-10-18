@@ -324,9 +324,9 @@ ninfer_add_op_test(ninfer_gqa_kv_page_delta_i8_test
 ninfer_add_op_test(ninfer_gqa_kv_page_delta_rotated_test
   SOURCES ops/test_gqa_kv_page_delta_rotated.cpp
   LIBRARIES ninfer_ops)
-# Log-probability of the chosen token, against an FP64 log-softmax oracle. Phase 5.5 of
-# docs/SCR.md scores the two reuse paths in nats, so this measures the quantity that score
-# consumes rather than the argmax it is often confused with.
+# Log-probability of the chosen token, against an FP64 log-softmax oracle. `docs/SCR.md` §5
+# scores the two reuse paths in nats, so this measures the quantity that score consumes rather
+# than the argmax it is often confused with.
 ninfer_add_op_test(ninfer_logprob_of_choice_test
   SOURCES ops/test_logprob_of_choice.cpp
   LIBRARIES ninfer_ops)

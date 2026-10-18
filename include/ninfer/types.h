@@ -423,8 +423,8 @@ struct GenerationResult {
     // Element i is the logprob of `generated_token_ids[i]` given everything before it, over the
     // sampler's token domain. Always the same size as `generated_token_ids`; a token whose producing
     // path does not measure logprobs (the MTP/DFlash licensed tokens) is reported as NaN rather than
-    // being dropped, so the two vectors never describe different tokens. Phase 5.5 of
-    // docs/SCR.md measures Suffix Cache Reuse with this; the served API does not expose it.
+    // being dropped, so the two vectors never describe different tokens. `docs/SCR.md` §5 measures
+    // Suffix Cache Reuse with this; the served API does not expose it.
     std::vector<float> generated_logprobs;
     // Best-minus-second-best logit gap in nats, parallel to `generated_logprobs`. NaN where a path
     // measured no margin. See ops::logprob_of_choice.
