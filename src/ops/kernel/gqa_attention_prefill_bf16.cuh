@@ -306,6 +306,15 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const bool partial = rope_delta_page_range_is_partial(current_range);
         if (!partial || current_page_delta == 0) { return; }
 
+        // The caller's baseline scores were just read out of q_s by every warp, and the call below
+        // rewrites cols 0-63 of *every* row of it. Inside a warp those are program-ordered; across
+        // warps they are not, so warps that only meet at the barrier after the rotation would let a
+        // fast warp rotate rows a slow one is still reading, and that warp's baseline half of the
+        // splice would then be computed from rotated Q. Both halves rotate to plausible values, so
+        // that failure is silent. The early return above is safe to cross: it depends only on
+        // CTA-uniform state, so all threads reach this barrier or none does.
+        __syncthreads();
+
         gqa_prefill_rotate_q_smem_inplace(q_s, Br, tid, Threads, current_page_delta, freq);
         __syncthreads();
         float shifted[QKNt][4]{};
@@ -351,6 +360,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // out of it: `load_and_rotate_q` is a no-op rotation there, and forcing it through the
         // sentinel that the page-transition comparison used to require was an indirect way to ask
         // for exactly this.
+        //
+        // The reload issues cp.async writes into q_s, and the shifted reads above are still in
+        // flight in the other warps, so it needs the same barrier the rotation got -- the arrival
+        // of those writes is what the `cp_wait`/barrier inside `load_and_rotate_q` orders, not
+        // their issue. Same argument as above: every thread reaches this one.
+        __syncthreads();
         load_and_rotate_q(0);
         current_delta = 0;
     };
