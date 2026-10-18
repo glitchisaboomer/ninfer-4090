@@ -405,10 +405,14 @@ enum class PrefixReusePath : std::uint8_t {
     // The prompt shares a leading run with the resident sequence but diverges before the frontier
     // the lane stopped at, which is the shape of an edit made inside the prompt. Unlike
     // `AppendAtFrontier` the prompt reaches no frontier the lane kept whole, so the reuse ends at
-    // the divergence: resident KV covers `[0, reuse_base)`, everything after it is prefilled, and
-    // the recurrent state is zeroed because it was summarised past the divergence. The lane also
-    // retained no hidden state at `reuse_base - 1`, so a speculative backend stages its prefill
-    // here without a bridge. Appended rather than inserted so the existing values do not move.
+    // the divergence: resident KV covers `[0, reuse_base)` and everything after it is prefilled.
+    // The recurrent state is kept rather than zeroed -- it is the previous prompt's summary, which
+    // is the snapshot this feature continues from, and clearing it would drop the reused prefix's
+    // contribution from the linear-attention layers. The lane retained no hidden state at
+    // `reuse_base - 1`, so a speculative backend forwards that one token over the reused prefix to
+    // write the row there; a prompt carrying media keeps the resident row instead, because its
+    // prefill is driven by a Vision session the forward does not stage. Appended rather than
+    // inserted so the existing values do not move.
     AppendAtSharedPrefix,
 };
 

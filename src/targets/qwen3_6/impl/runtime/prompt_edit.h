@@ -67,7 +67,8 @@ inline constexpr std::uint32_t kPromptEditBlockTokens = 64;
 inline constexpr std::uint32_t kMinimumForwardedTailTokens = 16;
 
 // Whether the MTP frontier forward applies to a reuse whose base is `base` for a prompt of
-// `prompt_tokens` tokens.
+// `prompt_tokens` tokens, where `prompt_has_media` says whether that prompt carries an image or
+// another Vision item.
 //
 // The layer that predicts a second token pairs the row at position `p` with the embedding of token
 // `p + 1`, so the row at `base - 1` only matches the new prompt when it is written from the hidden
@@ -76,9 +77,19 @@ inline constexpr std::uint32_t kMinimumForwardedTailTokens = 16;
 // and a following token to pair with: a nonzero base, and a base below the prompt end. Every plan
 // that selects the forward satisfies both; the runtime re-checks them where it runs, because a plan
 // that named a base outside them would otherwise have the forward underflow or read past the prompt.
+//
+// A prompt with media is excluded, and that exclusion has to live here rather than only in the
+// runtime that refuses it. The forward runs the ordinary Text prefill for one token, while a
+// multimodal request's prefill is driven by the Vision session the request stages; the runtime cannot
+// run one without the other, and a plan that selected the forward for a media prompt would reach that
+// refusal as a failed request rather than as a degraded draft. Such a prompt keeps whatever MTP row
+// the resident sequence left at `base - 1`, which is the same trade the relocation path made before
+// the forward existed: a row paired with a pre-edit token costs draft acceptance at that one position
+// and can never become an accepted token, because drafts are verified against the base model.
 [[nodiscard]] constexpr bool mtp_frontier_forward_applies(std::uint32_t base,
-                                                          std::uint32_t prompt_tokens) noexcept {
-    return base > 0 && base < prompt_tokens;
+                                                          std::uint32_t prompt_tokens,
+                                                          bool prompt_has_media) noexcept {
+    return base > 0 && base < prompt_tokens && !prompt_has_media;
 }
 
 // A contiguous run of tokens that is token-identical in both prompts, expressed in

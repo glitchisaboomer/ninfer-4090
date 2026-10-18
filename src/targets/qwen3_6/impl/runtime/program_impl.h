@@ -2648,13 +2648,22 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.mtp_bridge == MtpBridgeMode::FrontierForward) {
-            if (staged.cursor != staged.base ||
-                !qwen3_6::detail::mtp_frontier_forward_applies(staged.base,
-                                                               staged.prompt_tokens)) {
-                throw std::logic_error("staged MTP frontier forward is outside the reusable suffix");
-            }
+            // The plan already declines this bridge for a media prompt, so reaching here with a
+            // Vision session staged means the rule was not applied where the plan was built. That is
+            // a planner defect rather than a prompt shape, and it is refused rather than repaired:
+            // the forward would prefill one token through the Text path while the vision session
+            // owns the same chunk's multimodal work. This check runs before the positional one so
+            // that defect is reported as the rule it broke: the position it names is satisfied, so
+            // the check below would otherwise take the blame.
             if (staged.vision || dflash || !sequence.kv || !sequence.kv->text.valid()) {
                 throw std::logic_error("staged MTP frontier forward needs a resident Text prefix");
+            }
+            // No vision session reaches this point; the flag is passed from the actual state so the
+            // predicate is never told something the caller has not established.
+            if (staged.cursor != staged.base ||
+                !qwen3_6::detail::mtp_frontier_forward_applies(staged.base, staged.prompt_tokens,
+                                                               staged.vision != nullptr)) {
+                throw std::logic_error("staged MTP frontier forward is outside the reusable suffix");
             }
             const std::uint32_t frontier_page =
                 (staged.base - 1) / static_cast<std::uint32_t>(kPagedKVPageSize);

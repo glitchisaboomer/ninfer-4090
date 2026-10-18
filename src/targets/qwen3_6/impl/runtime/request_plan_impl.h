@@ -553,7 +553,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // the resident prefix and write the row from the result.
             plan->prepare_mtp = true;
             plan->mtp_bridge  = qwen3_6::detail::mtp_frontier_forward_applies(
-                                   plan->reuse_base, plan->summary.prompt_tokens)
+                                   plan->reuse_base, plan->summary.prompt_tokens,
+                                   base.vision_control != nullptr)
                                     ? MtpBridgeMode::FrontierForward
                                     : MtpBridgeMode::None;
         } else if (plan->reuse == ReusePath::SuffixRelocation) {
@@ -578,7 +579,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // summary by the one token; the caller's comment records why that is left alone.
             plan->prepare_mtp = true;
             plan->mtp_bridge  = qwen3_6::detail::mtp_frontier_forward_applies(
-                                   plan->reuse_base, plan->summary.prompt_tokens)
+                                   plan->reuse_base, plan->summary.prompt_tokens,
+                                   base.vision_control != nullptr)
                                     ? MtpBridgeMode::FrontierForward
                                     : MtpBridgeMode::None;
         }

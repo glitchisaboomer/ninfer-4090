@@ -1767,23 +1767,50 @@ void test_trim_relocated_run_tails() {
     }
 }
 
+namespace {
+
+// `mtp_frontier_forward_applies` is constexpr and every case below passes it compile-time constants,
+// so the compiler folds each call, folds the branch inside `expect` to a constant, and emits an
+// empty function: the checks then pass without running, which is what this file's build did before
+// these helpers existed. Reading the arguments back through a volatile copy keeps the calls opaque.
+std::uint32_t opaque_tokens(std::uint32_t blocks) {
+    volatile std::uint32_t value = block_tokens(blocks);
+    return value;
+}
+
+bool opaque_flag(bool flag) {
+    volatile bool value = flag;
+    return value;
+}
+
+} // namespace
+
 // The MTP frontier forward is only usable when there is a prefix to read and a following token to
 // pair the recovered hidden with. Both ends matter: a zero base has no reused prefix, and a base at
-// the prompt end would read the token after the prompt while writing the row before it.
+// the prompt end would read the token after the prompt while writing the row before it. A prompt
+// carrying media is excluded outright, because the forward runs the Text prefill for one token while
+// that request's prefill is driven by the Vision session it stages.
 void test_mtp_frontier_forward_applies() {
     using ninfer::targets::qwen3_6::detail::mtp_frontier_forward_applies;
 
-    expect(!mtp_frontier_forward_applies(0, 0), "an empty prompt has no frontier to forward");
-    expect(!mtp_frontier_forward_applies(0, block_tokens(4)),
+    expect(!mtp_frontier_forward_applies(opaque_tokens(0), opaque_tokens(0), opaque_flag(false)),
+           "an empty prompt has no frontier to forward");
+    expect(!mtp_frontier_forward_applies(opaque_tokens(0), opaque_tokens(4), opaque_flag(false)),
            "a zero base has no reused prefix to read");
-    expect(!mtp_frontier_forward_applies(block_tokens(4), block_tokens(4)),
+    expect(!mtp_frontier_forward_applies(opaque_tokens(4), opaque_tokens(4), opaque_flag(false)),
            "a base at the prompt end has no following token");
-    expect(!mtp_frontier_forward_applies(block_tokens(5), block_tokens(4)),
+    expect(!mtp_frontier_forward_applies(opaque_tokens(5), opaque_tokens(4), opaque_flag(false)),
            "a base past the prompt end has no following token");
-    expect(mtp_frontier_forward_applies(block_tokens(1), block_tokens(4)),
+    expect(mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(4), opaque_flag(false)),
            "a base with a prefix and a following token applies");
-    expect(mtp_frontier_forward_applies(1, 2),
+    expect(mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(2), opaque_flag(false)),
            "the one-token prefix with one following token applies");
+    // The media exclusion is the part a plan can get wrong: it satisfies every positional rule, so
+    // without this case the branch is only reachable through a multimodal request at run time.
+    expect(!mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(4), opaque_flag(true)),
+           "a prompt carrying media never selects the frontier forward");
+    expect(!mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(2), opaque_flag(true)),
+           "the shortest applicable prefix is still declined for a media prompt");
 }
 
 int main() {
