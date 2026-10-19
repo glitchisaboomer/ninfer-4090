@@ -6,7 +6,7 @@
 // `Q5SmallTMmaResidualAtomicEpilogue` (`src/ops/linear/q5/q5_small_t_mma.cuh:44`) has two CTAs,
 // each owning half of K, both doing `atomicAdd` into the same bf16 output element. The programming
 // model fixes no order between them and bf16 addition is not associative, so the residual's low bits
-// are not reproducible. See docs/ISSUE_prefill-nondeterminism.md.
+// are not reproducible. See docs/SCR.md.
 //
 // The band is reachable at every prompt length, which is the part that made the bug hard to see: the
 // last prefill chunk is a short tail, so a 660-token prompt and a 67-token prompt both land in it.

@@ -40,10 +40,9 @@ struct OrdinaryDecodeIngress {
 struct OrdinaryDecodeEgress {
     std::array<TokenId, kMaximumConcurrency> sampled_tokens{};
     // Next-token logprob of the corresponding `sampled_tokens` entry, over the same token domain
-    // the sampler used. Emitted for every decode round, unconditionally: Phase 5.5 of
-    // docs/SCR_ROADMAP.md measures the reuse paths' divergence in nats, and a flag that only
-    // switched this off would fork the captured CUDA graph for no measurable gain against a decode
-    // step's weight traffic.
+    // the sampler used. Emitted for every decode round, unconditionally: `docs/SCR.md` §5 measures
+    // the reuse paths' divergence in nats, and a flag that only switched this off would fork the
+    // captured CUDA graph for no measurable gain against a decode step's weight traffic.
     std::array<float, kMaximumConcurrency> sampled_logprobs{};
     // Gap in nats between the best and second-best logit for each decode column. Emitted alongside
     // `sampled_logprobs` for the same reason: a logprob difference only means something once the

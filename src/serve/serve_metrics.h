@@ -8,7 +8,8 @@
 // against prefill wall time, committed decode tokens against decode wall
 // time - so scrapers that difference llama.cpp counters read this server
 // without changes. The ninfer:-prefixed series report what llama.cpp cannot:
-// speculative draft/acceptance totals and prefix-cache reuse.
+// speculative draft/acceptance totals, prefix-cache reuse, and the relocated run
+// that Suffix Cache Reuse serves from resident KV instead of prefilling.
 
 #include "serve/generation_service.h"
 
@@ -52,6 +53,7 @@ private:
     std::uint64_t tokens_predicted_total_            = 0;
     double tokens_predicted_seconds_total_           = 0.0;
     std::uint64_t prefix_cache_hit_tokens_total_     = 0;
+    std::uint64_t prefix_relocated_tokens_total_     = 0;
     std::uint64_t speculative_draft_tokens_total_    = 0;
     std::uint64_t speculative_accepted_tokens_total_ = 0;
     std::map<std::uint64_t, int> active_;

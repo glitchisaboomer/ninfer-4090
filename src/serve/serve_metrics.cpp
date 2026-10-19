@@ -39,11 +39,18 @@ std::vector<std::pair<std::uint64_t, int>> ServeMetrics::active_snapshot() const
 
 void ServeMetrics::record(const GenerationOutcome& outcome) {
     const GenerationMetrics& m = outcome.metrics;
+    // Computed prefill excludes every token served from resident KV: an ordinary prefix hit shares
+    // the rows and a relocated run is remapped from them, so neither was prefilled. Summing before
+    // the subtraction is what keeps llamacpp:prompt_tokens_total honest for relocated requests,
+    // which it under-reported when it subtracted the prefix hit alone. The two are still counted
+    // separately in the ninfer: series.
     const std::uint64_t cached = m.prefix_cache_hit_tokens;
+    const std::uint64_t relocated = m.prefix_relocated_tokens;
     const std::uint64_t prompt = outcome.prompt_tokens > 0
                                      ? static_cast<std::uint64_t>(outcome.prompt_tokens)
                                      : 0;
-    const std::uint64_t computed_prefill = prompt > cached ? prompt - cached : 0;
+    const std::uint64_t reused = cached + relocated;
+    const std::uint64_t computed_prefill = prompt > reused ? prompt - reused : 0;
 
     const std::lock_guard<std::mutex> lock(mutex_);
     requests_total_ += 1;
@@ -53,6 +60,7 @@ void ServeMetrics::record(const GenerationOutcome& outcome) {
         outcome.completion_tokens > 0 ? static_cast<std::uint64_t>(outcome.completion_tokens) : 0;
     tokens_predicted_seconds_total_ += std::max(0.0, m.decode_seconds);
     prefix_cache_hit_tokens_total_ += cached;
+    prefix_relocated_tokens_total_ += relocated;
     speculative_draft_tokens_total_ += m.speculative_draft_tokens;
     speculative_accepted_tokens_total_ += m.speculative_accepted_tokens;
 }
@@ -71,6 +79,7 @@ std::string ServeMetrics::render(std::uint32_t max_concurrency) const {
     append_counter(out, "llamacpp:requests_deferred", in_flight - processing);
     append_counter(out, "ninfer:requests_total", requests_total_);
     append_counter(out, "ninfer:prefix_cache_hit_tokens_total", prefix_cache_hit_tokens_total_);
+    append_counter(out, "ninfer:prefix_relocated_tokens_total", prefix_relocated_tokens_total_);
     append_counter(out, "ninfer:draft_tokens_total", speculative_draft_tokens_total_);
     append_counter(out, "ninfer:draft_accepted_tokens_total", speculative_accepted_tokens_total_);
     return out;

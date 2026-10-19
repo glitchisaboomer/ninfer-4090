@@ -42,6 +42,10 @@ enum class MtpBridgeMode : std::uint8_t {
     None,
     BeforeSuffix,
     AfterExactHit,
+    // Forward the single token at `base - 1` over the resident prefix to recover the hidden state
+    // no cache holds there, and write the MTP row at `base - 1` from it. `BeforeSuffix` reads a
+    // hidden the lane kept; this mode has to produce one, so it runs the base model once.
+    FrontierForward,
 };
 
 // Host-side relocation geometry for Suffix Cache Reuse. Defined with the edit detector so
@@ -509,6 +513,11 @@ private:
     // the page remap, per-page fingerprints taken before and after the re-rotation, and whether the
     // relocated K plane is finite, since the relocation path has produced badly wrong output while
     // every component tests clean in isolation.
+    //
+    // Every number here is decoded by the plane's own dtype. A packed plane (`--kv-dtype rk4v4`,
+    // `rk4v4-e8`, `rk2v4-e8`) holds quantization codes, not floats, and reading them as BF16 invents
+    // NaN (`0x7F2A`) and `FLT_MAX` (`0x7F7F`) rather than measuring anything: on such a run
+    // `non_finite` and `range` describe bit patterns, and a row total is a sum of code bytes.
     void log_scr_relocation(const RequestPlanImpl& request_plan, std::uint32_t prompt_tokens,
                             std::uint32_t base, std::span<const std::int32_t> remap,
                             const qwen3_6::PagedKVCacheView& view,
@@ -523,7 +532,9 @@ private:
                                              cudaStream_t stream) const;
 
     // sum|x| per (kv_head, page_offset) row of one physical page. Strictly finer than
-    // scr_page_fingerprint, which collapses the whole page to one number.
+    // scr_page_fingerprint, which collapses the whole page to one number. The row width is the
+    // plane's own element extent, so the rows are the same rows for a packed plane; the printed
+    // integrity line labels the dtype so a code-byte total is not read as an activation magnitude.
     [[nodiscard]] std::vector<float> scr_page_row_fingerprints(const PagedKVLayerView& layer,
                                                               std::int32_t physical_page,
                                                               cudaStream_t stream) const;
@@ -549,25 +560,23 @@ private:
     // The GDN half of the relocation diagnostic.
     //
     // A Linear Attention slot is one recurrent summary of a whole sequence rather than a per-token
-    // cache, so it cannot be relocated: there is nothing to move and no RoPE to undo. A relocated
-    // request therefore has to invalidate it, and program_impl.h does that by zeroing the slot and
-    // replaying the head range. That reasoning is sound but was never observed, and it has one
-    // unverified branch: when the plan's head range is empty the zero is skipped on the argument
-    // that the resident prompt is then a strict prefix of the new one. Nothing checked that
-    // argument, and a wrong answer here does not fail loudly -- 48 of 64 layers simply start from a
-    // summary of a prompt the request never contained, which shows up only as drift in the first
-    // generated token's logprob.
+    // cache, so it cannot be relocated and has no RoPE to undo. The relocated run is simply not
+    // forwarded; the state is kept. That follows the authors' design -- "snapshot the recurrent
+    // state before the edit and continue from that snapshot" -- which their reference implements as
+    // `KVREUSE_SSM_MODE=fork` (the default): restore the state saved at the end of the previous
+    // prompt. program_impl.h therefore keeps the resident slot and lets only the ranges the prefill
+    // covers advance it; it is not zeroed, because dropping the reused prefix's contribution from
+    // 48 of 64 layers is a far wider approximation than SCR accepts and bounds with K.
     //
-    // This reports, per stage, whether the zero was taken and how much magnitude each layer's conv
-    // and recurrent halves actually carry, so the three states that look alike from the outside
-    // separate: zero skipped (magnitude left over from the previous prompt), zero taken and still
-    // zero (head range empty or not yet replayed), and zero taken and refilled by prefill (magnitude
-    // back). A non-zero non-finite count means the replay itself produced garbage, which is a
-    // different fault entirely.
+    // This reports, per stage, how much magnitude each layer's conv and recurrent halves carry, so
+    // the state a stage ends with can be lined up against the cold-start control (`full_reset`) and
+    // read for drift. `full_reset` is the only stage that takes a zero, so only it reports the
+    // before/after pair; `fork` and `post_prefill` report the single retained magnitude. A non-zero
+    // non-finite count means a kernel produced garbage, which is a different fault entirely.
     //
     // Reading the whole slot costs a full PCIe round trip per stage, which is why this stays behind
     // the same NINFER_SCR_DIAG switch as the KV probe rather than running unconditionally.
-    void log_scr_gdn_state(const char* stage, bool zero_taken, std::optional<bool> head_empty,
+    void log_scr_gdn_state(const char* stage, bool zero_taken,
                            const LinearAttentionStateFingerprint& before,
                            const LinearAttentionStateFingerprint& after,
                            cudaStream_t stream) const;

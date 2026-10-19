@@ -25,18 +25,10 @@ void fail(const std::string& what) {
     ++failures;
 }
 
-// Sign convention: delta = dst - src. The kernel applies R(-delta) to Q, which is equivalent to the
-// key having been at dst instead of src. This matches the Phase 4a comment in gqa_attention_decode.cuh
-// and the integration test's negative control in tests/ops/test_scr_relocation_integration.cpp.
-constexpr std::int32_t kDelta = (kDestPage * kPageSize) - (kSourcePage * kPageSize); // = -384
-
 // The detail::gqa_attention_cached_small_t_launch dispatch only accepts TOKENS in [1, 8].
 // 16 would hit the default branch and throw. 8 is the largest token count the small-t
 // bf16 kernel supports, and it is enough to exercise the Q counter-rotation path.
 constexpr std::int32_t kDecodeTokens = 8;
-constexpr std::int32_t kDecodeBase   = kDestPage * kPageSize + kRelocatedRun - kDecodeTokens;
-constexpr std::uint32_t kDecodeVisible =
-    static_cast<std::uint32_t>(kDecodeBase + kDecodeTokens);
 
 // Helper: run the prefill A1 path through the detail:: launcher with the supplied batch view. This is
 // the append-and-attend route, so the cache is mutated by the call; the test builds a fresh cache for
@@ -70,39 +62,41 @@ AttentionRun run_prefill_attention_detail(Cache& cache, const std::vector<__nv_b
     return AttentionRun{download_doubles(dout, q.size())};
 }
 
-void check_decode_attention_with_delta(const Scenario& scenario) {
+void check_decode_attention_with_delta(const Scenario& scenario,
+                                           const Criterion& anchor = kConformanceBf16) {
 
-    // 0. Setup assertion: the scenario is only meaningful if the block table is non-identity at
-    //    kDestPage. If a future refactor of build_scenario makes the table identity, the negative
-    //    control becomes meaningless (zero deltas would be correct).
+    // 0. Setup assertion: the destination page table entry is non-identity, so the zero-delta
+    //    negative control remains meaningful for both aligned and mixed-page scenarios.
     if (scenario.table[kDestPage] == kDestPage) {
         fail("block table must be non-identity at kDestPage for the negative control to be valid");
         return;
     }
 
     const FreqTable freq = default_inv_freq();
-    const std::int32_t delta = scenario.dst - scenario.src; // = kDelta = -384
-    const std::uint32_t visible = kDecodeVisible;
+    const std::int32_t decode_base = scenario.dst + scenario.run - kDecodeTokens;
+    const std::uint32_t visible = static_cast<std::uint32_t>(decode_base + kDecodeTokens);
 
     // 1. Build a cache with K at source positions (no physical re-rotation)
 
     Cache cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+    place_unaligned_relocation(cache, scenario);
 
 
-    // 2. Build the delta plane: all zeros except kDestPage
-    std::vector<std::int32_t> delta_host(kLogicalPages, 0);
-    delta_host[kDestPage] = delta;
-    DeviceBuffer delta_buf = upload_i32(delta_host);
+    // 2. Build page deltas and packed interval bounds for every destination page touched.
+    DeltaMetadata delta_metadata = make_delta_metadata(scenario);
+    DeviceBuffer delta_buf = upload_i32(delta_metadata.deltas);
+    DeviceBuffer range_buf(delta_metadata.ranges.size() * sizeof(std::uint32_t));
+    range_buf.copy_from_host(delta_metadata.ranges.data(), delta_metadata.ranges.size() * sizeof(std::uint32_t));
 
     // 3. Build the view with the delta plane and freq table attached
     PagedKVLayerView view = cache.view();
     view.rope_deltas = Tensor(delta_buf.p, DType::I32, {kLogicalPages});
+    view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {kLogicalPages});
     view.rope_inv_freq = freq; // std::array<float, 32>
 
 
     // 4. Run attention WITH deltas via detail:: launcher (should match reference)
-    auto got_relocated = run_cached_attention_view(cache, scenario.q, kDecodeBase, kDecodeTokens,
+    auto got_relocated = run_cached_attention_view(cache, scenario.q, decode_base, kDecodeTokens,
                                                    visible, view);
 
 
@@ -110,7 +104,7 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
     Cache reference = make_reference_cache(scenario);
 
     auto got_reference =
-        run_cached_attention(reference, scenario.q, kDecodeBase, kDecodeTokens, visible);
+        run_cached_attention(reference, scenario.q, decode_base, kDecodeTokens, visible);
 
 
     // 5b. Anchor the reference itself to the FP64 ideal attention oracle. If this fails, the bug is
@@ -118,8 +112,8 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
 
     if (!expect_conformant(
             measure(got_reference.out,
-                    ideal_attention(scenario.q, reference, kDecodeBase, kDecodeTokens)),
-            "A3 over a directly prefilled page (anchors the harness)")) {
+                    ideal_attention(scenario.q, reference, decode_base, kDecodeTokens), anchor),
+            "A3 over a directly prefilled page (anchors the harness)", anchor)) {
         ++failures;
     }
 
@@ -133,7 +127,7 @@ void check_decode_attention_with_delta(const Scenario& scenario) {
     std::vector<std::int32_t> zero_deltas(kLogicalPages, 0);
     DeviceBuffer zero_buf = upload_i32(zero_deltas);
     view.rope_deltas = Tensor(zero_buf.p, DType::I32, {kLogicalPages});
-    auto got_stale = run_cached_attention_view(cache, scenario.q, kDecodeBase, kDecodeTokens, visible,
+    auto got_stale = run_cached_attention_view(cache, scenario.q, decode_base, kDecodeTokens, visible,
                                                view);
 
     // 8. Assert the control FAILS loudly
@@ -153,12 +147,10 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
     }
 
     const FreqTable freq      = default_inv_freq();
-    const std::int32_t delta  = scenario.dst - scenario.src; // = kDelta = -384
-
     constexpr std::int32_t kPrefillTokens = 128;
-    constexpr std::int32_t kPrefillBase   = (kDestPage + 2) * kPageSize; // = 320; two pages past dst
+    const std::int32_t prefill_base = scenario.dst + scenario.run;
     const std::uint32_t visible =
-        static_cast<std::uint32_t>(kPrefillBase + kPrefillTokens);
+        static_cast<std::uint32_t>(prefill_base + kPrefillTokens);
 
     // Prefill path uses a Q sized for kPrefillTokens, not kQueryTokens. The reference must use
     // the same Q at the same positions, or the comparison is meaningless.
@@ -176,20 +168,25 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
 
     // 1. Build a cache with K at source positions (no physical re-rotation)
     Cache cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+    place_unaligned_relocation(cache, scenario);
 
-    // 2. Build the delta plane: all zeros except kDestPage
-    std::vector<std::int32_t> delta_host(kLogicalPages, 0);
-    delta_host[kDestPage] = delta;
-    DeviceBuffer delta_buf = upload_i32(delta_host);
+    // 2. Build page deltas and packed interval bounds for every destination page touched.
+    DeltaMetadata delta_metadata = make_delta_metadata(scenario);
+    DeviceBuffer delta_buf = upload_i32(delta_metadata.deltas);
+    DeviceBuffer range_buf(delta_metadata.ranges.size() * sizeof(std::uint32_t));
+    range_buf.copy_from_host(delta_metadata.ranges.data(),
+                             delta_metadata.ranges.size() * sizeof(std::uint32_t));
 
     // 3. Build the batch view with the delta plane and freq table attached
     PagedKVLayerView layer_view = cache.view();
     layer_view.rope_deltas  = Tensor(delta_buf.p, DType::I32, {kLogicalPages});
+    layer_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {kLogicalPages});
     layer_view.rope_inv_freq = freq;
 
     PagedKVBatchLayerView prefill_batch_view = cache.batch_view();
     prefill_batch_view.rope_deltas  = layer_view.rope_deltas.view({kLogicalPages, 1});
+    prefill_batch_view.rope_delta_ranges =
+        layer_view.rope_delta_ranges.view({kLogicalPages, 1});
     prefill_batch_view.rope_inv_freq = layer_view.rope_inv_freq;
 
     // 4. Build the tail K/V chunk the prefill call writes at kPrefillBase
@@ -207,19 +204,19 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
 
     // 5. Run prefill attention WITH deltas
     auto got_relocated = run_prefill_attention_detail(cache, prefill_q, tail_k, tail_v,
-                                                      kPrefillBase, kPrefillTokens, visible,
+                                                      prefill_base, kPrefillTokens, visible,
                                                       prefill_batch_view);
 
     // 6. Reference: direct prefill at the destination, then the same tail chunk
     Cache reference = make_reference_cache(scenario);
-    append_chunk(reference, tail_k, tail_v, kPrefillBase, kPrefillTokens);
+    append_chunk(reference, tail_k, tail_v, prefill_base, kPrefillTokens);
     auto got_reference =
-        run_cached_attention(reference, prefill_q, kPrefillBase, kPrefillTokens, visible);
+        run_cached_attention(reference, prefill_q, prefill_base, kPrefillTokens, visible);
 
     // 6b. Anchor the reference to the FP64 oracle
     if (!expect_conformant(
             measure(got_reference.out,
-                    ideal_attention(prefill_q, reference, kPrefillBase, kPrefillTokens)),
+                    ideal_attention(prefill_q, reference, prefill_base, kPrefillTokens)),
             "A1 over a directly prefilled page (anchors the harness)")) {
         ++failures;
     }
@@ -235,18 +232,21 @@ void check_prefill_attention_with_delta(const Scenario& scenario) {
     DeviceBuffer zero_buf = upload_i32(zero_deltas);
 
     Cache stale_cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(stale_cache, scenario.k_src, scenario.v, scenario.src, kRelocatedRun);
+    append_chunk(stale_cache, scenario.k_src, scenario.v, scenario.src, scenario.run);
 
     PagedKVLayerView stale_layer_view = stale_cache.view();
     stale_layer_view.rope_deltas  = Tensor(zero_buf.p, DType::I32, {kLogicalPages});
+    stale_layer_view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {kLogicalPages});
     stale_layer_view.rope_inv_freq = freq;
 
     PagedKVBatchLayerView stale_batch_view = stale_cache.batch_view();
     stale_batch_view.rope_deltas  = stale_layer_view.rope_deltas.view({kLogicalPages, 1});
+    stale_batch_view.rope_delta_ranges =
+        stale_layer_view.rope_delta_ranges.view({kLogicalPages, 1});
     stale_batch_view.rope_inv_freq = stale_layer_view.rope_inv_freq;
 
     auto got_stale = run_prefill_attention_detail(stale_cache, prefill_q, tail_k, tail_v,
-                                                  kPrefillBase, kPrefillTokens, visible,
+                                                  prefill_base, kPrefillTokens, visible,
                                                   stale_batch_view);
 
     if (!expect_control_separates(measure(got_relocated.out, got_reference.out),
@@ -266,13 +266,26 @@ int main() {
 
     const FreqTable freq = default_inv_freq();
     const Scenario scenario = build_scenario(freq);
+    const Scenario unaligned_scenario = build_unaligned_scenario(freq);
+    // A run longer than a page: whole relocated pages sit between the two partial ends. The BF16
+    // prefill path is the control that must keep agreeing with the FP64 oracle on it, which pins any
+    // op-level failure of the same shape to the quantized kernel rather than to the fixture.
+    const Scenario long_scenario = build_unaligned_long_scenario(freq);
 
     std::printf("GQA KV page-delta oracle checks\n");
     std::printf("  run of %d tokens: src %d -> dst %d, delta %d, block table permuted\n", kRelocatedRun,
                 scenario.src, scenario.dst, scenario.dst - scenario.src);
+    std::printf("  long off-grid run: src %d -> dst %d, delta %d, %d tokens over dst pages %d..%d\n",
+                long_scenario.src, long_scenario.dst, long_scenario.dst - long_scenario.src,
+                long_scenario.run, long_scenario.dst / kPageSize,
+                (long_scenario.dst + long_scenario.run - 1) / kPageSize);
 
     check_decode_attention_with_delta(scenario);
     check_prefill_attention_with_delta(scenario);
+    check_decode_attention_with_delta(unaligned_scenario);
+    check_prefill_attention_with_delta(unaligned_scenario);
+    check_decode_attention_with_delta(long_scenario, kConformanceBf16MultiPage);
+    check_prefill_attention_with_delta(long_scenario);
 
     if (failures != 0) {
         std::printf("GQA KV page-delta oracle checks FAILED (%d)\n", failures);

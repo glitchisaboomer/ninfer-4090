@@ -8,6 +8,11 @@ deletions leaving two separated survivors -- using ports of the detector and the
 `src/targets/qwen3_6/impl/runtime/prompt_edit.{h,cpp}` implements, driven by the script's own
 alignment search.
 
+The off-grid fixture is the other side of the same coin: an edit whose token delta is not a whole
+number of pages, which the block detector cannot see at all and which forces the copied route. Its
+shape is checked the same way, against a token-level detector port and the script's inverse
+alignment search.
+
 No server, no GPU, no tokenizer assets: the alignment search is checked against a deterministic
 stand-in that counts words, and the planner arithmetic against token sequences built from it.
 """
@@ -122,13 +127,31 @@ def candidates(spans, resident_tokens, limit):
 
 
 def select_segmented(spans, resident_tokens, limit, max_spans):
-    """A port of detail::plan_relocations' selection: the `max_spans` longest survivors.
+    """A port of detail::plan_relocations' selection.
 
-    The cap is applied longest-first and the survivors are then handed back in prompt order, which
-    is the order the runtime consumes (`plan_relocations` sorts by `dest_begin` after the cap).
+    The longest survivors are taken first, so a destination-page collision displaces the least reuse
+    and the cap keeps the most. The cap counts relocated spans, not candidates: a survivor that
+    collides with a longer one already kept is passed over rather than displacing it. At most one span
+    may occupy a 64-token destination page, because the packed range plane names one relocated interval
+    per page and the runtime refuses a plan that breaks the rule rather than truncating it.
+
+    Both the collision rule and the reordering are inert on the aligned fixtures here, whose survivors
+    begin on block boundaries and are separated by a whole block; they exist for the all-offset
+    detector's off-grid destinations, which are the only source of a span that is not a whole page.
+    The survivors are handed back in prompt order, which is the order the runtime consumes
+    (`plan_relocations` sorts by `dest_begin` last).
     """
-    return sorted(sorted(candidates(spans, resident_tokens, limit),
-                         key=lambda span: -span[1])[:max_spans])
+    pool = sorted(candidates(spans, resident_tokens, limit), key=lambda span: (-span[1], span[0]))
+    kept = []
+    for dest, tokens in pool:
+        if len(kept) >= max_spans:
+            break
+        last = (dest + tokens - 1) // BLOCK
+        if any(dest // BLOCK <= (kept_dest + kept_tokens - 1) // BLOCK and
+               kept_dest // BLOCK <= last for kept_dest, kept_tokens in kept):
+            continue
+        kept.append((dest, tokens))
+    return sorted(kept)
 
 
 def select_tail(spans, resident_tokens, limit, max_spans):
@@ -420,8 +443,13 @@ def test_a_plan_line_parses_back_off_the_diagnostic() -> None:
             "span{src=832 dst=640 tok=128 delta=-192 src_pages=13..14 dst_pages=10..11} "
             "span{src=960 dst=832 tok=128 delta=-128 src_pages=15..16 dst_pages=13..14} "
             "ranges=3 [0,640) [768,832) [960,1000) remap[-1,5,-1,6]")
-    plans = scr_e2e_check.parse_relocation_plans(
-        "[scr-diag] declined prompt_tokens=1 reuse_base=0\n" + line)
+    # The planner's own line runs alongside the applied one on every request that reaches the SCR
+    # block, and it names spans and counts that were planned rather than run. It must be skipped.
+    planned = ("[scr-diag] plan mode=segmented shift=on prompt_tokens=1000 reuse_base=0 "
+               "resident_kv=1024 max_spans=6 limit=984 boundary=no spans_seen=3 candidates=2 "
+               "selector=2 fallback=no after_trim=2 expressible=yes final=2 relocated=256 "
+               "reject{leading span is prefix reuse old=[0,64) new_begin=0 tokens=64}")
+    plans = scr_e2e_check.parse_relocation_plans(planned + "\n" + line)
     assert len(plans) == 1
     assert plans[0]["prompt"] == 1000 and plans[0]["base"] == 0
     assert plans[0]["spans"] == [{"src": 832, "dst": 640, "tok": 128},
@@ -429,6 +457,15 @@ def test_a_plan_line_parses_back_off_the_diagnostic() -> None:
     assert plans[0]["ranges"] == [(0, 640), (768, 832), (960, 1000)]
     assert plans[0]["ranges_reported"] == 3
     assert scr_e2e_check.check_relocation_plan(plans[0], 2) == []
+
+
+def test_a_refusal_is_not_read_as_an_applied_plan() -> None:
+    """A refusal names the spans and ranges the runtime *did not* run, so reading it back as a plan
+    would assert a plan shape that never executed."""
+    refused = ("[scr] refused an inexpressible relocation plan: refused=spans share a destination "
+               "page reuse_base=0 prompt_tokens=1000 span{src=0 dst=64 tokens=100} "
+               "span{src=256 dst=164 tokens=16} range[0,64) range[180,1000)")
+    assert scr_e2e_check.parse_relocation_plans(refused) == []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -675,3 +712,84 @@ def test_a_page_of_a_relocated_span_needs_at_most_two_copies_and_one_delta() -> 
         assert len(segments) <= 2, f"page {page} needs {len(segments)} copies"
         for _src_page, src_offset, _dst_offset, take in segments:
             assert 0 < take <= BLOCK - src_offset, "a segment stays inside its source page"
+
+
+# ---------------------------------------------------------------------------------------------
+# The off-grid fixture: an edit the page grid cannot express
+#
+# Scope A's edit, with the middle sized so the delta is *not* a multiple of 64. The block detector
+# then matches nothing after the edit, and the surviving source misses the destination's page offset
+# by construction, so the re-pointing route cannot express it and the copied route is the only one
+# that can. That is the shape `--shape off-grid` runs and `source_may_shift` asserts.
+# ---------------------------------------------------------------------------------------------
+def test_the_off_grid_fixture_moves_the_edit_off_the_page_grid() -> None:
+    with live_shape("off-grid"):
+        pads = scr_e2e_check.solve_alignment(None, 512, 900, False)
+        assert pads is not None, "the off-grid search failed"
+        vocab = {}
+        text_a = scr_e2e_check.request_prompt("a", pads)
+        text_b = scr_e2e_check.request_prompt("b", pads)
+    prompt_a = server_tokens(text_a, vocab)
+    prompt_b = server_tokens(text_b, vocab)
+
+    delta = len(prompt_a) - len(prompt_b)
+    assert delta > 0, "the fixture is a deletion"
+    assert delta % BLOCK != 0, \
+        f"the edit moves {delta} tokens, a whole number of pages: that is not the off-grid case"
+
+    # A whole-block index only matches content on the same grid in both prompts, so after an
+    # off-grid edit it finds nothing: that is why the token-level detector exists at all.
+    aligned = surviving_spans(prompt_a, prompt_b)
+    assert all((old - new) % BLOCK == 0 for old, new, _t in aligned), \
+        f"the block detector found an off-grid survivor, so the fixture is not off-grid: {aligned}"
+
+    runs = survivor_runs(prompt_a, prompt_b)
+    assert len(runs) >= 2, f"expected the shared prefix and the survivor, got {runs}"
+    old_begin, new_begin, tokens = runs[-1]
+    assert old_begin - new_begin == delta, \
+        "the surviving run is shifted by exactly the edit's token delta"
+    assert (old_begin - new_begin) % BLOCK != 0, "the source has to start off the page grid"
+    assert tokens >= 2 * BLOCK, "the survivor has to be long enough to relocate whole pages"
+
+
+def test_the_off_grid_plan_check_wants_a_source_off_the_page_grid() -> None:
+    """A plan whose source shares its destination's page offset is the re-pointing shape. The
+    off-grid check must reject it, or a run that silently fell back would report a pass."""
+    def plan(src):
+        return {
+            "prompt": 1000,
+            "base": 0,
+            "spans": [{"src": src, "dst": 640, "tok": 128}],
+            "ranges": [(0, 640), (768, 1000)],
+            "ranges_reported": 2,
+        }
+
+    on_grid = scr_e2e_check.check_relocation_plan(plan(832), 1, source_may_shift=True)
+    assert any("off-grid" in problem for problem in on_grid), on_grid
+
+    off_grid = scr_e2e_check.check_relocation_plan(plan(833), 1, source_may_shift=True)
+    assert off_grid == [], off_grid
+
+    # Without the relaxation the same span is the whole-block rule's business, which is what every
+    # aligned fixture relies on.
+    strict = scr_e2e_check.check_relocation_plan(plan(833), 1)
+    assert any("64-token blocks" in problem for problem in strict), strict
+
+
+def test_an_off_grid_plan_from_the_port_passes_the_shape_check() -> None:
+    """Tie the check to the port it is written for: the plan the token-level selector produces on a
+    shifted edit is exactly the plan `check_relocation_plan(..., source_may_shift=True)` accepts."""
+    previous, current = shift_scenario(5)
+    selected = relocate_whole_pages(survivor_runs(previous, current), len(previous),
+                                    len(current) - 1)
+    assert len(selected) == 1, f"expected one off-grid span, got {selected}"
+    source, dest, tokens = selected[0]
+    ranges = prefilled_ranges([(dest, tokens)], len(current))
+    plan = {
+        "prompt": len(current),
+        "base": 0,
+        "spans": [{"src": source, "dst": dest, "tok": tokens}],
+        "ranges": ranges,
+        "ranges_reported": len(ranges),
+    }
+    assert scr_e2e_check.check_relocation_plan(plan, 1, source_may_shift=True) == [], plan

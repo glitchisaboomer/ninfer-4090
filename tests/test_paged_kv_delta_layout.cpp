@@ -2,7 +2,7 @@
 // that lets attention read a relocated page as if it had been prefilled at its new position, and the
 // per-page delta rule that fills it.
 //
-// This is the half of docs/SCR_QUANTIZED_KV_RELOCATION.md Step 1 that needs no CUDA toolchain. The
+// This is the half of docs/SCR.md Step 1 that needs no CUDA toolchain. The
 // pool header that consumes these numbers includes <cuda_runtime_api.h>, so this arithmetic was pulled
 // into a CUDA-free header specifically so it can be tested somewhere without nvcc -- and so that an
 // off-by-one in the page rounding or a half-page span is caught here rather than on a GPU run where
@@ -44,8 +44,19 @@ using ninfer::kPagedKVAquirePage;
 using ninfer::plan_relocated_page_moves;
 using ninfer::plan_relocated_page_substitution;
 using ninfer::RelocatedCopySpan;
+using ninfer::RelocatedPageCounts;
 using ninfer::RelocatedPageMove;
 using ninfer::RelocatedPageSubstitution;
+using ninfer::RopeDeltaPageRange;
+using ninfer::plan_rope_delta_page_ranges;
+using ninfer::encode_rope_delta_page_ranges;
+using ninfer::pack_rope_delta_page_range;
+using ninfer::rope_delta_page_range_begin;
+using ninfer::rope_delta_page_range_end;
+using ninfer::rope_delta_page_range_is_empty;
+using ninfer::rope_delta_page_range_is_partial;
+using ninfer::kRopeDeltaRangeEmpty;
+using ninfer::kRopeDeltaRangeMaxOffset;
 
 int g_failures = 0;
 
@@ -322,7 +333,16 @@ void test_copied_span_moves() {
     const auto moves_of = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens,
                              std::size_t pages) {
         const RelocatedCopySpan span{source, dest, tokens};
-        return plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1), pages);
+        return plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1),
+                                         RelocatedPageCounts::same(pages));
+    };
+    const auto moves_of_shrinking = [](std::uint32_t source, std::uint32_t dest,
+                                       std::uint32_t tokens, std::size_t source_pages,
+                                       std::size_t dest_pages) {
+        const RelocatedCopySpan span{source, dest, tokens};
+        return plan_relocated_page_moves(
+            std::span<const RelocatedCopySpan>(&span, 1),
+            RelocatedPageCounts{.source = source_pages, .destination = dest_pages});
     };
 
     // An aligned source is one move per destination page: the 64 tokens fit inside one source page.
@@ -364,8 +384,8 @@ void test_copied_span_moves() {
     // says it came from. Nothing here re-states the decomposition; it rebuilds the run from the moves
     // and compares against `source_begin + (dest - dest_begin)`.
     for (std::uint32_t offset = 0; offset < kPagedKVPageSize; ++offset) {
-        for (std::uint32_t tokens : {64u, 128u, 192u, 256u}) {
-            for (std::uint32_t dest_begin : {0u, 64u, 704u}) {
+        for (std::uint32_t tokens : {1u, 17u, 64u, 128u, 192u, 256u}) {
+            for (std::uint32_t dest_begin : {0u, 1u, 31u, 63u, 64u, 704u}) {
                 const std::uint32_t source_begin = 448u + offset;
                 const std::uint32_t dest_end     = dest_begin + tokens;
                 const std::vector<RelocatedPageMove> moves =
@@ -420,33 +440,242 @@ void test_copied_span_moves() {
         }
     }
 
-    // Rejections. Each of these is a span the copier must not act on: a partial destination page would
-    // need a delta for a page it only half owns, and either end reaching past the mapping would read or
-    // write a page that is not in it.
+    // Rejections. Destination boundaries are now token-granular; only empty or out-of-mapping spans
+    // are invalid.
     const auto rejected = [&](const char* what, std::uint32_t source, std::uint32_t dest,
                               std::uint32_t tokens, std::size_t pages) {
         const RelocatedCopySpan span{source, dest, tokens};
         try {
-            (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1), pages);
+            (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(&span, 1),
+                                            RelocatedPageCounts::same(pages));
             std::printf("  FAIL: accepted %s\n", what);
             ++g_failures;
         } catch (const std::invalid_argument&) {
         }
     };
-    rejected("a run starting inside a destination page", 448, 1, 64, 16);
-    rejected("a run ending inside a destination page", 448, 0, 100, 16);
     rejected("an empty run", 448, 0, 0, 16);
     rejected("a run past the destination mapping", 448, 1024, 64, 16);
     rejected("a source past the current mapping", 1024, 0, 64, 16);
     rejected("a source that runs off the end of the mapping", 960, 0, 128, 16);
 
+    {
+        const std::vector<RelocatedPageMove> moves = moves_of(448, 1, 128, 16);
+        std::vector<bool> written(16 * kPagedKVPageSize, false);
+        for (const RelocatedPageMove& move : moves) {
+            for (std::uint32_t i = 0; i < move.tokens; ++i) {
+                const std::uint32_t destination =
+                    static_cast<std::uint32_t>(move.dest_page) * kPagedKVPageSize +
+                    move.dest_token + i;
+                const std::uint32_t source =
+                    static_cast<std::uint32_t>(move.source_page) * kPagedKVPageSize +
+                    move.source_token + i;
+                check(source == 448 + destination - 1,
+                      "destination edge copy preserves the source token correspondence");
+                check(!written[destination], "destination edge token is written only once");
+                written[destination] = true;
+            }
+        }
+        for (std::uint32_t destination = 1; destination < 129; ++destination) {
+            check(written[destination], "every token in an unaligned destination span is copied");
+        }
+    }
+
     // A relocation of nothing is not a relocation: the caller has to learn that rather than publish an
     // empty move list as success.
     try {
-        (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(), 16);
+        (void)plan_relocated_page_moves(std::span<const RelocatedCopySpan>(),
+                                        RelocatedPageCounts::same(16));
         std::printf("  FAIL: accepted a relocation with no spans\n");
         ++g_failures;
     } catch (const std::invalid_argument&) {
+    }
+
+    // A shrinking edit, which is the shape the copied path exists for. The prompt lost a region, so
+    // the mapping being published is shorter than the one it replaces, and a surviving run reads pages
+    // above the published mapping's end while staying well inside its own. Measuring both ends against
+    // the published count refused exactly this, naming a source that never left its own mapping.
+    {
+        const std::vector<RelocatedPageMove> moves = moves_of_shrinking(960, 768, 192, 18, 16);
+        check(moves.size() == 3, "a source above the published mapping still splits per page");
+        for (std::size_t index = 0; index < moves.size() && index < 3; ++index) {
+            check(moves[index].dest_page == static_cast<std::int32_t>(12 + index),
+                  "its destinations ascend from the first published page it covers");
+            check(moves[index].source_page == static_cast<std::int32_t>(15 + index),
+                  "and its sources ascend in the mapping being replaced, not the published one");
+            check(moves[index].dest_token == 0 && moves[index].source_token == 0,
+                  "an aligned move starts at both page origins");
+            check(moves[index].tokens == static_cast<std::uint32_t>(kPagedKVPageSize),
+                  "each move carries a whole page");
+        }
+    }
+    // The same run against a source mapping that really is too short is still refused. This is the
+    // check that keeps the copier from naming a page the allocation does not have, and it has to
+    // survive the fix above rather than being traded away for it.
+    {
+        const RelocatedCopySpan span{960, 768, 192};
+        bool threw = false;
+        try {
+            (void)plan_relocated_page_moves(
+                std::span<const RelocatedCopySpan>(&span, 1),
+                RelocatedPageCounts{.source = 17, .destination = 16});
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        check(threw, "a source past its own mapping is still refused");
+    }
+}
+
+void test_rope_delta_page_ranges() {
+    std::printf("RoPE delta ranges represent relocated sub-page intervals\n");
+    const std::uint32_t packed_range = pack_rope_delta_page_range(7, 53);
+    check(!rope_delta_page_range_is_empty(packed_range), "a valid interval has a nonempty encoding");
+    check(rope_delta_page_range_begin(packed_range) == 7 &&
+          rope_delta_page_range_end(packed_range) == 53,
+        "packed page offsets round-trip exactly");
+    check(rope_delta_page_range_is_empty(kRopeDeltaRangeEmpty),
+        "the empty page-range sentinel is recognized");
+    check(pack_rope_delta_page_range(0, 64) == (64u << 6),
+        "a full page uses a valid packed interval");
+    check(rope_delta_page_range_is_empty(pack_rope_delta_page_range(10, 10)),
+        "an empty interval is rejected by the packer");
+
+    // Every representable interval, not a sample. begin and end share one uint32, so the encoding
+    // is only correct if the two half-widths never overlap: any pair that decodes to something
+    // other than what it encoded is a bug the sampled cases above can miss, and the ones that
+    // miss it are the boundary values at the ends of a mixed page.
+    {
+        std::size_t mismatches   = 0;
+        std::size_t rejected     = 0;
+        for (std::uint32_t begin = 0; begin < kRopeDeltaRangeMaxOffset; ++begin) {
+            for (std::uint32_t end = begin + 1; end <= kRopeDeltaRangeMaxOffset; ++end) {
+                const std::uint32_t packed = pack_rope_delta_page_range(begin, end);
+                if (rope_delta_page_range_is_empty(packed)) { ++rejected; continue; }
+                if (rope_delta_page_range_begin(packed) != begin ||
+                    rope_delta_page_range_end(packed) != end) {
+                    if (mismatches < 4) {
+                        std::printf("    FAIL: (%u,%u) decodes as (%u,%u)\n", begin, end,
+                                    rope_delta_page_range_begin(packed),
+                                    rope_delta_page_range_end(packed));
+                    }
+                    ++mismatches;
+                }
+            }
+        }
+        check(rejected == 0,
+              "every valid interval encodes, and none is silently turned into the sentinel");
+        check(mismatches == 0,
+              "every representable offset pair round-trips exactly");
+        // A pair the packer must refuse, so the caller learns it rather than reading a wrong
+        // interval back out. `end <= begin` is empty or inverted; `end > begin` below the page size is
+        // valid and encoded.
+        for (std::uint32_t begin = 0; begin <= kRopeDeltaRangeMaxOffset; ++begin) {
+            check(rope_delta_page_range_is_empty(pack_rope_delta_page_range(begin, begin)),
+                  "a zero-width interval decodes as empty");
+            if (begin > 0) {
+                check(rope_delta_page_range_is_empty(pack_rope_delta_page_range(begin, begin - 1)),
+                      "an inverted interval decodes as empty");
+            }
+        }
+        check(rope_delta_page_range_is_empty(
+                  pack_rope_delta_page_range(0, kRopeDeltaRangeMaxOffset + 1)),
+              "an interval past the end of a page decodes as empty");
+    }
+
+    // The boundary page shapes the kernels actually branch on. A page whose interval is the whole
+    // page takes the whole-page delta route; anything narrower must be recognized as partial, or
+    // the boundary score path never runs for it.
+    {
+        check(rope_delta_page_range_is_partial(pack_rope_delta_page_range(0, 1)),
+              "a one-token interval at the start of a page is partial");
+        check(rope_delta_page_range_is_partial(pack_rope_delta_page_range(63, 64)),
+              "a one-token interval at the end of a page is partial");
+        check(rope_delta_page_range_is_partial(pack_rope_delta_page_range(7, 8)),
+              "a single interior token is partial");
+        check(!rope_delta_page_range_is_partial(pack_rope_delta_page_range(0, 64)),
+              "a whole-page interval is not partial");
+        check(!rope_delta_page_range_is_partial(kRopeDeltaRangeEmpty),
+              "the empty sentinel is not partial");
+        check(rope_delta_page_range_begin(kRopeDeltaRangeEmpty) == 63 &&
+                  rope_delta_page_range_end(kRopeDeltaRangeEmpty) == 127,
+              "the sentinel decodes as a nonsensical interval, which is why callers must test "
+              "emptiness first");
+    }
+    const std::vector<RelocatedCopySpan> spans{{465, 321, 100}};
+    const std::vector<RopeDeltaPageRange> ranges = plan_rope_delta_page_ranges(spans, 16);
+    check(ranges.size() == 16, "the range table parallels logical pages");
+    check(ranges[5].begin == 1 && ranges[5].end == 64 && ranges[5].delta == -144,
+          "the first boundary page records its relocated suffix");
+    check(ranges[6].begin == 0 && ranges[6].end == 37 && ranges[6].delta == -144,
+          "the last boundary page records its relocated prefix");
+    check(ranges[4].begin == 0 && ranges[4].end == 0 && ranges[4].delta == 0,
+          "untouched pages have an empty zero-delta interval");
+
+    const std::vector<RelocatedCopySpan> whole_page{{448, 320, 128}};
+    const std::vector<RopeDeltaPageRange> whole_ranges =
+        plan_rope_delta_page_ranges(whole_page, 16);
+    check(whole_ranges[5].begin == 0 && whole_ranges[5].end == 64 &&
+              whole_ranges[5].delta == -128,
+          "a fully relocated page uses the same interval representation");
+    check(whole_ranges[6].begin == 0 && whole_ranges[6].end == 64 &&
+              whole_ranges[6].delta == -128,
+          "every full interior page has the span shift");
+
+    const std::vector<RelocatedCopySpan> overlapping{{448, 321, 20}, {512, 350, 12}};
+    try {
+        (void)plan_rope_delta_page_ranges(overlapping, 16);
+        check(false, "two relocation spans sharing a page are rejected");
+    } catch (const std::invalid_argument&) {
+    }
+
+    // The two planes are published together and neither alone means anything, so they have to
+    // name the same move. The runtime derives the scalar delta plane from this same table and
+    // ignores a page whose interval is empty. A bug that split the two derivations would leave a
+    // page with a range but a stale delta -- which no runtime check catches, because the kernel
+    // reads the range to pick the score path and the delta to pick the angle, and only disagrees
+    // with itself on a mixed page, producing plausible wrong attention.
+    {
+        // Destination pages 5, 10, 11, 12: 5/10/11 wholly relocated, 12 crossed by the tail of
+        // the second span. Chosen so the two planes can be compared on whole and partial pages
+        // alike, and so no two spans share a destination page, which the planner refuses.
+        const std::vector<RelocatedCopySpan> spans{{448, 320, 64}, {896, 640, 130}};
+        const std::size_t pages = 16;
+        const std::vector<RopeDeltaPageRange> ranges = plan_rope_delta_page_ranges(spans, pages);
+        const std::vector<std::uint32_t> packed =
+            encode_rope_delta_page_ranges(spans, pages);
+
+        std::size_t relocated_pages = 0;
+        for (std::size_t page = 0; page < pages; ++page) {
+            const RopeDeltaPageRange& range = ranges[page];
+            const bool has_interval = range.begin != range.end;
+
+            // The scalar plane, exactly as ProgramImplCore builds it.
+            const std::int32_t scalar_delta = has_interval ? range.delta : 0;
+
+            const std::uint32_t this_packed = packed[page];
+
+            check(rope_delta_page_range_is_empty(this_packed) == !has_interval,
+                  "the packed plane is empty exactly where the table has no interval");
+            check(has_interval || scalar_delta == 0,
+                  "a page with no interval keeps the ordinary-page delta");
+            if (!has_interval) { continue; }
+
+            ++relocated_pages;
+            check(rope_delta_page_range_begin(this_packed) == range.begin &&
+                      rope_delta_page_range_end(this_packed) == range.end,
+                  "the packed interval decodes back to the table's interval");
+            check(scalar_delta == range.delta,
+                  "the scalar delta equals the range table's shift wherever a range exists");
+            check(rope_delta_page_range_is_partial(this_packed) ==
+                      (range.begin != 0 || range.end != kPagedKVPageSize),
+                  "the partial predicate matches the table's interval shape");
+        }
+        check(relocated_pages == 4,
+              "the scenario relocated four pages: three whole and one crossed");
+        check(!rope_delta_page_range_is_partial(packed[5]) &&
+                  !rope_delta_page_range_is_partial(packed[10]) &&
+                  !rope_delta_page_range_is_partial(packed[11]) &&
+                  rope_delta_page_range_is_partial(packed[12]),
+              "only the page the span's tail crosses reads as partial");
     }
 }
 
@@ -623,6 +852,65 @@ void test_relocated_page_substitution() {
         check(out.final_ids[1] == 12 && out.final_ids[2] == kPagedKVAquirePage,
               "so the other dropped page pays for one destination and the pool for the other");
     }
+
+    // A shrinking edit, which is the shape this substitution exists for: the new prompt needs fewer
+    // pages than the resident mapping holds, and a surviving run reads a page above the new mapping's
+    // end. The allocation used to refuse that outright -- it required the two mappings to be the same
+    // length -- which made the copied path unreachable for a deletion, the very edit that needs it.
+    // The arithmetic never needed the equality: a page above the destination mapping is a dropped page
+    // like any other, so it pays for a destination unless a copy reads it, and if a copy reads it it is
+    // held and returned after the copies have run.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13, 14, 15};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        // 14 is above the published mapping's last page and is the one the copies read.
+        const std::vector<std::int32_t> protected_pages{14};
+        const RelocatedPageSubstitution out =
+            plan_relocated_page_substitution(current, mapping, protected_pages);
+        check(out.final_ids[0] == 10 && out.final_ids[1] == 11,
+              "the pages the shorter mapping keeps are kept");
+        check(out.final_ids[2] == 12 && out.final_ids[3] == 13,
+              "the dropped pages below the sources pay for both destinations");
+        check(out.from_pool == 0, "so the pool is not asked for anything");
+        check(out.held_for_copy.size() == 2 && out.held_for_copy[0] == 14 &&
+                  out.held_for_copy[1] == 15,
+              "the page above the mapping that a copy reads is held, and so is the surplus after it");
+
+        // Everything the allocation owned is accounted for exactly once: named by the shorter mapping,
+        // held for the copy, or -- when the pool is asked -- not owned at all. A leak here is a page the
+        // pool frees while the allocation still believes it owns it.
+        std::vector<std::int32_t> named(out.final_ids);
+        check(std::count(named.begin(), named.end(), kPagedKVAquirePage) ==
+                  static_cast<std::ptrdiff_t>(out.from_pool),
+              "the slots left for the pool are exactly the pages it supplies");
+        named.erase(std::remove(named.begin(), named.end(), kPagedKVAquirePage), named.end());
+        named.insert(named.end(), out.held_for_copy.begin(), out.held_for_copy.end());
+        std::sort(named.begin(), named.end());
+        check(named == current, "a shrink accounts for every page it owned, exactly once");
+    }
+
+    // The same shrink with nothing read: the pages above the mapping are then ordinary surplus, and
+    // they are handed back after the copies -- of which there are none -- rather than leaked.
+    {
+        const std::vector<std::int32_t> current{10, 11, 12, 13, 14, 15};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        const RelocatedPageSubstitution out = plan_relocated_page_substitution(current, mapping, {});
+        check(out.from_pool == 0, "a shorter mapping with unread surplus never asks the pool");
+        check(out.held_for_copy == std::vector<std::int32_t>({14, 15}),
+              "the surplus past the reuse is returned to the pool once the copies have run");
+    }
+
+    // And the other direction, so the arithmetic is not merely tolerated for a growth: a longer mapping
+    // buys its extra destinations from the pool when the current mapping has nothing to drop.
+    {
+        const std::vector<std::int32_t> current{10, 11};
+        const std::vector<std::int32_t> mapping{10, 11, kPagedKVAquirePage, kPagedKVAquirePage};
+        const RelocatedPageSubstitution out = plan_relocated_page_substitution(current, mapping, {});
+        check(out.from_pool == 2, "a longer mapping with nothing dropped asks the pool for both");
+        check(out.final_ids[0] == 10 && out.final_ids[1] == 11,
+              "while the pages it still names stay mapped");
+        check(out.held_for_copy.empty(), "and nothing is held, because nothing was dropped");
+    }
 }
 
 } // namespace
@@ -646,6 +934,7 @@ int main() {
     test_implied_context_round_trip();
     test_row_span_tiles_the_plane();
     test_copied_span_moves();
+    test_rope_delta_page_ranges();
     test_relocated_page_substitution();
 
     if (g_failures != 0) {

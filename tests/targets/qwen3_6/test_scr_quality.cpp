@@ -1,4 +1,4 @@
-// Phase 5.5 SCR checks: scoring two runs of the same prompt.
+// The SCR quality checks of `docs/SCR.md` §5: scoring two runs of the same prompt.
 //
 // The scorer is host-only and dependency-free, so this file also builds with a plain host compiler:
 //   g++ -std=c++20 -I src -I include

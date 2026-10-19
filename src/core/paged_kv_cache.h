@@ -37,6 +37,7 @@ struct PagedKVLayerView {
     bool e8_lattice           = false;
     bool e8_root              = false;
     Tensor rope_deltas;          // [logical_pages] int32, or empty (data==nullptr)
+    Tensor rope_delta_ranges;    // [logical_pages] packed [begin,end) token offsets, or empty
     std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
 };
 
@@ -54,6 +55,7 @@ struct PagedKVBatchLayerView {
     Tensor v_scale_pages;
     Tensor block_tables;
     Tensor rope_deltas;          // [table_rows, logical_pages] int32, or empty
+    Tensor rope_delta_ranges;    // [logical_pages, table_rows] packed [begin,end) offsets, or empty
     std::array<float, 32> rope_inv_freq; // RoPE frequency table; all-zero means "don't rotate"
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
@@ -97,11 +99,12 @@ struct PagedKVPoolLayout {
     PagedKVPoolSpec spec;
     std::vector<PagedKVPlaneLayout> planes;
     TensorRegion block_tables;
-    // Per-(logical page, table row) RoPE delta, parallel to the block tables. One int32 per entry:
-    // the number of positions a page's keys were moved by relocation, so attention can counter-rotate
-    // its query tile instead of the quantized K plane being rewritten. Sized from the block table it
-    // parallels, never independently -- see plan_paged_kv_pool.
+    // Per-(logical page, table row) RoPE delta and packed relocated [begin,end) token interval.
+    // The ordinary delta remains one int32 per page; the range plane packs a 6-bit begin and 7-bit
+    // exclusive end per page, with 0xffffffff meaning no copied interval. Both are sized from and
+    // parallel to the block table, never independently.
     TensorRegion rope_deltas;
+    TensorRegion rope_delta_ranges;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
     [[nodiscard]] std::size_t metadata_bytes() const noexcept;
@@ -112,6 +115,7 @@ struct PagedKVPoolLayout {
 
 class PagedKVAllocation;
 struct PagedKVResize;
+struct PagedKVReservation;
 
 class PagedKVPool {
 public:
@@ -129,25 +133,51 @@ public:
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] const Tensor& block_tables() const noexcept;
-    // The RoPE delta plane, one int32 per (logical page, table row), indexed exactly like the block
-    // table beside it. `kRopeDeltaNone` (0) means the page is ordinary and attention takes its
-    // existing route. Reading this is what makes a quantized K plane relocatable without rewriting it.
+    // The RoPE delta plane and packed sub-page interval plane, both indexed like the block table.
+    // `kRopeDeltaNone` (0) is an ordinary page; an empty packed interval means no copied interval,
+    // while a nonempty interval limits the shift to copied destination tokens.
     [[nodiscard]] const Tensor& rope_deltas() const noexcept;
+    [[nodiscard]] const Tensor& rope_delta_ranges() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;
     [[nodiscard]] Tensor rope_delta_row(std::int32_t row) const;
+    [[nodiscard]] Tensor rope_delta_range_row(std::int32_t row) const;
+    [[nodiscard]] Tensor rope_delta_range_row_for_block_table(Tensor block_table) const;
     // Given a single-row block-table slice (as returned by `block_table_row`), return the
     // matching rope-delta row. Pointer-range matching: the block_table tensor's data pointer
     // must lie inside `block_tables_`. Throws if it does not.
     [[nodiscard]] Tensor rope_delta_row_for_block_table(Tensor block_table) const;
 
+    // Entitlement and occupancy accounting. Public because the runtime planner prices a
+    // sequence's growth and a relocation's page demand against them before it commits, which is
+    // a read of pool state rather than pool internals; the private section below holds the
+    // operations only the allocation and the bundle helpers may perform.
     [[nodiscard]] std::uint32_t entitled_pages() const noexcept;
-    [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
-    [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
+    [[nodiscard]] std::size_t total_page_bytes() const noexcept;
+
+    // Acquires one page of entitlement. Throws std::bad_alloc when the pool cannot satisfy it.
+    // The runtime planner takes single pages this way while pricing an off-grid span.
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
 
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
+
+    // Device-side gather/scatter across all planes, used to stage a checkpoint's pages in and out
+    // of one contiguous device buffer.
+    void gather_to_contiguous_device(std::span<const std::int32_t> page_ids, void* d_staging,
+                                     cudaStream_t stream = nullptr) const;
+    void scatter_from_contiguous_device(std::span<const std::int32_t> page_ids, const void* d_staging,
+                                       cudaStream_t stream = nullptr);
+
+    // Per-page I/O. Public because staging a checkpoint's pages and verifying a plane's contents
+    // are both operations on the pool's storage, not on its internals; the single-page forms are
+    // what the cache test uses to round-trip a page and to check clear_rope_delta_row's bytes.
+    [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
+    [[nodiscard]] std::size_t page_bytes(std::size_t plane_index) const;
+    void copy_page_to_host(std::size_t plane_index, std::int32_t page_id, void* dst,
+                           cudaStream_t stream = nullptr) const;
+    void copy_page_from_host(std::size_t plane_index, std::int32_t page_id, const void* src,
+                             cudaStream_t stream = nullptr);
 
     // Resets one table row's RoPE deltas to `kRopeDeltaNone`. Called by `PagedKVAllocation::bind_row`
     // on the caller's stream, which is what establishes the plane's invariant: a row carries either
@@ -156,26 +186,24 @@ public:
     // non-blocking stream that will read it.
     void clear_rope_delta_row(std::int32_t row, cudaStream_t stream = nullptr);
 
-    [[nodiscard]] std::size_t page_bytes(std::size_t plane_index) const;
-    void copy_page_to_host(std::size_t plane_index, std::int32_t page_id, void* dst,
-                           cudaStream_t stream = nullptr) const;
-    void copy_page_from_host(std::size_t plane_index, std::int32_t page_id, const void* src,
-                             cudaStream_t stream = nullptr);
+  private:
+    // Which row of `block_tables_` a single-row slice points into, or a throw if it does not name
+    // one. Shared by both `*_for_block_table` lookups, which differ only in the plane they read
+    // afterwards: both must agree on the pointer arithmetic, and a divergence there is silent -
+    // the wrong row still holds well-formed data.
+    [[nodiscard]] std::int32_t block_table_row_index(Tensor block_table) const;
+
+    [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     void copy_pages_to_host(std::size_t plane_index, std::span<const std::int32_t> page_ids, void* dst,
                             cudaStream_t stream = nullptr) const;
     void copy_pages_from_host(std::size_t plane_index, std::span<const std::int32_t> page_ids, const void* src,
                               cudaStream_t stream = nullptr);
 
-    // Device-side gather/scatter across all planes
-    void gather_to_contiguous_device(std::span<const std::int32_t> page_ids, void* d_staging,
-                                     cudaStream_t stream = nullptr) const;
-    void scatter_from_contiguous_device(std::span<const std::int32_t> page_ids, const void* d_staging,
-                                       cudaStream_t stream = nullptr);
-    [[nodiscard]] std::size_t total_page_bytes() const noexcept;
-
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
+    friend std::vector<PagedKVAllocation> reserve_paged_kv_bundle(
+        std::span<const PagedKVReservation> reservations);
 
     [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
                                                std::uint32_t new_pages) const noexcept;
@@ -191,6 +219,7 @@ private:
     std::vector<Tensor> planes_;
     Tensor block_tables_;
     Tensor rope_deltas_;
+    Tensor rope_delta_ranges_;
     std::vector<std::int32_t> free_page_ids_;
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
@@ -286,8 +315,13 @@ public:
     //
     // Throws `std::bad_alloc` when the pool cannot supply the pages the copies need, before anything
     // is published, so a caller that priced the relocation first can fall back safely.
+    // `ranges` is the interval plane the plan already derived with
+    // `plan_rope_delta_page_ranges`, parallel to `mapping`. Both planes this call publishes -- the
+    // interval plane read by attention and the shift plane it counter-rotates with -- are derived
+    // from it, so the copier cannot plan a different shift than the one the relocation was priced
+    // and admitted with.
     void relocate_copied_pages(std::span<const std::int32_t> mapping,
-                               std::span<const std::int32_t> deltas,
+                               std::span<const RopeDeltaPageRange> ranges,
                                std::span<const RelocatedCopySpan> spans, cudaStream_t stream);
 
     void bind_row(std::int32_t row, cudaStream_t stream = nullptr);
@@ -308,6 +342,7 @@ private:
     PagedKVPool* pool_ = nullptr;
     std::vector<std::int32_t> page_ids_;
     std::vector<std::int32_t> rope_deltas_;
+    std::vector<std::uint32_t> rope_delta_ranges_;
     std::uint32_t page_entitlement_ = 0;
     std::int32_t bound_row_         = -1;
 };

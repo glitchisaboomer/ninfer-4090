@@ -7,6 +7,7 @@
 // only what both share: layout constants, device helpers, and the split reducer.
 
 #include "core/device.h" // kTargetSmCount
+#include "core/paged_kv_delta_layout.h"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"

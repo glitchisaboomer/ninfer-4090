@@ -6,7 +6,7 @@
 //
 // Why a hash rather than a magnitude: sum|x| is an aggregate that two distinct states can share, so it
 // can show that two traces differ but never that they agree, which is exactly the weakness
-// docs/ISSUE_prefill-nondeterminism.md records against the `[scr-diag] gdn` totals. The fold answers
+// docs/SCR.md records against the `[scr-diag] gdn` totals. The fold answers
 // both questions; the FP64 sum of |x| rides along only to say how large a difference is.
 //
 // Within one tile length the fold is injective in every input word: each step is the splitmix64
@@ -99,7 +99,7 @@ struct ChunkTrace {
 // The trace's memory is thread_local (store(), below), and every Engine serves its requests on a
 // worker thread of its own (runtime/engine/concurrent_executor.h), so two Engines in one process never
 // share a trace: each one's first prefill has nothing to compare against and prints `baseline=yes`.
-// That is precisely the case docs/ISSUE_prefill-nondeterminism.md cannot name a layer for, so a
+// That is precisely the case docs/SCR.md cannot name a layer for, so a
 // completed chunk is also published to a process-wide table keyed by shape, and looked up there when
 // this instance has no baseline of its own.
 //

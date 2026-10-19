@@ -336,6 +336,7 @@ GenerationOutcome sample_outcome() {
     outcome.reasoning_tokens                = 3;
     outcome.finish_reason                   = ninfer::FinishReason::StopToken;
     outcome.metrics.prefix_cache_hit_tokens = 4;
+    outcome.metrics.prefix_relocated_tokens = 2;
     return outcome;
 }
 
@@ -364,7 +365,7 @@ int test_response_object() {
     failures += check(response.at("reasoning").at("effort") == "low",
                       "Responses object did not echo reasoning effort");
     failures +=
-        check(response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
+        check(response.at("usage").at("input_tokens_details").at("cached_tokens") == 6 &&
                   response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
                   response.at("usage").at("total_tokens") == 18,
               "Responses usage details serialized");

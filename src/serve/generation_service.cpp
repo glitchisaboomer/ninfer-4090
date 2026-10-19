@@ -16,19 +16,39 @@
 
 namespace ninfer::serve {
 
+namespace {
+
+// Prompt tokens this request served from KV that was already resident, by either mechanism: an
+// ordinary prefix hit shares the rows an earlier request left in place, and a relocated run is
+// remapped from rows it computed at different positions. Neither was prefilled here, so both come
+// out of the computed-prefill figure and both count as a cache hit on the wire. The two stay
+// separable in telemetry (`prefix_cache_hit_tokens`, `prefix_relocated_tokens`), which is why this
+// sums them at each reporting site rather than merging the fields. The plan tiles
+// [reuse_base, prompt) with relocated spans, so the sum can never exceed the prompt.
+int reused_prompt_tokens(const GenerationMetrics& metrics) {
+    return static_cast<int>(metrics.prefix_cache_hit_tokens) +
+           static_cast<int>(metrics.prefix_relocated_tokens);
+}
+
+} // namespace
+
 CompletionUsage make_completion_usage(const GenerationOutcome& outcome) {
     return CompletionUsage{outcome.prompt_tokens, outcome.completion_tokens,
-                           static_cast<int>(outcome.metrics.prefix_cache_hit_tokens)};
+                           std::clamp(reused_prompt_tokens(outcome.metrics), 0,
+                                      outcome.prompt_tokens)};
 }
 
 CompletionTimings make_completion_timings(const GenerationOutcome& outcome) {
     CompletionTimings timings;
-    const int cached = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens);
-    // What the prefill computed, not what the prompt contained. The cache hit covers ordinary
-    // prefix reuse; a relocated run is not prefilled either, so subtracting it here is what keeps
-    // this figure honest for Suffix Cache Reuse instead of reporting a rate no prefill achieved.
-    const int prompt_eval = std::max(
-        0, outcome.prompt_tokens - cached - static_cast<int>(outcome.metrics.prefix_relocated_tokens));
+    // The same clamp `make_completion_usage` applies, so `/v1` usage and `timings` cannot disagree
+    // about one request. A reused count past the prompt is a planner bug rather than a request
+    // shape, but the two figures are read side by side, and one of them reporting more cached tokens
+    // than the prompt had is a disagreement a reader would have to resolve from the code.
+    const int reused =
+        std::clamp(reused_prompt_tokens(outcome.metrics), 0, outcome.prompt_tokens);
+    // What the prefill computed, not what the prompt contained. Reused covers both mechanisms, so
+    // this is the honest figure for Suffix Cache Reuse instead of a rate no prefill achieved.
+    const int prompt_eval = std::max(0, outcome.prompt_tokens - reused);
     timings.prompt_n = prompt_eval;
     timings.prompt_ms = outcome.metrics.prefill_seconds * 1000.0;
     timings.prompt_per_second = outcome.metrics.prefill_seconds > 0.0
@@ -39,7 +59,7 @@ CompletionTimings make_completion_timings(const GenerationOutcome& outcome) {
     timings.predicted_per_second = outcome.metrics.decode_seconds > 0.0
         ? static_cast<double>(outcome.completion_tokens) / outcome.metrics.decode_seconds
         : 0.0;
-    timings.cache_n = outcome.metrics.prefix_cache_hit_tokens;
+    timings.cache_n = static_cast<std::uint32_t>(reused);
     return timings;
 }
 

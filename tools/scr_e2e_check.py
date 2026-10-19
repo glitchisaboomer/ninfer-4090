@@ -15,21 +15,25 @@ The comparison is worthless unless SCR actually engaged, so this script fails lo
 server does not report reuse=suffix_relocation rather than reporting a vacuous pass.
 
 It also checks that the engagement was real work: the request log's `computed_prefill_tokens` is the
-engine's own count of the prompt tokens its prefill chunks ran, and for a relocated request that must
-be the prompt minus the relocated run. A relocation that is planned but never applied still answers
+engine's own count of the prompt tokens its prefill chunks ran, and that must be the prompt minus
+whatever was served from resident KV -- the cache hit plus the relocated run, for a request that
+reports both. A relocation that is planned but never applied still answers
 correctly -- the re-prefilled pages hold what the relocation would have served -- so the only thing
 that catches it is the work. `--scr-mode tail|segmented` selects which relocation shape to check, and
-`--shape scope-a|interleaved` selects the fixture it runs on: the built-in Scope-A prompt has one
-surviving run, which both shapes relocate identically, so `interleaved` supplies a prompt whose edit
-leaves two separated survivors -- the one case that distinguishes them.
+`--shape scope-a|interleaved|off-grid` selects the fixture it runs on. `scope-a` is the built-in
+prompt, whose edit leaves one surviving run, which both shapes relocate identically. `interleaved`
+supplies a prompt whose edit leaves two separated survivors, the one case that distinguishes the two
+shapes. `off-grid` supplies Scope A's prompt with an edit whose token delta is *not* a whole number
+of pages: the source cannot be re-pointed at, so its payload has to be copied, and the fixture forces
+`NINFER_SCR_SOURCE_SHIFT=1` on the server so the token-level detector and the copied route are both
+live.
 
 Run it once per supported --kv-dtype (`bf16`, `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`). The relocation
 is a delta on the page, not a rewrite of the codes, so every layout whose attention kernels honour
 that delta has to be checked; BF16 alone no longer exercises the path.
 
 Usage (from the repo root):
-    python tools/scr_e2e_check.py --model "qwen3_8_27b.ninfer" \
-        --base-args "... --kv-dtype rk4v4-e8 ..."
+    python tools/scr_e2e_check.py --base-args "qwen3_8_27b.ninfer --kv-dtype rk4v4-e8 ..."
 
 Standard library only: no pip install.
 """
@@ -141,7 +145,9 @@ FACT_PLACEMENT = "tail"
 # surviving run -- the shape tail relocation is built for, and the one that cannot tell the two
 # relocation modes apart. `interleaved` is the two-deletion fixture defined with the interleaved
 # regions below, whose edit leaves two separated survivors, which is the only case where segmented
-# relocation does something tail relocation does not.
+# relocation does something tail relocation does not. `off-grid` is Scope A's prompt with an edit
+# that moves a number of tokens the page grid cannot express, so the surviving source has to be
+# copied rather than re-pointed; it is only meaningful with NINFER_SCR_SOURCE_SHIFT=1.
 SHAPE = "scope-a"
 
 # The fact the question asks about. At the very end of the prompt when placed in the tail, so it is
@@ -343,10 +349,12 @@ def second_replacement_text(pad):
 PROMPT_A_SHAPE = {
     "scope-a": "PREFIX + MIDDLE + TAIL, primes the KV cache",
     "interleaved": "P + R1 + S1 + R2 + S2, primes the KV cache",
+    "off-grid": "PREFIX + MIDDLE + TAIL with an off-page edit, primes the KV cache",
 }
 PROMPT_B_SHAPE = {
     "scope-a": "PREFIX + TAIL: the middle is deleted, the tail survives",
     "interleaved": "P + R1' + S1 + R2' + S2: both regions are replaced, both survivors survive",
+    "off-grid": "PREFIX + TAIL: the middle is deleted by a non-whole-page edit, the tail survives",
 }
 
 
@@ -411,6 +419,31 @@ def _search_alignment(port, label, why, build, max_tokens, timeout, think):
     return None
 
 
+def _search_off_grid(port, label, build_a, build_b, max_tokens, timeout, think):
+    """Grow one region until the two prompts differ by a non-multiple of the page size.
+
+    `_search_alignment` drives an edit *onto* the page grid so the re-pointing route can express it;
+    this is the inverse search, and it is the whole point of the off-grid fixture. `build_a(pad)` is
+    the prompt whose region moves and `build_b()` the prompt it moves relative to, so what is
+    measured is the edit's own token delta -- the difference of the two rendered prompts -- and not a
+    region's length, which a boundary merge between regions could report as a whole page. Any
+    non-zero remainder does it; the first is taken so the fixture stays reproducible under a given
+    tokenizer. Returns the pad, or None when the budget ran out.
+    """
+    fixed = count_tokens(port, build_b(), max_tokens, timeout, think)
+    for units in range(0, ALIGNMENT_BUDGET):
+        for shift in range(0, ALIGNMENT_SHIFT_SPAN):
+            delta = count_tokens(port, build_a((units, shift)), max_tokens, timeout, think) - fixed
+            if delta > 0 and delta % BLOCK_TOKENS != 0:
+                print(f"    {label} padded with {units} unit(s) + {shift} shift word(s) "
+                      f"-> the edit moves {delta} tokens, {delta % BLOCK_TOKENS} past a whole "
+                      f"{BLOCK_TOKENS}-token page")
+                return (units, shift)
+    print(f"    WARNING: could not put {label} off the page grid in {ALIGNMENT_BUDGET} attempts "
+          f"x {ALIGNMENT_SHIFT_SPAN} shifts")
+    return None
+
+
 def _alignment_targets(pads):
     """The boundaries that must each land on a 64-token block, and how to build the text that
     reaches each one.
@@ -452,10 +485,46 @@ def solve_alignment(port, max_tokens, timeout, think):
     or None when any of them could not be aligned. The searches are printed in full because a
     misaligned edit is silent: the diff simply finds no surviving block and the run reports
     full_reset, which the engagement check would then fail on with nothing to say about why.
-    """
-    print("  aligning the surviving spans to 64-token boundaries...")
 
+    The off-grid shape inverts the second of those searches: its edit is placed *off* the grid on
+    purpose, so only the shared prefix is aligned. Everything else about the fixture is Scope A's.
+    """
     pads = [(0, 0)] * 5
+
+    if SHAPE == "off-grid":
+        # The one fixture that must not be fully aligned. The prefix is shared and so is ordinary
+        # prefix reuse, and it is aligned for the same reason Scope A aligns it; the edit itself is
+        # left off the grid, because a source that misses the page grid is exactly what the copied
+        # route exists for.
+        print("  placing the edit off the 64-token page grid...")
+        prefix_pad = _search_alignment(port, "PREFIX", "the shared prefix is reused as whole blocks",
+                                       lambda pad: prefix_text(pad), max_tokens, timeout, think)
+        if prefix_pad is None:
+            return None
+        pads[0] = prefix_pad
+        middle_pad = _search_off_grid(
+            port, "MIDDLE",
+            lambda pad: prefix_text(pads[0]) + middle_text(pad) + tail_text(),
+            lambda: prefix_text(pads[0]) + tail_text(),
+            max_tokens, timeout, think)
+        if middle_pad is None:
+            return None
+        pads[1] = middle_pad
+
+        tokens_a = count_tokens(port, request_prompt("a", pads), max_tokens, timeout, think)
+        tokens_b = count_tokens(port, request_prompt("b", pads), max_tokens, timeout, think)
+        delta = tokens_a - tokens_b
+        prefix_only = count_tokens(port, prefix_text(pads[0]), max_tokens, timeout, think)
+        tail_tokens = tokens_b - prefix_only
+        print(f"    prompt A = {tokens_a} tokens, prompt B = {tokens_b} tokens, "
+              f"MIDDLE = {delta} tokens ({delta % BLOCK_TOKENS} past a whole page)")
+        print(f"    relocated run is about {tail_tokens} tokens "
+              f"(~{tail_tokens // BLOCK_TOKENS} whole pages)")
+        print("    (the source starts off the page grid, so the span has to be copied, not "
+              "re-pointed)")
+        return pads
+
+    print("  aligning the surviving spans to 64-token boundaries...")
     for index, (label, why, build) in enumerate(_alignment_targets(pads)):
         pad = _search_alignment(port, label, why, build, max_tokens, timeout, think)
         if pad is None:
@@ -664,7 +733,7 @@ def _intervals(pairs):
     return " ".join(f"[{begin},{end})" for begin, end in pairs) or "(none)"
 
 
-def check_relocation_plan(plan, expected_spans):
+def check_relocation_plan(plan, expected_spans, source_may_shift=False):
     """Structural checks on one applied plan; returns a list of complaints.
 
     The planner's own contract is that the prefilled ranges and the relocated spans tile the suffix
@@ -673,6 +742,12 @@ def check_relocation_plan(plan, expected_spans):
     count honest, so it is checked directly rather than inferred from the savings line, which only
     sees the totals. `expected_spans` is the count the mode claims: two separated survivors for
     segmented on the interleaved fixture, one run everywhere else.
+
+    `source_may_shift` is what the off-grid fixture sets. There the span's source is deliberately
+    *not* on the page grid, which is the entire point of the run, so the whole-block rule would
+    reject the very plan under test. The check inverts instead: the plan has to contain a span whose
+    source misses the destination's page offset, because a plan that stayed on the grid is the
+    re-pointing shape and would mean this run measured nothing the aligned fixtures do not.
     """
     problems = []
     label = f"plan(prompt={plan['prompt']}, base={plan['base']})"
@@ -702,12 +777,21 @@ def check_relocation_plan(plan, expected_spans):
                         f"{plan['prompt']}")
 
     for span in plan["spans"]:
-        if span["src"] % BLOCK_TOKENS or span["dst"] % BLOCK_TOKENS or span["tok"] % BLOCK_TOKENS:
+        if not source_may_shift and (span["src"] % BLOCK_TOKENS or span["dst"] % BLOCK_TOKENS or
+                                     span["tok"] % BLOCK_TOKENS):
             problems.append(f"{label}: span src={span['src']} dst={span['dst']} "
                             f"tok={span['tok']} is not whole 64-token blocks")
         if span["dst"] + span["tok"] >= plan["prompt"]:
             problems.append(f"{label}: span dst={span['dst']} tok={span['tok']} reaches the "
                             f"final prompt token, which must always be prefilled")
+    if source_may_shift and plan["spans"] and not any(
+            (span["src"] - span["dst"]) % BLOCK_TOKENS for span in plan["spans"]):
+        # Only a span whose source misses the destination's page offset has to be copied. If every
+        # span is on the grid then the plan is the re-pointing shape, and the off-grid case -- the
+        # one this fixture exists to exercise -- was not what ran.
+        problems.append(f"{label}: every span's source shares its destination's page offset "
+                        f"(src-dst is a whole number of pages), so the plan is the re-pointing "
+                        f"shape and the off-grid case is not what this run measured")
     return problems
 
 
@@ -736,6 +820,12 @@ def run_config(args, extra_flags, label):
     environment = dict(os.environ)
     if args.scr_diag:
         environment["NINFER_SCR_DIAG"] = "1"
+    if args.shape == "off-grid":
+        # The off-grid fixture is only meaningful with the token-level detector and the copied route
+        # enabled: without the switch the block detector finds nothing after an off-grid edit and the
+        # run reports full_reset. Forcing it here keeps the run reproducible instead of depending on
+        # the caller's shell.
+        environment["NINFER_SCR_SOURCE_SHIFT"] = "1"
 
     # The server log is redirected to a file rather than a pipe: on Windows a pipe buffer fills up
     # while we are waiting on HTTP and the server blocks, which looks like a hang.
@@ -826,13 +916,17 @@ def main():
                         help="relocation shape to pass to --scr (default: tail). 'segmented' "
                              "exercises the interleaved-survivor path, whose savings differ from "
                              "the one contiguous run 'tail' uses.")
-    parser.add_argument("--shape", choices=("scope-a", "interleaved"), default="scope-a",
+    parser.add_argument("--shape", choices=("scope-a", "interleaved", "off-grid"),
+                        default="scope-a",
                         help="prompt fixture to run (default: scope-a). 'scope-a' is the built-in "
                              "[P R S] -> [P S] prompt, whose edit leaves one surviving run and so "
                              "cannot tell the two relocation modes apart. 'interleaved' builds "
                              "[P R1 S1 R2 S2] -> [P R1' S1 R2' S2], whose edit leaves two "
                              "separated survivors: segmented relocates both, tail only the longer "
-                             "one, and that difference is the only thing that distinguishes them.")
+                             "one, and that difference is the only thing that distinguishes them. "
+                             "'off-grid' keeps Scope A's shape but places the edit off the "
+                             "64-token page grid, so the source has to be copied rather than "
+                             "re-pointed; it forces NINFER_SCR_SOURCE_SHIFT=1 on the server.")
     parser.add_argument("--scr-max-spans", type=int, default=None,
                         help="pass --scr-max-spans through to the --scr server (default: the "
                              "server's own). 1 collapses segmented mode onto the single longest "
@@ -904,6 +998,8 @@ def main():
     print(f"KV dtype under test: --kv-dtype {kv_dtype}")
     print(f"Relocation shape under test: --scr-mode {args.scr_mode}")
     print(f"Fixture under test: --shape {args.shape}")
+    if args.shape == "off-grid":
+        print("Source shift under test: on (NINFER_SCR_SOURCE_SHIFT=1, forced by --shape off-grid)")
     if args.scr_max_spans is not None:
         print(f"Span cap under test: --scr-max-spans {args.scr_max_spans}")
     print()
@@ -961,6 +1057,9 @@ def main():
     # geometry is printed, so on the interleaved fixture the whole point of the run -- two
     # separated survivors, one prefilled range per gap -- is unobservable without it.
     expected_spans = 2 if (args.shape == "interleaved" and args.scr_mode == "segmented") else 1
+    # The off-grid fixture's span is off the page grid at the source by design, so its plan is
+    # checked for that shape rather than against the whole-block rule.
+    source_may_shift = args.shape == "off-grid"
     plans = parse_relocation_plans(log_texts.get("scr", ""))
     if args.scr_diag:
         if not plans:
@@ -976,8 +1075,8 @@ def main():
                       f"spans={len(plan['spans'])} ranges={len(plan['ranges'])}")
                 print(f"    relocated: {_intervals([(s['dst'], s['dst'] + s['tok']) for s in plan['spans']])}")
                 print(f"    prefilled: {_intervals(plan['ranges'])}")
-                problems.extend(check_relocation_plan(plan, expected_spans))
-    elif args.shape == "interleaved":
+                problems.extend(check_relocation_plan(plan, expected_spans, source_may_shift))
+    elif args.shape in ("interleaved", "off-grid"):
         print("(pass --scr-diag to check the plan's shape: span count, range count, and the "
               "tiling between them)")
 
@@ -1003,10 +1102,11 @@ def main():
                 "SCR did not engage, so this comparison would be vacuous. "
                 "Make the shared tail longer (>= a few 64-token blocks) and check that no "
                 "turn-checkpoint path is taking precedence.")
-        # cache_hit is prefix reuse only. For this edit shape the prefix does not match (the middle is
-        # deleted, so the resident prompt is not a prefix of the new one), so reuse_base is 0 and
-        # cache_hit is legitimately 0 even when relocation saved hundreds of tokens. The relocated
-        # count is reported separately as prefix_relocated_tokens in the JSON completion record.
+        # cache_hit is prefix reuse only, and the relocated count is reported separately, so the two
+        # are read separately below. An edit of this shape used to leave cache_hit at 0 -- the resident
+        # prompt is not a prefix of the new one, so there was no whole-prompt match to reuse -- but the
+        # opening of the prompt is unchanged, and the runtime now reuses it. A run therefore reports a
+        # cache hit and a relocated count at the same time.
 
     if len(ref_records) < 2:
         problems.append(f"expected 2 completion records in the --no-scr run, saw {len(ref_records)}")
@@ -1041,7 +1141,19 @@ def main():
         for record in scr_requests:
             prompt = record["prompt_tokens"]
             relocated = record["relocated"] if record["reuse"] == "suffix_relocation" else 0
-            cache = record["cache_hit"] if record["reuse"] != "suffix_relocation" else 0
+            # A path that relocates nothing has to report no relocated tokens: the plan clears them
+            # when it gives up on a relocation, and a summary that kept them would report reuse the
+            # request never performed. Read conditionally below, that field would hide such a plan, so
+            # it is checked here instead.
+            if record["reuse"] != "suffix_relocation" and record["relocated"] != 0:
+                problems.append(
+                    f"request {record['id']} ({record['reuse']}) reported {record['relocated']} "
+                    "relocated tokens on a path that relocates nothing")
+            # The cache hit is counted whatever the path. The prefill computes the prompt minus
+            # everything served from resident KV, and a plan that resumes at a shared prefix and
+            # relocates past it reports both counts at once -- the shape this fixture produces -- so
+            # zeroing either term would make the invariant wrong for exactly that request.
+            cache = record["cache_hit"]
             expected = prompt - relocated - cache
             computed = record["computed_prefill_tokens"]
             skipped = prompt - computed

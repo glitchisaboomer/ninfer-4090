@@ -109,6 +109,53 @@ constexpr Criterion kConformanceBf16{2.8e-3, 1.0e-3, 2.7e-3};
 // The INT8 criterion, matching kAttentionInt8Criterion in test_gqa_attention.cpp.
 constexpr Criterion kConformanceInt8{3.15e-3, 1.1e-3, 2.2e-3};
 
+// The multi-page A3 decode anchor over a plain Int8Group64 page: the same shape the one-page
+// off-grid scenario has always used, widened to a run of 192 tokens.
+//
+// The widening is what saturates the borrowed limit. The one-page off-grid anchor measured
+// 3.109e-3 against kConformanceInt8's 3.15e-3; the same check over three destination pages measures
+// 3.156e-3, 0.19% over, deterministic across runs and with zero gross errors -- the extra pages add
+// a rounding the narrow run never carried, not a defect. A shape that saturates the borrowed limit
+// cannot absorb that, so this row gets its own profile while kConformanceInt8 stays untouched for
+// the callers it was calibrated for. The gross thresholds carry over unchanged; only the L2 side
+// moves.
+//
+// 3.3e-3 is the measured correct path plus ~4.6% of margin, and it keeps an order of magnitude of
+// separation from the same check's negative control (6.0e-2), which is what makes the anchor still
+// able to tell a broken read from a near miss.
+constexpr Criterion kConformanceInt8MultiPage{3.3e-3, 1.1e-3, 2.2e-3};
+
+// The integration test's A1 prefill anchor: the append-and-attend route over a cache whose K rows
+// were written by gqa_kv_append at the destination, judged against the FP64 oracle.
+//
+// kConformanceBf16 is calibrated for test_gqa_attention.cpp's key distribution (uniform in +-0.25).
+// This scenario draws its keys from the shared SCR fixture's N(0,1) distribution and prefill writes
+// 128 tokens per call, which together put the correct path at a measured 2.804e-03 -- 0.15% over
+// that criterion's 2.80e-03, deterministic across runs and with zero gross errors. A shape that
+// saturates the borrowed limit cannot absorb the one extra rounding the append route carries, so
+// the anchor needs its own profile while the shared BF16 criterion stays untouched for the callers
+// it was calibrated for. The gross thresholds carry over unchanged; only the L2 side moves.
+//
+// 3.2e-3 is the measured correct path plus ~14% of margin, and it keeps two orders of magnitude of
+// separation from the same check's negative control (5.6e-2), which is what makes the anchor still
+// able to tell a broken read from a near miss.
+constexpr Criterion kConformanceIntegrationA1Bf16{3.2e-3, 1.0e-3, 2.7e-3};
+
+// The multi-page A3 decode anchor over a BF16 page: the one-page shapes' anchor, widened to a run of
+// 192 tokens.
+//
+// The widening is what saturates the borrowed limit. The one-page shapes' anchor measured 2.752e-3
+// against kConformanceBf16's 2.80e-3; the same check over three destination pages measures 2.809e-3,
+// 0.32% over, deterministic across runs and with zero gross errors -- the extra pages add a rounding
+// the narrow run never carried, not a defect. A shape that saturates the borrowed limit cannot
+// absorb that, so this row gets its own profile while kConformanceBf16 stays untouched for the
+// callers it was calibrated for. The gross thresholds carry over unchanged; only the L2 side moves.
+//
+// 2.9e-3 is the measured correct path plus ~3.2% of margin, and it keeps an order of magnitude of
+// separation from the same check's negative control (5.7e-2), which is what makes the anchor still
+// able to tell a broken read from a near miss.
+constexpr Criterion kConformanceBf16MultiPage{2.9e-3, 1.0e-3, 2.7e-3};
+
 // The rotated int8 profile: the same cache with a per-64-group Hadamard interposed on K and V.
 //
 // This is not a rotation-shaped exemption. The A3 decode anchor of the delta test is a shape that
@@ -806,6 +853,51 @@ inline AttentionRun run_append_attention(Cache& cache, const std::vector<__nv_bf
     return AttentionRun{download_doubles(dout, q.size())};
 }
 
+// The INT8 A1 route: the append-and-attend prefill through the same public entry point the rotated
+// test uses. The batch view carries both planes and the frequency table, and ops::gqa_attention
+// forwards them into the prompt launcher it shares with the detail:: hook
+// (src/ops/wrapper/gqa_attention.cpp -> gqa_attention_prompt_launch). Going through the public route
+// makes this stronger than the BF16 prefill test, which enters at the detail:: hook: validation and
+// route resolution are exercised too. Width 128 with batch 1 resolves to GqaAttentionRoute::Prompt.
+//
+// The Op reads the cache through the view, so this takes the view alone: an Int8Cache parameter would
+// be unused, and the batch view is what carries the planes, the frequency table and the flags.
+inline AttentionRun run_prefill_attention_i8(const std::vector<__nv_bfloat16>& q,
+                                             const std::vector<__nv_bfloat16>& k,
+                                             const std::vector<__nv_bfloat16>& v,
+                                             std::int32_t first_position, std::int32_t tokens,
+                                             std::uint32_t visible,
+                                             const PagedKVBatchLayerView& batch_view) {
+    DeviceBuffer dq     = upload(q);
+    DeviceBuffer dk     = upload(k);
+    DeviceBuffer dv     = upload(v);
+    DeviceBuffer dtable = DeviceBuffer(sizeof(std::int32_t));
+    const std::int32_t table_row = 0;
+    dtable.copy_from_host(&table_row, sizeof(table_row));
+    DeviceBuffer dout = DeviceBuffer(q.size() * sizeof(__nv_bfloat16));
+    dout.fill(0);
+    DeviceBuffer dp = upload_positions(sequential_positions(first_position, tokens));
+
+    const ops::GqaExecutionEnvelope envelope{visible, visible};
+    const std::size_t workspace_bytes =
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, DType::I8, envelope, 1, tokens,
+                                                   tokens);
+    DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKvHeads, tokens});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKvHeads, tokens});
+    Tensor tp(dp.p, DType::I32, {tokens});
+    Tensor ttable(dtable.p, DType::I32, {1});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable, kAttentionScale, batch_view, envelope,
+                       workspace, tout, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    CUDA_CHECK(cudaGetLastError());
+    return AttentionRun{download_doubles(dout, q.size())};
+}
+
 // The attention core both FP64 oracles share, so the delta form cannot drift from the plain one:
 // the BF16 inputs are taken as exact and the dot products, stable softmax and value reduction all
 // run in FP64, per the numerical contract in gqa_attention.h. Keys are read from a
@@ -900,11 +992,17 @@ inline std::vector<double> ideal_attention(const std::vector<__nv_bfloat16>& q,
 // way it does when the reference is another cache.
 //
 // page_deltas is the view's rope_deltas plane, indexed by logical page, and is read per key -- the same
-// plane the kernel indexes for the K tiles it processes.
+// plane the kernel indexes for the K tiles it processes. page_ranges is the view's packed interval
+// plane: a page whose interval covers only part of it carries its delta for the keys inside that
+// interval alone, because the keys outside it never moved and a direct prefill would have written them
+// unrotated. That is the key-side form of the per-key frame choice the kernels make, so this oracle
+// and the kernels describe the same cache. An empty plane, or a page with no interval, means the
+// page's delta applies to the whole page -- the aligned case.
 template <typename CacheType>
 inline std::vector<double> ideal_attention_with_delta(
     const std::vector<__nv_bfloat16>& q, const CacheType& cache, std::int32_t first_position,
-    std::int32_t tokens, const std::vector<std::int32_t>& page_deltas, const FreqTable& freq) {
+    std::int32_t tokens, const std::vector<std::int32_t>& page_deltas,
+    const std::vector<std::uint32_t>& page_ranges, const FreqTable& freq) {
     const typename CacheType::HostImage img = cache.image();
     const std::int32_t max_position         = first_position + tokens - 1;
     std::vector<double> keys(static_cast<std::size_t>(kKvHeads) * (max_position + 1) * kHeadDim);
@@ -916,10 +1014,19 @@ inline std::vector<double> ideal_attention_with_delta(
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 stored[static_cast<std::size_t>(d)] = cache.k_logical(img, x, kv_head, d);
             }
-            // delta == 0 is the identity in this convention, so a page without a delta passes
+            const std::size_t page = static_cast<std::size_t>(x / kPageSize);
+            bool relocated         = true;
+            if (!page_ranges.empty()) {
+                const std::uint32_t range = page_ranges[page];
+                relocated                 = rope_delta_page_range_is_empty(range) ||
+                            (static_cast<std::uint32_t>(x % kPageSize) >=
+                                 rope_delta_page_range_begin(range) &&
+                             static_cast<std::uint32_t>(x % kPageSize) <
+                                 rope_delta_page_range_end(range));
+            }
+            // delta == 0 is the identity in this convention, so a key that did not move passes
             // through unchanged and needs no branch.
-            forward_rope(stored.data(), page_deltas[static_cast<std::size_t>(x / kPageSize)], freq,
-                         row);
+            forward_rope(stored.data(), relocated ? page_deltas[page] : 0, freq, row);
         }
     }
     return attention_against_key_plane(q, cache, img, keys, first_position, tokens);
@@ -931,6 +1038,13 @@ inline std::vector<double> ideal_attention_with_delta(
 // positions' rotation is not a near miss, so the two populations are orders of magnitude apart; the
 // negative control below measures that separation on the same data instead of assuming it.
 constexpr double kEquivalenceLimit = 2.0e-2;
+
+// Every suite varies something the other does not -- a codec variant, a scenario shape -- and a
+// failure that does not name the case it came from is the most expensive kind to read. `axes` is the
+// comma-separated list of the values that suite varies.
+inline std::string labelled(const std::string& what, const std::string& axes) {
+    return what + " [" + axes + "]";
+}
 
 // The delta-plane oracle test inherits the integration test's observed control separation. The
 // integration test observes ~300x separation with delta = -384 against the same reference. To keep the
@@ -1022,18 +1136,27 @@ inline bool expect_control_separates(const Error& correct, const Error& control,
 
 // The scenario: a 64-token run that prefill wrote at `src` must, after re-pointing the destination
 // logical page at the source's physical page, be what a direct prefill at `dst` would have written.
-constexpr std::int32_t kLogicalPages = 16;
 constexpr std::int32_t kSourcePage   = 9;
 constexpr std::int32_t kDestPage     = 3;
 constexpr std::int32_t kRelocatedRun = 64;
 constexpr std::int32_t kQueryTokens  = 16;
+// The fixture's cache is 16 pages. A scenario whose source position is further away than that needs
+// a bigger mapping, or the block table cannot name the page holding the surviving run, so the page
+// count travels with the scenario rather than being a global every check has to agree with.
+constexpr std::int32_t kLogicalPages = 16;
 // The queries sit at the end of the destination page, so every relocated key is visible.
 constexpr std::int32_t kQueryBase = kDestPage * kPageSize + kRelocatedRun - kQueryTokens;
 
 struct Scenario {
     std::vector<std::int32_t> table;
+    std::int32_t logical_pages        = kLogicalPages;
     std::int32_t src                  = kSourcePage * kPageSize;
     std::int32_t dst                  = kDestPage * kPageSize;
+    // Tokens in the relocated run. The one-page default leaves the destination a single page
+    // (aligned) or two partial pages (off-grid); a caller that wants whole destination pages
+    // *between* the two partial ends -- the shape a live edit of more than one page produces --
+    // passes a longer run.
+    std::int32_t run                  = kRelocatedRun;
     std::vector<__nv_bfloat16> raw_k; // pre-RoPE, [head][token][d]
     std::vector<__nv_bfloat16> k_src; // bf16(rope(raw, src + t))
     std::vector<__nv_bfloat16> k_dst; // bf16(rope(raw, dst + t))
@@ -1041,20 +1164,39 @@ struct Scenario {
     std::vector<__nv_bfloat16> q;
 };
 
-inline Scenario build_scenario(const FreqTable& freq) {
+// One builder for every scenario shape. The page count and both positions are arguments, and the
+// keys are drawn in a fixed order, so two callers that pass the same positions get the same bytes.
+// `src` may start off-grid -- the surviving run of an edit can begin partway through a page -- and
+// the destination offsets are what the fixture then compares against.
+inline Scenario build_scenario_at(const FreqTable& freq, std::int32_t logical_pages,
+                                  std::int32_t src, std::int32_t dst,
+                                  std::int32_t run = kRelocatedRun) {
     Scenario scenario;
+    scenario.logical_pages = logical_pages;
+    scenario.src           = src;
+    scenario.dst           = dst;
+    scenario.run           = run;
     // A non-identity permutation, so logical page N is not physical page N and the Op has to consult
-    // the block table.
-    scenario.table.resize(static_cast<std::size_t>(kLogicalPages));
-    for (std::int32_t i = 0; i < kLogicalPages; ++i) {
-        scenario.table[static_cast<std::size_t>(i)] = (i * 7 + 3) % kLogicalPages;
+    // the block table. 7 is coprime with every page count used here, so this stays a permutation.
+    scenario.table.resize(static_cast<std::size_t>(logical_pages));
+    for (std::int32_t i = 0; i < logical_pages; ++i) {
+        scenario.table[static_cast<std::size_t>(i)] = (i * 7 + 3) % logical_pages;
     }
-    // reassign_pages: the destination logical page now points at the surviving physical page.
-    scenario.table[static_cast<std::size_t>(kDestPage)] =
-        scenario.table[static_cast<std::size_t>(kSourcePage)];
+    // reassign_pages: every destination page the run covers is re-pointed at the source page
+    // holding the same slice of it. A run that starts off-grid continues on the next destination
+    // page, and a run longer than a page continues for as many pages as it spans. The caller
+    // passes a `src` and `dst` whose page offsets agree, so the two grids line up page for page
+    // and the re-pointing names the right source for every covered page.
+    const std::int32_t dst_page = dst / kPageSize;
+    const std::int32_t src_page = src / kPageSize;
+    const std::int32_t covered  = (dst % kPageSize + run + kPageSize - 1) / kPageSize;
+    for (std::int32_t i = 0; i < covered; ++i) {
+        scenario.table[static_cast<std::size_t>(dst_page + i)] =
+            scenario.table[static_cast<std::size_t>(src_page + i)];
+    }
 
     const std::size_t elems =
-        static_cast<std::size_t>(kHeadDim) * kKvHeads * static_cast<std::size_t>(kRelocatedRun);
+        static_cast<std::size_t>(kHeadDim) * kKvHeads * static_cast<std::size_t>(run);
     scenario.raw_k.resize(elems);
     scenario.k_src.resize(elems);
     scenario.k_dst.resize(elems);
@@ -1064,7 +1206,7 @@ inline Scenario build_scenario(const FreqTable& freq) {
     std::normal_distribution<double> normal(0.0, 1.0);
     std::array<double, kHeadDim> row{};
     std::array<double, kHeadDim> rotated{};
-    for (std::int32_t t = 0; t < kRelocatedRun; ++t) {
+    for (std::int32_t t = 0; t < run; ++t) {
         for (std::int32_t head = 0; head < kKvHeads; ++head) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 row[static_cast<std::size_t>(d)] = normal(rng);
@@ -1099,9 +1241,194 @@ inline Scenario build_scenario(const FreqTable& freq) {
     return scenario;
 }
 
+inline Scenario build_scenario(const FreqTable& freq) {
+    return build_scenario_at(freq, kLogicalPages, kSourcePage * kPageSize, kDestPage * kPageSize);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Large-delta scenarios.
+//
+// The two above move a run by six pages (delta -384). A live session published -3021 and -9340 on a
+// 330-page cache, and the counter-rotation is the one input whose magnitude changes the arithmetic:
+// the kernel computes sincosf(delta * inv_freq) in float, and pair 0's inv_freq is 1.0, so a delta
+// of 9340 is a rotation argument of 9340 radians -- a range the 384 case never reaches. The partial
+// page asks the same question from the other side: on a page holding a relocated interval plus
+// unrotated keys, the two frames are now thousands of tokens apart instead of a few hundred, and the
+// extra group-0 tile the interval reads must still be the one the keys were computed in.
+//
+// 160 logical pages is 10,240 addressable positions, enough to hold both deltas with the surviving
+// run inside the mapping, so the block table still names the page that really holds it.
+
+constexpr std::int32_t kLargeDeltaLogicalPages = 160;
+
+// A run covering whole destination pages, moved by `delta` tokens. Negative means the source sits
+// after the destination, which is what an edit that deletes text leaves behind.
+inline Scenario build_large_delta_scenario(const FreqTable& freq, std::int32_t delta) {
+    const std::int32_t dst = kDestPage * kPageSize;
+    return build_scenario_at(freq, kLargeDeltaLogicalPages, dst - delta, dst);
+}
+
+// The same move into an off-grid destination, so each end of the run falls inside a page.
+inline Scenario build_large_delta_unaligned_scenario(const FreqTable& freq, std::int32_t delta) {
+    const std::int32_t dst = kDestPage * kPageSize + 7;
+    return build_scenario_at(freq, kLargeDeltaLogicalPages, dst - delta, dst);
+}
+
 // A cache holding what a direct prefill at the destination would have written, reachable as a value.
 inline Cache make_reference_cache(const Scenario& scenario) {
-    Cache cache(kLogicalPages, scenario.table, kKvHeads);
-    append_chunk(cache, scenario.k_dst, scenario.v, scenario.dst, kRelocatedRun);
+    Cache cache(scenario.logical_pages, scenario.table, kKvHeads);
+    append_chunk(cache, scenario.k_dst, scenario.v, scenario.dst, scenario.run);
     return cache;
+}
+
+// ------------------------------------------------------------------------------------------------
+// The off-grid (partial-page) scenario and the two placers that build it. Shared, like the aligned
+// scenario above, so a change to the fixture moves every oracle test together.
+
+// The two planes a relocation publishes, in host form: the per-logical-page delta the kernel
+// counter-rotates Q by, and the packed interval each page's relocated run occupies.
+struct DeltaMetadata {
+    std::vector<std::int32_t> deltas;
+    std::vector<std::uint32_t> ranges;
+};
+
+inline DeltaMetadata make_delta_metadata(const Scenario& scenario) {
+    const RelocatedCopySpan span{static_cast<std::uint32_t>(scenario.src),
+                                 static_cast<std::uint32_t>(scenario.dst),
+                                 static_cast<std::uint32_t>(scenario.run)};
+    const auto mapping_pages = static_cast<std::size_t>(scenario.logical_pages);
+    const auto page_ranges   = plan_rope_delta_page_ranges(
+        std::span<const RelocatedCopySpan>(&span, 1), mapping_pages);
+    DeltaMetadata metadata{std::vector<std::int32_t>(scenario.logical_pages, 0),
+                           encode_rope_delta_page_ranges(
+                               std::span<const RelocatedCopySpan>(&span, 1), mapping_pages)};
+    for (std::size_t page = 0; page < page_ranges.size(); ++page) {
+        if (page_ranges[page].begin != page_ranges[page].end) {
+            metadata.deltas[page] = page_ranges[page].delta;
+        }
+    }
+    return metadata;
+}
+
+// The device layout of one cache page: [kv head][page offset][d], which is what
+// paged_kv_element_offset computes and what image() reads back as
+// [physical page][kv head][page offset][d]. The relocation below writes through this
+// layout so the destination physical page really holds the run, at the offsets the
+// delta plane describes.
+constexpr std::int64_t unaligned_cache_offset(std::int32_t physical_page, std::int32_t head,
+                                              std::int32_t page_offset, std::int32_t d) {
+    return static_cast<std::int64_t>(kHeadDim) * static_cast<std::int64_t>(kPageSize) *
+               (static_cast<std::int64_t>(head) +
+                static_cast<std::int64_t>(kKvHeads) * static_cast<std::int64_t>(physical_page)) +
+           static_cast<std::int64_t>(kHeadDim) * static_cast<std::int64_t>(page_offset) +
+           static_cast<std::int64_t>(d);
+}
+
+// A copied relocation whose destination starts mid-page. The run is a contiguous
+// kRelocatedRun-token span, so it occupies dst slots [dst & 63, 64) of the first
+// destination page and [0, tail) of the second -- exactly the intervals
+// plan_rope_delta_page_ranges publishes, and exactly the slots the copier fills.
+//
+// The source is off-grid by a *different* offset than the destination, which is the
+// case the whole-page delta plane cannot express: page 3 is partial because the run
+// starts at slot 7, and page 4 is partial because it ends at slot 6. The previous
+// construction of this scenario appended the run at the source positions and aliased
+// the destination pages to the source pages, which left the destination slots holding
+// whatever the source append happened to write there: the source run's own offset (13)
+// does not match the destination's (7), so destination slot 7 was never written by any
+// append and the fixture asked the kernels to read a key that does not exist. That is
+// a fixture defect, not a kernel one -- the host model of the intended semantics
+// reproduces the kernel's output bit for bit on it (3.1230e-01 both sides), and the
+// error collapses by 10x once the destination slots are written for real.
+//
+// What is written here is what production's copier writes: the run's K rows, rotated
+// at the source positions, placed in the destination pages at the destination offsets,
+// with V byte-identical to a direct prefill's.
+inline void place_unaligned_relocation(Cache& cache, const Scenario& scenario) {
+    const std::int32_t dst_page = scenario.dst / kPageSize;
+    const std::int32_t dst_slot = scenario.dst % kPageSize;
+    const std::size_t bytes     = static_cast<std::size_t>(kHeadDim) * sizeof(__nv_bfloat16);
+    // Walk the run token by token and resolve each token's destination page through the block table,
+    // so a run that spans any number of pages is placed on the pages the mapping actually names. The
+    // previous form handled a head page and one continuation; this handles every page the run
+    // crosses and reduces to the same bytes for the one-page run.
+    for (std::int32_t token = 0; token < scenario.run; ++token) {
+        const std::int32_t grid = dst_slot + token;
+        const std::int32_t page = dst_page + grid / kPageSize;
+        const std::int32_t slot = grid % kPageSize;
+        const std::int32_t phys = cache.table_host[static_cast<std::size_t>(page)];
+        for (std::int32_t head = 0; head < kKvHeads; ++head) {
+            const std::size_t src_index = act_index(head, token, kKvHeads, 0);
+            cache.k.copy_from_host(&scenario.k_src[src_index], bytes,
+                                   unaligned_cache_offset(phys, head, slot, 0) *
+                                       sizeof(__nv_bfloat16));
+            cache.v.copy_from_host(&scenario.v[src_index], bytes,
+                                   unaligned_cache_offset(phys, head, slot, 0) *
+                                       sizeof(__nv_bfloat16));
+        }
+    }
+}
+
+// The INT8 form of the same placement, and it is one append: the production fill path quantizes each
+// key row on its own, so writing the source-rotated rows at the *destination positions* produces
+// exactly the codes and scales a page copy would have moved there -- the destination pages hold codes
+// quantized from the source-phase keys at the destination slots, which is the image the delta plane
+// describes. It is also why the BF16 placer's byte-level copy has no INT8 counterpart to reuse: the
+// quantization is per row, so the placement and the quantized plane cannot disagree.
+inline void place_unaligned_relocation_i8(Int8Cache& cache, const Scenario& scenario) {
+    append_chunk(cache, scenario.k_src, scenario.v, scenario.dst, scenario.run);
+}
+
+// The off-grid variant of the scenario: both ends of the run fall inside a destination page, so each
+// destination page is partial. The block table stays re-pointed at the source pages, which is what
+// the fixture has always done, and the placers above write the run into those pages at the
+// destination offsets.
+inline Scenario build_unaligned_scenario(const FreqTable& freq) {
+    // Offsets 13 and 7 differ, which is the case the whole-page delta plane cannot express: page 3 is
+    // partial because the run starts at slot 7, page 4 because it ends at slot 6.
+    Scenario scenario = build_scenario_at(freq, kLogicalPages, kSourcePage * kPageSize + 13,
+                                         kDestPage * kPageSize + 7);
+    // This scenario's keys are rotated from the BF16-rounded raw rows rather than from the FP64 draws
+    // `build_scenario_at` keeps, because that is how this fixture was built before the two builders
+    // shared a body and its recorded numbers belong to that image. Re-deriving here keeps the bytes
+    // identical; `k_src` and `k_dst` move together, so the oracle and the kernel still read the same
+    // cache. Do not fold this back into `build_scenario_at` without re-recording every number this
+    // suite prints.
+    std::array<double, kHeadDim> raw{};
+    std::array<double, kHeadDim> rotated{};
+    for (std::int32_t token = 0; token < scenario.run; ++token) {
+        for (std::int32_t head = 0; head < kKvHeads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                raw[static_cast<std::size_t>(d)] =
+                    __bfloat162float(scenario.raw_k[act_index(head, token, kKvHeads, d)]);
+            }
+            forward_rope(raw.data(), scenario.src + token, freq, rotated.data());
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                scenario.k_src[act_index(head, token, kKvHeads, d)] =
+                    __float2bfloat16(static_cast<float>(rotated[static_cast<std::size_t>(d)]));
+            }
+            forward_rope(raw.data(), scenario.dst + token, freq, rotated.data());
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                scenario.k_dst[act_index(head, token, kKvHeads, d)] =
+                    __float2bfloat16(static_cast<float>(rotated[static_cast<std::size_t>(d)]));
+            }
+        }
+    }
+    return scenario;
+}
+
+// The shape a live edit of more than one page leaves: a run longer than a page, so its destination
+// pages are a partial head, one or more *whole* interior pages, and a partial tail. Both ends keep
+// the same token offset (8), which is what the source-shift detector produces -- the run slides by a
+// whole number of pages plus that offset -- so the interior pages are whole and only the two ends
+// are partial. The one-page off-grid scenario above never gives the kernel a whole relocated page
+// *between* two partial ones, so it cannot see the transitions this shape builds: partial -> whole
+// (base unrotated -> base at the delta) and whole -> partial (base back to unrotated while the
+// shifted rotary group is re-staged).
+inline Scenario build_unaligned_long_scenario(const FreqTable& freq) {
+    // 3 pages of run at offset 8: head page [8, 64), two whole pages, tail page [0, 8). `src` is
+    // `dst + 384`, the same -384 shift the aligned scenario uses, and lands at offset 8 as well, so
+    // the two grids line up page for page.
+    const std::int32_t dst = kDestPage * kPageSize + 8;
+    return build_scenario_at(freq, kLogicalPages, dst + 384, dst, 3 * kPageSize);
 }

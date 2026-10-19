@@ -230,6 +230,54 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 plan->disk_snapshot_path = disk_match->file_path;
             }
         }
+        // The longest leading run the resident sequence and this prompt still share. Every path above
+        // needs the prompt to reach a frontier the lane kept whole -- the exact one it stopped at, a
+        // turn checkpoint, or a snapshot -- so a prompt that diverges before that frontier matched none
+        // of them and took a cold prefill, even where the leading run was identical, resident, and
+        // already at the positions the prompt wants.
+        //
+        // Nothing downstream recovers that run. Both relocation selectors drop it: a leading span is
+        // "ordinary prefix reuse", which they hold the reuse base responsible for. With a zero base it
+        // was therefore neither reused nor relocated, and every token of it was re-prefilled -- on the
+        // e2e fixture, which deletes a middle region, 576 of a 990-token prompt.
+        //
+        // Deliberately after the paths above and before relocation: they reuse more whenever they
+        // apply, and this one only ever claims less than the ledger holds, so it cannot displace a
+        // longer hit. It sets the base the relocation block below plans against, which is the other
+        // half of the same gap: survivors past the shared run are still relocated at their new
+        // positions, and the run itself needs nothing done to it at all.
+        //
+        // DFlash is excluded for the reason relocation already excludes it: its continuation is
+        // carried on a frontier of its own and its cache is filled through `kv_cache_append_prefix`
+        // rather than the page table, so resuming below that frontier is a different problem. The
+        // identity check is what keeps a prompt whose token types, positions or Vision items changed
+        // inside the shared run off this path; a Vision item straddling its end declines here and keeps
+        // the cold prefill it would otherwise have had.
+        if (plan->reuse == ReusePath::FullReset && sequence.retained && sequence.kv &&
+            speculative_backend != SpeculativeBackend::DFlash) {
+            const std::uint32_t resident_kv = static_cast<std::uint32_t>(
+                std::min(sequence.ledger.size(), static_cast<std::size_t>(sequence.text_kv_valid)));
+            // The final prompt token is always prefilled, because prompt logits can only come from a
+            // real forward pass. A base at the prompt end would instead sample from the hidden state of
+            // the last token the resident sequence generated, which is a different position entirely.
+            // `size() - 1` would wrap to 0xFFFFFFFF on an empty prompt and ask the detector for a
+            // reuse base past every page. An empty prompt cannot reach this path today -- the
+            // frontend rejects one before a plan exists -- but this is the only place that turns a
+            // `size_t` length into the `uint32_t` base the rest of the plan uses, so spell the zero
+            // case out rather than leave a wrap standing in for it.
+            const std::uint32_t reusable =
+                prompt.token_ids.empty()
+                    ? 0u
+                    : static_cast<std::uint32_t>(prompt.token_ids.size() - 1ULL);
+            const std::uint32_t shared = qwen3_6::detail::longest_shared_prefix_tokens(
+                sequence.ledger, prompt.token_ids, resident_kv, reusable);
+            if (shared >= qwen3_6::detail::kPromptEditBlockTokens &&
+                qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                                shared)) {
+                plan->reuse      = ReusePath::AppendAtSharedPrefix;
+                plan->reuse_base = shared;
+            }
+        }
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -242,7 +290,16 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             (plan->reuse == ReusePath::RestoreTurnCheckpoint && decoder->mtp_cache() != nullptr &&
              sequence.mtp_kv_valid >= plan->reuse_base - 1) ||
             is_disk_restore;
-        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
+        // A shared-prefix resume consumes MTP rows the way it consumes Text ones: the rows below
+        // `reuse_base` are the resident rows, at the positions this prompt still wants, so only their
+        // extent has to be checked. `tail_hidden_valid` is deliberately not required here, unlike on
+        // the append path -- the prompt is longer than the base, so the first sample comes from the
+        // prefill and never from a retained hidden state.
+        const bool shared_prefix_ready =
+            plan->reuse == ReusePath::AppendAtSharedPrefix && decoder->mtp_cache() != nullptr &&
+            (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
+        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
+            !shared_prefix_ready) {
             plan->reuse              = ReusePath::FullReset;
             plan->reuse_base         = 0;
             plan->disk_snapshot_path.clear();
@@ -278,10 +335,20 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         base.vision_control == nullptr && sequence.retained && sequence.kv &&
         prompt.identity.reusable &&
         delta_path_supports_dtype(kv_dtype) &&
-        (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier)) {
-        const qwen3_6::detail::PromptEditDiff diff = qwen3_6::detail::diff_prompt_edit(
-            sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
-
+        (plan->reuse == ReusePath::FullReset || plan->reuse == ReusePath::AppendAtFrontier ||
+         plan->reuse == ReusePath::AppendAtSharedPrefix)) {
+        // A relocation whose source is off the page grid cannot be re-pointed at all, only copied, so
+        // both the detector and the selector/expressibility rules it feeds have to know which grid
+        // they are planning against. Off by default: with the flag unset this block is the code it was
+        // before the copying path existed, and the runtime's copied branch stays unreachable.
+        //
+        // The detector must match: the aligned detector only indexes 64-token block boundaries, so an
+        // off-grid edit (the shape of essentially every edit a user types) yields no surviving spans
+        // and every selector below plans nothing. With the copied path enabled the all-offset
+        // detector feeds both selectors: the re-pointing one keeps nothing it could re-point that is
+        // not already on the grid, the shifted one keeps the rest, and the aligned plan is
+        // byte-identical to the pre-copy code whenever an aligned survivor exists.
+        //
         // Selection rules live with the detector so they stay unit-testable on the host. `reuse_base`
         // is the prefix-reuse frontier, so a destination below it is already covered by ordinary
         // prefix reuse. Both modes produce spans; the prefilled ranges are then derived from the
@@ -289,68 +356,143 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // contiguous run, so the derivation reproduces exactly the head and tail that mode has
         // always reported; segmented mode may interleave survivors anywhere, which yields one range
         // per gap and is the only structural difference.
-        // A relocation whose source is off the page grid cannot be re-pointed at all, only copied, so
-        // both the selector below and the expressibility rule it is judged by have to know which grid
-        // they are planning against. Off by default: with the flag unset this block is the code it was
-        // before the copying path existed, and the runtime's copied branch stays unreachable.
+        //
+        // A shared-prefix resume reaches this block with the base it just claimed, so the run it
+        // covers is excluded from every span twice over -- by the selectors' "destination below the
+        // prefix frontier" rule and by the leading-span rule if the run starts at 0. That is the
+        // intent: those tokens are already reused, and a span over them would count them again and
+        // re-point pages that are already where the prompt wants them.
         const bool source_may_shift = qwen3_6::detail::scr_source_shift_enabled();
+        const qwen3_6::detail::PromptEditDiff diff =
+            source_may_shift
+                ? qwen3_6::detail::diff_prompt_edit_shifted(
+                      sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens)
+                : qwen3_6::detail::diff_prompt_edit(
+                      sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
+        const std::uint32_t prompt_tokens_count =
+            static_cast<std::uint32_t>(prompt.token_ids.size());
+
+        // One trace per request, filled by whichever selector runs. The two disagree about the shape
+        // they can express, not about what a refusal means, so the diagnostic below reads the same
+        // fields for either mode.
+        qwen3_6::detail::RelocationTrace trace;
         std::vector<RelocatedSpan> plan_spans;
         if (base.scr_mode == ninfer::ScrRelocationMode::Segmented) {
             plan_spans = qwen3_6::detail::plan_relocations(
-                diff, sequence.text_kv_valid, plan->reuse_base,
-                static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
-                base.suffix_reuse_max_spans);
+                diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
+                base.turn_rewrite_boundary, base.suffix_reuse_max_spans, &trace);
         } else {
-            qwen3_6::detail::TailRelocationTrace trace;
             const qwen3_6::detail::TailRelocationPlan tail = qwen3_6::detail::plan_tail_relocation(
-                diff, sequence.text_kv_valid, plan->reuse_base,
-                static_cast<std::uint32_t>(prompt.token_ids.size()), base.suffix_reuse_max_spans,
-                base.turn_rewrite_boundary, &trace);
-            if (scr_diagnostics_enabled() && !tail.viable) {
-                // A refusal the planner made silently is the hardest kind to diagnose: the suite
-                // reports the path it took, never the reason it declined, and a run can relocate one
-                // request out of twelve for reasons that look identical to not having tried.
-                std::ostringstream declined;
-                declined << "[scr-diag] declined prompt_tokens=" << trace.prompt_tokens
-                         << " reuse_base=" << trace.prefix_reuse_tokens
-                         << " resident_kv=" << trace.resident_kv_tokens
-                         << " max_spans=" << trace.max_spans
-                         << " limit=" << trace.limit
-                         << " boundary=" << (trace.boundary_supplied ? "yes" : "no")
-                         << " spans_seen=" << trace.spans_seen
-                         << " candidates=" << trace.candidates.size();
-                if (trace.early_exit != nullptr) { declined << " early_exit=" << trace.early_exit; }
-                if (trace.declined != nullptr) { declined << " declined=" << trace.declined; }
-                for (const auto& reject : trace.rejected) {
-                    declined << " reject{" << reject.reason << " old=[" << reject.old_begin << ","
-                             << reject.old_end << ") new_begin=" << reject.new_begin
-                             << " tokens=" << reject.tokens << "}";
-                }
-                std::cerr << declined.str() << '\n';
-                std::cerr.flush();
-            }
-            if (tail.viable) {
-                plan_spans = tail.spans;
-            } else if (source_may_shift) {
-                // The re-pointing selector declined, and with the copied path enabled that is not the
-                // end of the story: the survivors it dropped for being off the page grid are exactly
-                // what the source-shifting selector keeps, quantizing only their destinations. Asking
-                // it here rather than replacing the call above keeps the aligned plan -- and the
-                // hardware-verified re-pointing path behind it -- byte-identical when it exists.
-                plan_spans = qwen3_6::detail::plan_shifted_relocations(
-                    diff, sequence.text_kv_valid, plan->reuse_base,
-                    static_cast<std::uint32_t>(prompt.token_ids.size()), base.turn_rewrite_boundary,
-                    base.suffix_reuse_max_spans);
-            }
+                diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
+                base.suffix_reuse_max_spans, base.turn_rewrite_boundary, &trace);
+            if (tail.viable) { plan_spans = tail.spans; }
         }
+        const std::size_t selector_spans = plan_spans.size();
+
+        // The copied path, when the mode's selector expressed nothing. Every dtype that reaches here
+        // reads the packed boundary range -- the attention kernels that consume it choose the query
+        // frame for the keys inside a page's interval per key -- so the exact destination interval is
+        // expressible even when a whole-page quantization of it is not. Both modes need this, and for
+        // the same reason: with `NINFER_SCR_SOURCE_SHIFT` the detector reports survivors whose
+        // destinations are off the page grid, which is the shape neither re-pointing selector can
+        // express on its own. The fallback runs before the trim below so the plan it recovers is
+        // trimmed with everything else: a plan that skips the trim hands the second token-predicting
+        // layer a row paired with a token the edit replaced, which is what the trim exists to fix.
+        const bool used_fallback = plan_spans.empty() && source_may_shift;
+        if (used_fallback) {
+            plan_spans = qwen3_6::detail::plan_shifted_relocations(
+                diff, sequence.text_kv_valid, plan->reuse_base, prompt_tokens_count,
+                base.turn_rewrite_boundary, base.suffix_reuse_max_spans,
+                /*destination_may_shift=*/true);
+        }
+        const std::size_t fallback_spans = plan_spans.size();
+
+        // The layer that predicts more than one token reads the same moved cache with a stem that
+        // pairs row p with token p + 1, so a run ending where the prompts diverge leaves its last
+        // row paired with a token the edit replaced. Forwarding each run's last block moves that
+        // end back into text the two prompts share, and the prefill then writes the row from a
+        // token the new prompt actually has. The cost is one block of reuse per run, paid only when
+        // that second token-predicting layer will read the cache.
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            qwen3_6::detail::trim_relocated_run_tails(plan_spans,
+                                                      qwen3_6::detail::kPromptEditBlockTokens);
+        }
+        const std::size_t trimmed_spans = plan_spans.size();
 
         // The prefilled ranges, derived from the spans rather than carried next to them: one source
         // for both modes, and the tiling with the spans is what makes the accounting below honest.
-        const std::uint32_t prompt_tokens_count =
-            static_cast<std::uint32_t>(prompt.token_ids.size());
         std::vector<qwen3_6::detail::PrefillRange> plan_ranges =
             qwen3_6::detail::relocation_prefill_ranges(plan_spans, plan->reuse_base,
                                                        prompt_tokens_count);
+
+        // A plan the runtime cannot execute is refused rather than half-applied, and the refusal is
+        // printed whether or not diagnostics are enabled: reaching it means a selector produced spans
+        // the runtime cannot execute, and a silent refusal would hide it while still reporting
+        // cold-prefill reuse. The rule that refused it is named and the spans and ranges that failed
+        // it are dumped, because the counts alone cannot say whether a selector over-produced or the
+        // prompt is past what a per-page delta can express. Both selectors now enforce the destination
+        // rules themselves, so this is a tripwire rather than a control-flow branch.
+        const char* refused = nullptr;
+        if (!plan_spans.empty()) {
+            refused = qwen3_6::detail::relocation_refusal(plan_spans, plan_ranges, plan->reuse_base,
+                                                          prompt_tokens_count, source_may_shift);
+            if (refused != nullptr) {
+                std::ostringstream refusal;
+                refusal << "[scr] refused an inexpressible relocation plan: refused=" << refused
+                        << " reuse_base=" << plan->reuse_base
+                        << " prompt_tokens=" << prompt_tokens_count;
+                for (const RelocatedSpan& span : plan_spans) {
+                    refusal << " span{src=" << span.source_begin << " dst=" << span.dest_begin
+                            << " tokens=" << span.tokens << "}";
+                }
+                for (const qwen3_6::detail::PrefillRange& range : plan_ranges) {
+                    refusal << " range[" << range.begin << "," << range.end << ")";
+                }
+                std::cerr << refusal.str() << '\n';
+                std::cerr.flush();
+                plan_spans.clear();
+                plan_ranges.clear();
+            }
+        }
+
+        std::uint32_t relocated_tokens = 0;
+        for (const RelocatedSpan& span : plan_spans) { relocated_tokens += span.tokens; }
+
+        // One line per request, for both modes, after the trim and the expressibility check: what the
+        // detector fed the selector, what the selector kept, what the copied path recovered, and what
+        // was thrown away and why. Counts alone could not tell a selector that declined from one the
+        // detector never fed, and segmented had no reason channel at all, so a refused or degraded
+        // plan was invisible. Printed only under NINFER_SCR_DIAG.
+        if (scr_diagnostics_enabled()) {
+            std::ostringstream plan_line;
+            plan_line << "[scr-diag] plan mode="
+                      << (base.scr_mode == ninfer::ScrRelocationMode::Segmented ? "segmented"
+                                                                                : "tail")
+                      << " shift=" << (source_may_shift ? "on" : "off")
+                      << " prompt_tokens=" << trace.prompt_tokens
+                      << " reuse_base=" << trace.prefix_reuse_tokens
+                      << " resident_kv=" << trace.resident_kv_tokens
+                      << " max_spans=" << trace.max_spans
+                      << " limit=" << trace.limit
+                      << " boundary=" << (trace.boundary_supplied ? "yes" : "no")
+                      << " spans_seen=" << trace.spans_seen
+                      << " candidates=" << trace.candidates.size()
+                      << " selector=" << selector_spans
+                      << " fallback=" << (used_fallback ? std::to_string(fallback_spans) : "no")
+                      << " after_trim=" << trimmed_spans
+                      << " expressible=" << (refused == nullptr ? "yes" : "no")
+                      << " final=" << plan_spans.size() << " relocated=" << relocated_tokens;
+            if (trace.early_exit != nullptr) { plan_line << " early_exit=" << trace.early_exit; }
+            if (trace.declined != nullptr) { plan_line << " declined=" << trace.declined; }
+            for (const auto& reject : trace.rejected) {
+                plan_line << " reject{" << reject.reason << " old=[" << reject.old_begin << ","
+                          << reject.old_end << ") new_begin=" << reject.new_begin
+                          << " tokens=" << reject.tokens << "}";
+            }
+            std::cerr << plan_line.str() << '\n';
+            std::cerr.flush();
+        }
+
         if (!plan_spans.empty()) {
             // Overwriting `reuse` with SuffixRelocation here is what makes the MTP coupling the final
             // block's job rather than this block's: that block keys off the reuse path, and
@@ -358,28 +500,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // for the staged MTP prefill itself -- `prepare_mtp` is set further down, after the
             // turn-checkpoint decision, which may still downgrade this plan to a plain FullReset. The
             // assertion that the staged MTP prefill exists therefore lives after that block.
-            //
-            // A plan that is not expressible is refused rather than half-applied, and the refusal is
-            // printed whether or not diagnostics are enabled: reaching it means a selector produced
-            // spans the runtime cannot execute, which is a programming error rather than a prompt
-            // shape, and a silent fallback would hide it while still reporting cold-prefill reuse.
-            if (!qwen3_6::detail::relocation_is_expressible(plan_spans, plan_ranges, plan->reuse_base,
-                                                            prompt_tokens_count, source_may_shift)) {
-                std::cerr << "[scr] refused an inexpressible relocation plan: spans="
-                          << plan_spans.size() << " ranges=" << plan_ranges.size()
-                          << " reuse_base=" << plan->reuse_base
-                          << " prompt_tokens=" << prompt_tokens_count << '\n';
-                plan_spans.clear();
-                plan_ranges.clear();
-            }
-        }
-        if (!plan_spans.empty()) {
-            std::uint64_t relocated = 0;
-            for (const RelocatedSpan& span : plan_spans) { relocated += span.tokens; }
             plan->reuse                           = ReusePath::SuffixRelocation;
             plan->relocated_prefill_ranges        = std::move(plan_ranges);
             plan->relocated_spans                 = std::move(plan_spans);
-            plan->summary.relocated_prompt_tokens = static_cast<std::uint32_t>(relocated);
+            plan->summary.relocated_prompt_tokens = relocated_tokens;
         }
     }
 
@@ -428,25 +552,44 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                    plan->reuse == ReusePath::RestoreDiskCheckpoint) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix;
+        } else if (plan->reuse == ReusePath::AppendAtSharedPrefix) {
+            // The bridge reads a hidden the lane kept, and a lane keeps exactly one, at the previous
+            // sequence's *last* position -- which is `base - 1` only when the prompt reaches the
+            // frontier. This path exists for the case where it does not, so there is no hidden to
+            // read and the row at `base - 1` has to be produced instead: forward that one token over
+            // the resident prefix and write the row from the result.
+            plan->prepare_mtp = true;
+            plan->mtp_bridge  = qwen3_6::detail::mtp_frontier_forward_applies(
+                                   plan->reuse_base, plan->summary.prompt_tokens,
+                                   base.vision_control != nullptr)
+                                    ? MtpBridgeMode::FrontierForward
+                                    : MtpBridgeMode::None;
         } else if (plan->reuse == ReusePath::SuffixRelocation) {
             // The relocated run's MTP rows are re-pointed alongside Text's, so only the two prefilled
             // ranges need staging, and the walk's `prepare_mtp` places them on the same pages the
             // Text remap chose.
             //
-            // No bridge, deliberately. The bridge writes the MTP row at the frontier from the base
-            // model's hidden state at `base - 1`, and a mid-prompt edit's frontier is a position the
-            // lane never retained: the one hidden state kept per lane, `sequence.tail_hidden`, is
-            // the previous sequence's *last* position, which is `base - 1` only for the
-            // AppendAtFrontier path. The MTP stem pairs row p with token p+1
-            // (`plan_mtp_alignment_window`: `shifted_embedding_begin = chunk_begin + 1`), so the two
-            // rows the edit moves -- the row at `base - 1` and the last row of the relocated run,
-            // each paired with a pre-edit token -- stay as the relocation left them. That costs
-            // draft quality at those positions and nothing else: drafts are verified against the
-            // base model, so a mist-paired row can lose a draft but never become a wrong accepted
-            // token. Recovering the true hidden is the open design question for this path; it is
-            // recorded here so the omission reads as a decision rather than an oversight.
+            // The MTP stem pairs row p with token p+1 (`plan_mtp_alignment_window`:
+            // `shifted_embedding_begin = chunk_begin + 1`), so a row left where the prompts diverge
+            // stays paired with a token the edit replaced. Two rows are exposed to that: the row at
+            // `base - 1`, and each moved run's last row.
+            //
+            // The moved run's last row is closed by the trim above: giving each run's last block back
+            // to the prefill moves its end into text both prompts share, so the prefill writes that
+            // row from a token the new prompt actually has.
+            //
+            // The row at `base - 1` has no stored hidden behind it -- `sequence.tail_hidden` is the
+            // previous sequence's *last* position, not this one -- so the runtime produces the hidden
+            // by forwarding that one token (`FrontierForward`). The forward reads the resident prefix
+            // and writes that position's Text KV in passing, which is saved and restored around it, so
+            // the reused prefix is left as the relocation found it. It does advance the recurrent
+            // summary by the one token; the caller's comment records why that is left alone.
             plan->prepare_mtp = true;
-            plan->mtp_bridge  = MtpBridgeMode::None;
+            plan->mtp_bridge  = qwen3_6::detail::mtp_frontier_forward_applies(
+                                   plan->reuse_base, plan->summary.prompt_tokens,
+                                   base.vision_control != nullptr)
+                                    ? MtpBridgeMode::FrontierForward
+                                    : MtpBridgeMode::None;
         }
     }
     // The coupling, asserted where it can hold: the block above is what stages the MTP prefill, so a

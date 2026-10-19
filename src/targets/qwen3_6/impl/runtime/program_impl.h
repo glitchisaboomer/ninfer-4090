@@ -529,11 +529,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
             // The control leg of the diagnostic. `ordered_reset` zeroes the GDN slot here too, so
-            // without this line the trace only ever shows the relocated path's stages and there is
-            // nothing to read a "stale recurrent state" against -- the run that is supposed to be
-            // the reference cannot be observed.
+            // this is the only stage that reads a cold-start state; without it the trace only ever
+            // shows the `fork` and `post_prefill` stages of a retained state, and there is nothing
+            // to read their magnitude against.
             if (scr_diagnostics_enabled()) {
-                log_scr_gdn_state("full_reset", true, std::nullopt, LinearAttentionStateFingerprint{},
+                log_scr_gdn_state("full_reset", true, LinearAttentionStateFingerprint{},
                                   decoder->linear_attention.fingerprint_slot(
                                       LinearStateSlots::current_state_slot(sequence.lane,
                                                                            max_concurrency),
@@ -762,7 +762,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 set_device_i32(io.rope_delta, sequence.rope_delta);
             }
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier ||
-                   request_plan.reuse == ReusePath::SuffixRelocation) {
+                   request_plan.reuse == ReusePath::SuffixRelocation ||
+                   request_plan.reuse == ReusePath::AppendAtSharedPrefix) {
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
@@ -837,27 +838,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // That helper is host-tested (tests/test_paged_kv_delta_layout.cpp) and lives in a
                 // CUDA-free header; re-deriving the same subtraction here would let the two drift,
                 // and the drift would surface as a silently wrong shift rather than as a failure.
+                //
+                // Only the re-pointing route needs it built here. The copied route's planes are
+                // derived by the allocation from `copy_ranges`, the ranges planned once below, so
+                // the shift plane it publishes is the one the plan priced rather than a second
+                // derivation that could disagree with the interval plane.
                 std::vector<std::int32_t> deltas(remap.size(), kRopeDeltaNone);
+                std::vector<RopeDeltaPageRange> copy_ranges;
                 if (copying) {
-                    // Destination coordinates, because the plane is indexed by logical page and a
-                    // copied source may start anywhere inside one: a page is inside the span when its
-                    // *destination* range says so. The shift is the same number either way -- it is
-                    // the span's own move -- but a source page index would name the wrong tokens, and
-                    // `rope_delta_for_dest_page` is the containment test on the grid that exists.
-                    for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
-                        for (std::uint32_t offset = 0; offset < span.tokens;
-                             offset += kPagedKVPageSize) {
-                            const std::int32_t dest_page = static_cast<std::int32_t>(
-                                (span.dest_begin + offset) / kPagedKVPageSize);
-                            if (dest_page < 0 ||
-                                static_cast<std::size_t>(dest_page) >= deltas.size()) {
-                                throw std::logic_error(
-                                    "relocated span destination page is outside the mapping");
-                            }
-                            deltas[static_cast<std::size_t>(dest_page)] = rope_delta_for_dest_page(
-                                span.source_begin, span.dest_begin, span.tokens, dest_page);
-                        }
-                    }
+                    copy_ranges = plan_rope_delta_page_ranges(copy_spans, remap.size());
                 } else {
                     for (const qwen3_6::detail::RelocatedSpan& span : request_plan.relocated_spans) {
                         // Spans are page-aligned by construction: `diff_prompt_edit` hashes whole
@@ -930,8 +919,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // own check then refuses after the plan was reported as reuse.
                 std::vector<std::uint32_t> relocation_source_pages;
                 if (copying) {
-                    const std::vector<RelocatedPageMove> moves =
-                        plan_relocated_page_moves(copy_spans, remap.size());
+                    // The sources are logical pages of the mapping that stands now and the
+                    // destinations logical pages of the one being published, and those two are
+                    // different lengths whenever the edit resized the prompt: a deleted region leaves
+                    // the new prompt needing fewer pages than the resident one holds, while the
+                    // surviving run still reads the pages above the new mapping's end. Bounding the
+                    // sources by the destination's count refused exactly that, naming a source that
+                    // never left its own mapping -- and it refused it here, before the pool was
+                    // priced, so the request failed on an edit the copied path exists to serve. The
+                    // allocation's own relocate reads the same two counts the same way; these pages
+                    // are released after the copy, not before.
+                    const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(
+                        copy_spans,
+                        RelocatedPageCounts{.source      = sequence.kv->text.page_ids().size(),
+                                            .destination = remap.size()});
                     relocation_source_pages.reserve(moves.size());
                     for (const RelocatedPageMove& move : moves) {
                         relocation_source_pages.push_back(
@@ -969,10 +970,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     // in the same pass as before. `relocate_copied_pages` drains the stream before it
                     // releases the pages it read, so a page handed to the pool is not still being
                     // copied from when another lane's prefill takes it.
-                    sequence.kv->text.relocate_copied_pages(remap, deltas, copy_spans, device.stream);
+                    sequence.kv->text.relocate_copied_pages(remap, copy_ranges, copy_spans,
+                                                            device.stream);
                     if (!backend_remap.empty()) {
-                        sequence.kv->backend->relocate_copied_pages(backend_remap, deltas, copy_spans,
-                                                                    device.stream);
+                        sequence.kv->backend->relocate_copied_pages(backend_remap, copy_ranges,
+                                                                    copy_spans, device.stream);
                     }
                 } else {
                     sequence.kv->text.reassign_pages(remap, deltas, device.stream);
@@ -981,14 +983,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     }
                 }
                 suffix_prefill_ranges.clear();
-                // Diagnostic only: fingerprint the GDN slot across the invalidation below so the
-                // trace says whether the zero ran, not merely that the code path was reached.
-                LinearAttentionStateFingerprint gdn_before;
-                if (scr_diagnostics_enabled()) {
-                    gdn_before = decoder->linear_attention.fingerprint_slot(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                        device.stream);
-                }
                 // Every range the plan reports, in prompt order, with the relocated runs as the gaps
                 // between them. One range is the ordinary contiguous shape; more than one is what
                 // interleaved survivors produce, and the staged walk consumes either without change
@@ -998,35 +992,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     suffix_prefill_ranges.push_back(range);
                 }
                 // The linear-attention layers keep one fixed-size recurrent state for the whole
-                // sequence rather than a per-token cache, so there is nothing to relocate and
-                // nothing to re-rotate. The state left over from the previous prompt was
-                // summarised over the *old* token sequence, including the region this edit just
-                // deleted, so leaving it in place has 48 of 64 layers asserting that content the
-                // prompt no longer contains. That is a contradiction rather than an
-                // approximation, and it is what made the relocated run emit degenerate output.
+                // sequence rather than a per-token cache, so there is nothing to relocate and no
+                // RoPE to undo: the relocated run is simply not forwarded. The state is kept, not
+                // rebuilt -- the authors' design "snapshots the recurrent state before the edit and
+                // continues from that snapshot", and their reference implements it as
+                // `KVREUSE_SSM_MODE=fork` (its default): "restore the state saved at the end of the
+                // previous prompt". The resident state is exactly that snapshot, and only the ranges
+                // pushed above advance it.
                 //
-                // Zeroing is sufficient and needs no snapshot. The ranges pushed just above are
-                // prefilled from this point on, and feeding the new content into a zeroed
-                // recurrence yields exactly the state a cold prefill of it would produce, which is
-                // what the paper's "snapshot the recurrent state before the edit" recovers. The
-                // relocated run then contributes nothing to these layers, which is the
-                // approximation the paper describes and measures as robust.
-                //
-                // Only when the first relocated destination does not start at the frontier, which
-                // is exactly when a range exists between the frontier and it to rebuild from. When
-                // the first survivor starts at the frontier, the resident prompt is a strict
-                // prefix of the new one, nothing was deleted ahead of the run, and the existing
-                // state is already a valid state for the reused prefix.
-                const bool rebuild_linear_state =
-                    request_plan.relocated_spans.front().dest_begin > base;
-                if (rebuild_linear_state) {
-                    decoder->linear_attention.zero_slot(
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                        device.stream);
-                }
+                // Zeroing instead drops the whole reused prefix's contribution from 48 of 64 layers,
+                // an approximation far wider than the one SCR bounds with K. The reset that used to
+                // run here was added for degenerate output whose own later fix attributed the symptom
+                // to the prefill's base position, not this state, so it never had to drop the prefix.
                 if (scr_diagnostics_enabled()) {
-                    log_scr_gdn_state("invalidate", rebuild_linear_state, !rebuild_linear_state,
-                                      gdn_before,
+                    log_scr_gdn_state("fork", false, LinearAttentionStateFingerprint{},
                                       decoder->linear_attention.fingerprint_slot(
                                           LinearStateSlots::current_state_slot(sequence.lane,
                                                                                max_concurrency),
@@ -1035,6 +1014,21 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
             } else {
                 trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+                // A shared-prefix resume keeps the resident KV below `base` and the recurrent state
+                // the previous prompt summarised. That state covers a frontier above `base` and so
+                // records the region the edit replaced -- which is precisely the pre-edit snapshot
+                // the authors' design continues from (`KVREUSE_SSM_MODE=fork`). It is kept, and the
+                // prompt's new ranges below advance it, for the same reason the relocation branch
+                // keeps it: dropping it would discard the reused prefix's contribution from 48 of 64
+                // layers, far wider than the approximation SCR accepts and bounds with K.
+                if (scr_diagnostics_enabled()) {
+                    log_scr_gdn_state("fork", false, LinearAttentionStateFingerprint{},
+                                      decoder->linear_attention.fingerprint_slot(
+                                          LinearStateSlots::current_state_slot(sequence.lane,
+                                                                               max_concurrency),
+                                          device.stream),
+                                      device.stream);
+                }
             }
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
@@ -1641,65 +1635,129 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
     return decoder->text_kv.execution_view(sequence.kv->text);
 }
 
+// The KV probe's decoding and row geometry, shared by both fingerprint functions and by the
+// `k_plane0` summary. None of it may assume a float plane.
+namespace {
+
+// One element of a KV plane as a float, decoded by the plane's own dtype.
+//
+// The dtype branch is not cosmetic. A BF16 plane stores a truncated FP32 and decodes as a shift; an
+// int8 plane stores one code per byte; and a packed plane (`rk4v4`, `rk4v4-e8`, `rk2v4-e8`) stores two
+// to four quantization codes per byte with every scale in a separate FP16 plane. Decoding packed codes
+// as BF16 does not read K, it reads the code bytes: `0x7F7F` becomes `FLT_MAX` and `0x7F2A` becomes a
+// NaN. That is exactly what a run with `--kv-dtype rk4v4-e8` reported before this branch existed --
+// 47143 "non-finite" words, a `[-3.38953e+38, 3.38953e+38]` range made of nothing but bit patterns,
+// and every relocated page marked changed because a fabricated NaN never equals itself.
+[[nodiscard]] float scr_plane_value(const void* plane, std::size_t index, DType dtype) {
+    switch (dtype) {
+        case DType::BF16: {
+            const std::uint32_t bits =
+                static_cast<std::uint32_t>(static_cast<const std::uint16_t*>(plane)[index]) << 16;
+            float value = 0.0F;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        }
+        case DType::FP32:
+            return static_cast<const float*>(plane)[index];
+        case DType::U8:
+            return static_cast<float>(static_cast<const std::uint8_t*>(plane)[index]);
+        case DType::I8:
+            return static_cast<float>(static_cast<const std::int8_t*>(plane)[index]);
+        default:
+            // No other dtype reaches a K/V plane today (`k_plane_dtype` is BF16, I8 or U8). For an
+            // unexpected one, report the raw element rather than inventing a float decode, so the
+            // fingerprints stay byte-exact even where their magnitudes are not activation-like.
+            return static_cast<float>(
+                static_cast<const std::uint8_t*>(plane)[index * dtype_size(dtype)]);
+    }
+}
+
+[[nodiscard]] float scr_plane_magnitude(const void* plane, std::size_t index, DType dtype) {
+    return std::fabs(scr_plane_value(plane, index, dtype));
+}
+
+// Element count of one (kv_head, page_offset) row, read from the plane's shape rather than from
+// `head_dim`: a packed plane holds `head_dim/2` codes per token, i.e. `head_dim/4` elements of a
+// 16-bit read, so dividing the element index by `head_dim` folded four tokens into one printed row
+// and shifted the reported `kv_head` -- the `of 256` count and the `pos=` labels drifting.
+// Zero means the page does not divide into `rows` even rows and the caller must bail rather than
+// mislabel.
+[[nodiscard]] std::size_t scr_row_elements(const PagedKVLayerView& layer, std::size_t page_stride,
+                                          std::size_t rows) {
+    const std::size_t element_size = dtype_size(layer.k_pages.dtype);
+    if (rows == 0 || element_size == 0 || page_stride % (rows * element_size) != 0) { return 0; }
+    return page_stride / (rows * element_size);
+}
+
+[[nodiscard]] const char* scr_dtype_name(DType dtype) {
+    switch (dtype) {
+        case DType::BF16: return "bf16";
+        case DType::FP32: return "f32";
+        case DType::FP16: return "f16";
+        case DType::U8: return "u8";
+        case DType::I8: return "i8";
+        case DType::I32: return "i32";
+        case DType::I64: return "i64";
+    }
+    return "unknown";
+}
+
+} // namespace
+
 // Suffix-relocation diagnostics. Off unless scr_diagnostics_enabled(), so it costs nothing in
 // production. Writes to stderr, which the e2e script folds into the server log.
-// A KV plane is BF16, and BF16 is exactly the top 16 bits of an FP32, so decoding is a shift. The
-// page stride comes from nb[3] rather than a computed element count, so this stays correct for any
-// plane dtype.
+// The page stride comes from nb[3] and the element size from the plane's dtype, so a page is read as
+// what it is: `head_dim` BF16 per head for an uncompressed plane, `head_dim/2` packed codes per head
+// for `rk4v4-e8`. Nothing here assumes a float plane.
 float ProgramImplCore::scr_page_fingerprint(const PagedKVLayerView& layer,
                                              std::int32_t physical_page,
                                              cudaStream_t stream) const {
     if (physical_page < 0 || physical_page >= layer.k_pages.ne[3]) { return -1.0F; }
-    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
-    const std::size_t elements    = page_stride / sizeof(std::uint16_t);
-    std::vector<std::uint16_t> host(elements);
+    const std::size_t page_stride  = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t element_size = dtype_size(layer.k_pages.dtype);
+    if (element_size == 0 || page_stride % element_size != 0) { return -1.0F; }
+    const std::size_t elements = page_stride / element_size;
+    std::vector<std::uint8_t> host(page_stride);
     // Enqueued on the launching stream and then drained, so the read cannot precede the writes it
     // is meant to observe.
     CUDA_CHECK(cudaMemcpyAsync(host.data(),
                                static_cast<const char*>(layer.k_pages.data) +
                                    static_cast<std::size_t>(physical_page) * page_stride,
-                               host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
-                               stream));
+                               page_stride, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     float total = 0.0F;
-    for (const std::uint16_t word : host) {
-        std::uint32_t bits = static_cast<std::uint32_t>(word) << 16;
-        float value        = 0.0F;
-        std::memcpy(&value, &bits, sizeof(value));
-        total += std::fabs(value);
+    for (std::size_t i = 0; i < elements; ++i) {
+        total += scr_plane_magnitude(host.data(), i, layer.k_pages.dtype);
     }
     return total;
 }
 
+// sum|x| per (kv_head, page_offset) row of one physical page, with the row width taken from the plane
+// so the printed `kv_head`/`pos` name the row the bytes actually came from.
 std::vector<float> ProgramImplCore::scr_page_row_fingerprints(const PagedKVLayerView& layer,
                                                               std::int32_t physical_page,
                                                               cudaStream_t stream) const {
-    // The plane is page-major, then kv_head, then page_offset, then head_dim, so the page-relative
-    // element index divided by head_dim names the row directly.
     const std::size_t rows =
         static_cast<std::size_t>(layer.num_kv_heads) * kPagedKVPageSize;
     std::vector<float> totals(rows, 0.0F);
     if (physical_page < 0 || physical_page >= layer.k_pages.ne[3]) { return totals; }
 
-    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
-    const std::size_t elements    = page_stride / sizeof(std::uint16_t);
-    const std::size_t head_dim    = static_cast<std::size_t>(layer.head_dim);
-    if (head_dim == 0) { return totals; }
-    std::vector<std::uint16_t> host(elements);
+    const std::size_t page_stride  = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t row_elements = scr_row_elements(layer, page_stride, rows);
+    if (row_elements == 0) { return totals; }
+    std::vector<std::uint8_t> host(page_stride);
     // Enqueued on the launching stream and then drained, so the read cannot precede the writes it
     // is meant to observe.
     CUDA_CHECK(cudaMemcpyAsync(host.data(),
                                static_cast<const char*>(layer.k_pages.data) +
                                    static_cast<std::size_t>(physical_page) * page_stride,
-                               host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
-                               stream));
+                               page_stride, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    for (std::size_t i = 0; i < elements; ++i) {
-        std::uint32_t bits = static_cast<std::uint32_t>(host[i]) << 16;
-        float value        = 0.0F;
-        std::memcpy(&value, &bits, sizeof(value));
-        const std::size_t row = i / head_dim;
-        if (row < totals.size()) { totals[row] += std::fabs(value); }
+    for (std::size_t row = 0; row < rows; ++row) {
+        const std::size_t base = row * row_elements;
+        for (std::size_t i = 0; i < row_elements; ++i) {
+            totals[row] += scr_plane_magnitude(host.data(), base + i, layer.k_pages.dtype);
+        }
     }
     return totals;
 }
@@ -1771,18 +1829,22 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
     // show up here rather than as an unexplained downstream symptom.
     // Read exactly the plane's own bytes. This previously read numel * 4 from a BF16 plane, twice
     // the allocation, so the reported range and non-finite count described memory past the plane.
-    const std::size_t plane_bytes = static_cast<std::size_t>(layer.k_pages.bytes());
-    std::vector<std::uint16_t> host(plane_bytes / sizeof(std::uint16_t));
+    // The elements are decoded by the plane's dtype and labelled with it, because a packed plane's
+    // range is a range of quantization codes -- "finite" there is a property of the dtype, not a
+    // check of the data, and calling `head_dim`-wide BF16 words out of `head_dim/2` code bytes is
+    // what manufactured NaN and `FLT_MAX` in the first place.
+    const std::size_t plane_bytes    = static_cast<std::size_t>(layer.k_pages.bytes());
+    const std::size_t element_size   = dtype_size(layer.k_pages.dtype);
+    const std::size_t plane_elements = element_size == 0 ? 0 : plane_bytes / element_size;
+    std::vector<std::uint8_t> host(plane_bytes);
     CUDA_CHECK(cudaMemcpy(host.data(), layer.k_pages.data, plane_bytes, cudaMemcpyDeviceToHost));
     std::size_t non_finite = 0;
     std::size_t first_bad  = 0;
     float lo               = 0.0F;
     float hi               = 0.0F;
     bool seeded            = false;
-    for (std::size_t i = 0; i < host.size(); ++i) {
-        std::uint32_t bits = static_cast<std::uint32_t>(host[i]) << 16;
-        float value        = 0.0F;
-        std::memcpy(&value, &bits, sizeof(value));
+    for (std::size_t i = 0; i < plane_elements; ++i) {
+        const float value = scr_plane_value(host.data(), i, layer.k_pages.dtype);
         if (!std::isfinite(value)) {
             if (non_finite == 0) { first_bad = i; }
             ++non_finite;
@@ -1792,7 +1854,8 @@ void ProgramImplCore::log_scr_relocation(const RequestPlanImpl& request_plan,
         if (!seeded || value > hi) { hi = value; }
         seeded = true;
     }
-    out << " k_plane0{bytes=" << plane_bytes << " non_finite=" << non_finite;
+    out << " k_plane0{bytes=" << plane_bytes << " dtype=" << scr_dtype_name(layer.k_pages.dtype)
+        << " elements=" << plane_elements << " non_finite=" << non_finite;
     if (non_finite != 0) { out << " first_bad_index=" << first_bad; }
     out << " range=[" << lo << "," << hi << "]}";
 
@@ -1847,8 +1910,19 @@ void ProgramImplCore::log_scr_relocation_integrity(
         return total;
     };
 
+    // The plane's geometry, printed once, so the per-row numbers below can be read without knowing
+    // which `--kv-dtype` produced them: `head_dim` elements per row for an uncompressed plane,
+    // `head_dim/2` packed codes per row for `rk4v4-e8`, and `dtype=u8` saying that a row total is a
+    // sum of code bytes rather than of activation magnitudes.
+    const std::size_t page_stride = static_cast<std::size_t>(layer.k_pages.nb[3]);
+    const std::size_t page_rows =
+        static_cast<std::size_t>(layer.num_kv_heads) * kPagedKVPageSize;
+
     std::ostringstream out;
-    out << "[scr-diag] post-prefill integrity";
+    out << "[scr-diag] post-prefill integrity plane{dtype="
+        << scr_dtype_name(layer.k_pages.dtype)
+        << " row_elements=" << scr_row_elements(layer, page_stride, page_rows)
+        << " rows=" << page_rows << " packed=" << (layer.packed_k ? "yes" : "no") << "}";
     std::size_t intact_pages = 0;
     for (const auto& probe : probes) {
         const std::size_t logical  = static_cast<std::size_t>(probe.logical_page);
@@ -1868,7 +1942,10 @@ void ProgramImplCore::log_scr_relocation_integrity(
         for (std::size_t row = 0; row < row_count; ++row) {
             const float expected = probe.row_fingerprints[row];
             const float observed = after[row];
-            if (expected == observed) { continue; }
+            // Bit-exact, not `==`. A fingerprint that decodes to NaN is itself a finding, and
+            // `NaN != NaN` booked every NaN row as changed -- which is how a fabricated NaN in a
+            // packed plane turned into `0/282 intact` on a run whose bytes had not moved at all.
+            if (std::memcmp(&expected, &observed, sizeof(float)) == 0) { continue; }
             ++changed;
             largest = std::max(largest, std::fabs(observed - expected));
             if (shown < 6) {
@@ -1926,11 +2003,11 @@ void ProgramImplCore::log_scr_prefill_chunk(std::uint32_t base, std::uint32_t cu
 }
 
 // Compact per-layer magnitude summary. Printing all 64 layers per stage would swamp the trace the
-// run is read through, so the line carries the total (which catches "the zero never ran"), the
-// worst layer (which catches one layer diverging while the total stays plausible), and a few
-// evenly spaced samples so two runs can be lined up by eye without a diff tool.
+// run is read through, so the line carries the total (which catches a slot left at zero when it
+// should carry a prefix), the worst layer (which catches one layer diverging while the total stays
+// plausible), and a few evenly spaced samples so two runs can be lined up by eye without a diff
+// tool.
 void ProgramImplCore::log_scr_gdn_state(const char* stage, bool zero_taken,
-                                        std::optional<bool> head_empty,
                                         const LinearAttentionStateFingerprint& before,
                                         const LinearAttentionStateFingerprint& after,
                                         cudaStream_t stream) const {
@@ -1951,23 +2028,16 @@ void ProgramImplCore::log_scr_gdn_state(const char* stage, bool zero_taken,
     };
 
     std::ostringstream out;
-    out << "[scr-diag] gdn stage=" << stage << " zero_taken=" << (zero_taken ? "yes" : "no")
-        << " head_range=";
-    if (!head_empty.has_value()) {
-        out << "n/a";
-    } else {
-        out << (*head_empty ? "empty" : "nonempty");
-    }
+    out << "[scr-diag] gdn stage=" << stage << " zero_taken=" << (zero_taken ? "yes" : "no");
 
-    // Read the layer count from `after`, which every stage fills. The two stages that have nothing
-    // to compare against pass an empty `before`, and reading the count from there would report
+    // Read the layer count from `after`, which every stage fills. The stages that have nothing to
+    // compare against pass an empty `before`, and reading the count from there would report
     // layers=0 on exactly the baseline legs a relocated run gets compared against.
     out << " layers=" << after.conv_abs_sum.size();
     if (zero_taken) {
-        // The whole question this line answers is whether the slot the relocation branch left
-        // behind is zero or stale, so report the magnitude rather than a boolean: "nonzero" alone
-        // would also be the answer after prefill has legitimately refilled it, and those two are
-        // the difference between a bug and the feature working.
+        // Only the cold-start control still takes a zero, and its whole question is whether the
+        // slot reads as zero afterwards, so report the before/after pair rather than a boolean:
+        // "nonzero" alone would also be the answer after prefill legitimately refilled it.
         out << " conv_abs_before=" << total(before.conv_abs_sum)
             << " conv_abs_after=" << total(after.conv_abs_sum)
             << " rec_abs_before=" << total(before.recurrent_abs_sum)
@@ -2578,6 +2648,48 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.mtp_bridge     = MtpBridgeMode::None;
         }
 
+        if (staged.mtp_bridge == MtpBridgeMode::FrontierForward) {
+            // The plan already declines this bridge for a media prompt, so reaching here with a
+            // Vision session staged means the rule was not applied where the plan was built. That is
+            // a planner defect rather than a prompt shape, and it is refused rather than repaired:
+            // the forward would prefill one token through the Text path while the vision session
+            // owns the same chunk's multimodal work. This check runs before the positional one so
+            // that defect is reported as the rule it broke: the position it names is satisfied, so
+            // the check below would otherwise take the blame.
+            if (staged.vision || dflash || !sequence.kv || !sequence.kv->text.valid()) {
+                throw std::logic_error("staged MTP frontier forward needs a resident Text prefix");
+            }
+            // No vision session reaches this point; the flag is passed from the actual state so the
+            // predicate is never told something the caller has not established.
+            if (staged.cursor != staged.base ||
+                !qwen3_6::detail::mtp_frontier_forward_applies(staged.base, staged.prompt_tokens,
+                                                               staged.vision != nullptr)) {
+                throw std::logic_error("staged MTP frontier forward is outside the reusable suffix");
+            }
+            const std::uint32_t frontier_page =
+                (staged.base - 1) / static_cast<std::uint32_t>(kPagedKVPageSize);
+            const auto prefix_pages = sequence.kv->text.page_ids();
+            if (frontier_page >= prefix_pages.size() || prefix_pages[frontier_page] < 0) {
+                throw std::logic_error("staged MTP frontier forward has no prefix page to preserve");
+            }
+            mark_workspace_usage(workspace_plan.mtp_prefill);
+            // Forward the one token at `base - 1` to recover the hidden state the row there needs.
+            // That position is inside the reused prefix and its page is exact, so the helper stashes
+            // the page across the forward. The forward advances the recurrent summary by that one
+            // token and it is left advanced: the summary is already the previous prompt's end state
+            // (the fork the relocation keeps), which carries every token the edit replaced plus the
+            // generation that followed, so one more token sits inside that approximation. Restoring
+            // it would cost a second full state image per lane -- an FP32 [128,128,value_heads] per
+            // GDN layer -- and that is not worth a one-token difference inside a summary the fork
+            // already approximates. The MTP row this produces is the row the row at `base - 1` needs,
+            // and it is the only thing this forward exists for.
+            schedule::mtp_frontier_forward_row(
+                schedule_state, decoder->text_kv.pool(), prefix_pages[frontier_page],
+                std::span<const TokenId>(staged.prompt.token_ids), staged.base - 1);
+            sequence.mtp_kv_valid = staged.base;
+            staged.mtp_bridge     = MtpBridgeMode::None;
+        }
+
         if (staged.cursor < staged.prompt_tokens) {
             // Suffix Cache Reuse prefills the ranges the plan reported and leaves the relocated run
             // between them to resident KV, so the cursor skips over that run here.
@@ -2666,18 +2778,17 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (scr_diagnostics_enabled()) {
                 // The GDN state every phase ends its prefill with.
                 //
-                // This is deliberately not gated on relocation. The question the run is trying to
-                // answer is whether a relocated request starts from a recurrent state that describes
-                // its own prompt, and "describes its own prompt" has to be checked against a run that
-                // provably built its state from a cold start. Fingerprinting only the relocated leg
-                // produces a number with nothing to compare it to -- which is exactly how the GDN
-                // invalidation went unobserved: each reading looked locally plausible.
+                // This is deliberately not gated on relocation. A relocated request now keeps the
+                // recurrent state the previous prompt summarised (the authors' `fork`) and advances
+                // it only over the ranges the prefill covers, so the question is whether that state
+                // still describes the new prompt; the reading is compared against a run that
+                // provably built its state from a cold start, which is what `full_reset` records.
                 //
                 // It is also the only per-phase observation of the state the first sampled token is
                 // computed from, so a baseline-vs-baseline difference here localises run-to-run
                 // drift to the recurrent state instead of leaving it somewhere in 64 layers.
-                log_scr_gdn_state("post_prefill", staged.reuse == ReusePath::SuffixRelocation,
-                                  std::nullopt, LinearAttentionStateFingerprint{},
+                log_scr_gdn_state("post_prefill", false,
+                                  LinearAttentionStateFingerprint{},
                                   decoder->linear_attention.fingerprint_slot(
                                       LinearStateSlots::current_state_slot(sequence.lane,
                                                                            max_concurrency),

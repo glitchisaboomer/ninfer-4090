@@ -74,7 +74,7 @@ function(ninfer_add_host_test name)
 endfunction()
 
 # The rope-delta plane's shape, sizing and per-page rule. Registered as a host test precisely because
-# docs/SCR_QUANTIZED_KV_RELOCATION.md records that `paged_kv_cache.h` includes <cuda_runtime_api.h>,
+# docs/SCR.md records that `paged_kv_cache.h` includes <cuda_runtime_api.h>,
 # so the arithmetic had to be pulled into a CUDA-free header before it could be tested anywhere
 # without a toolchain.
 ninfer_add_host_test(ninfer_paged_kv_delta_layout_test
@@ -167,11 +167,32 @@ ninfer_add_test(ninfer_paged_kv_reassign_pages_test
   SOURCES test_paged_kv_reassign_pages.cpp
   LIBRARIES ninfer_core)
 set_tests_properties(ninfer_paged_kv_reassign_pages_test PROPERTIES SKIP_RETURN_CODE 77)
+# The copied counterpart, whose own shape -- a published mapping shorter than the resident one -- is
+# what a deletion produces and what the re-pointing oracle above never exercises.
+ninfer_add_op_test(ninfer_paged_kv_copied_relocation_test
+  SOURCES test_paged_kv_copied_relocation.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+set_tests_properties(ninfer_paged_kv_copied_relocation_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# What a mid-prompt edit costs the recurrent state, which cannot be relocated or rewound. Separate
+# from the prefix test above because it leaves a long prompt resident, and that test's cases were
+# recorded against the sequence state they set up for themselves.
+ninfer_add_test(ninfer_qwen3_6_27b_mid_prompt_edit_test
+  SOURCES targets/qwen3_6_27b/test_engine_mid_prompt_edit.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_mid_prompt_edit_test PROPERTIES SKIP_RETURN_CODE 77)
+# The multi-span counterpart: three interleaved survivors after a long mid-prompt edit, the shape a
+# live session reported as 0% MTP acceptance and an early EOS. Measurement first -- it prints the
+# cold/reused agreement, the first-token logprob delta and the MTP counts per case, and fails only
+# when the reuse leg stopped relocating, which would make the case say nothing.
+ninfer_add_test(ninfer_qwen3_6_27b_multi_span_edit_test
+  SOURCES targets/qwen3_6_27b/test_engine_multi_span_edit.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_multi_span_edit_test PROPERTIES SKIP_RETURN_CODE 77)
 # Guards prefill reproducibility. Position 0's logprob comes from the forward pass alone, so a
 # disagreement between two cold prefills of one fixed prompt is prefill disagreeing with itself.
 ninfer_add_test(ninfer_qwen3_6_27b_prefill_determinism_test
@@ -286,16 +307,6 @@ ninfer_add_op_test(ninfer_gqa_attention_test
 ninfer_add_op_test(ninfer_scr_relocation_integration_test
   SOURCES ops/test_scr_relocation_integration.cpp
   LIBRARIES ninfer_ops)
-# The copied-relocation oracle: an off-grid source relocated by payload copy,
-# held bit-for-bit against the pages it was copied from and read back through
-# the public attention entry points. Pool-backed, because the copier is a
-# PagedKVAllocation method inside a real PagedKVPool; the planner chain it drives
-# (diff_prompt_edit_shifted, plan_shifted_relocations, plan_copied_page_remap)
-# lives in ninfer_engine, hence the second library. Device-only (a pool and a
-# CUDA stream), gated off by ninfer_add_op_test's SKIP_RETURN_CODE.
-ninfer_add_op_test(ninfer_scr_copied_relocation_test
-  SOURCES ops/test_scr_copied_relocation.cpp
-  LIBRARIES ninfer_ops ninfer_engine)
 
 # Oracle test for the per-page RoPE delta machinery. It calls detail:: launchers directly with a real
 # delta plane, so it validates the Phase 4a Q counter-rotation path independently of the physical K
@@ -313,9 +324,9 @@ ninfer_add_op_test(ninfer_gqa_kv_page_delta_i8_test
 ninfer_add_op_test(ninfer_gqa_kv_page_delta_rotated_test
   SOURCES ops/test_gqa_kv_page_delta_rotated.cpp
   LIBRARIES ninfer_ops)
-# Log-probability of the chosen token, against an FP64 log-softmax oracle. Phase 5.5 of
-# docs/SCR_ROADMAP.md scores the two reuse paths in nats, so this measures the quantity that score
-# consumes rather than the argmax it is often confused with.
+# Log-probability of the chosen token, against an FP64 log-softmax oracle. `docs/SCR.md` §5
+# scores the two reuse paths in nats, so this measures the quantity that score consumes rather
+# than the argmax it is often confused with.
 ninfer_add_op_test(ninfer_logprob_of_choice_test
   SOURCES ops/test_logprob_of_choice.cpp
   LIBRARIES ninfer_ops)

@@ -138,6 +138,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_disk_checkpoint";
     case ninfer::PrefixReusePath::SuffixRelocation:
         return "suffix_relocation";
+    case ninfer::PrefixReusePath::AppendAtSharedPrefix:
+        return "append_shared_prefix";
     }
     return "unknown";
 }

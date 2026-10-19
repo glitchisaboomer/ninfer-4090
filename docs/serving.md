@@ -561,12 +561,14 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-The shared family runtime distinguishes `full_reset`, `append_frontier`, and
+The shared family runtime distinguishes `full_reset`, `append_frontier`, `append_shared_prefix`, and
 `restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
 speculative-backend continuation state required to recompute a rewritten suffix; matching KV
 tokens alone never authorize a partial hit. Stable `preserve_thinking=true` histories normally
 append, while stable `false` histories restore the previous open-turn checkpoint when a new user
-closes that turn. The JSONL completion record exposes the selected path as `prefix_reuse_path`.
+closes that turn. An edit made in the middle of the prompt matches neither of those, so the runtime
+reuses the unchanged start of the prompt up to the first difference (`append_shared_prefix`) and
+prefills the rest. The JSONL completion record exposes the selected path as `prefix_reuse_path`.
 Changing reasoning effort changes the rendered prompt and therefore does not reuse a prefix whose
 effort instruction differs.
 

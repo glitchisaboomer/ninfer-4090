@@ -38,8 +38,9 @@ struct GenerationMetrics {
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
-    // Subset of the cache-hit tokens that came from Suffix Cache Reuse rather than
-    // ordinary prefix reuse, so the two mechanisms stay separable in telemetry.
+    // Cache-hit tokens served by relocating a surviving run rather than by ordinary prefix reuse.
+    // Disjoint from `prefix_cache_hit_tokens` and additive with it: reporting sums the two for the
+    // client-facing cache hit, while telemetry keeps them separable.
     std::uint32_t prefix_relocated_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
 };
@@ -49,7 +50,7 @@ struct GenerationOutcome {
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
     // Exactly the tokens this request delivered and the logprob the model gave each one, in
-    // generation order. Phase 5.5 of docs/SCR_ROADMAP.md compares Suffix Cache Reuse against the
+    // generation order. `docs/SCR.md` §5 compares Suffix Cache Reuse against the
     // full-prefill path with these, and the request JSONL log is where they are published: the wire
     // protocols stay unchanged, and a run only pays for them when the log is enabled. A token whose
     // producing path measures no logprob carries NaN, so the two vectors always describe the same

@@ -896,8 +896,11 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
     response["output"]       = built.output_items;
     response["incomplete_details"] =
         status == "incomplete" ? Json{{"reason", "max_output_tokens"}} : Json(nullptr);
+    // The streaming path builds `runtime` before the outcome exists, so its cached hint is zero
+    // there. Take the larger of the hint and the outcome's own count -- which, unlike the hint,
+    // includes relocated runs -- and clamp to the prompt.
     const int observed_cached = std::max(runtime.cached_input_tokens,
-                                         static_cast<int>(outcome.metrics.prefix_cache_hit_tokens));
+                                         make_completion_usage(outcome).cached_tokens);
     const int cached_tokens   = std::clamp(observed_cached, 0, outcome.prompt_tokens);
     response["usage"] =
         Json{{"input_tokens", outcome.prompt_tokens},

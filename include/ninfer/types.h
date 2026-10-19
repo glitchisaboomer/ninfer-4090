@@ -160,7 +160,7 @@ struct StopPolicy {
 
 // Which relocation shape the planner targets. Suffix Cache Reuse is an approximation either way;
 // this only decides how many prefilled ranges the runtime has to support, so the two can be
-// benchmarked against each other. See docs/SCR_RELOCATION_PATHS.md.
+// benchmarked against each other. See docs/SCR.md.
 enum class ScrRelocationMode : std::uint8_t {
     // One contiguous surviving run, so the runtime prefills exactly two ranges around it.
     Tail,
@@ -402,6 +402,18 @@ enum class PrefixReusePath : std::uint8_t {
     // re-prefilled. Unlike every other path, the tokens after `reuse_base` are not all
     // prefilled, so consumers must not assume "prefill the remainder".
     SuffixRelocation,
+    // The prompt shares a leading run with the resident sequence but diverges before the frontier
+    // the lane stopped at, which is the shape of an edit made inside the prompt. Unlike
+    // `AppendAtFrontier` the prompt reaches no frontier the lane kept whole, so the reuse ends at
+    // the divergence: resident KV covers `[0, reuse_base)` and everything after it is prefilled.
+    // The recurrent state is kept rather than zeroed -- it is the previous prompt's summary, which
+    // is the snapshot this feature continues from, and clearing it would drop the reused prefix's
+    // contribution from the linear-attention layers. The lane retained no hidden state at
+    // `reuse_base - 1`, so a speculative backend forwards that one token over the reused prefix to
+    // write the row there; a prompt carrying media keeps the resident row instead, because its
+    // prefill is driven by a Vision session the forward does not stage. Appended rather than
+    // inserted so the existing values do not move.
+    AppendAtSharedPrefix,
 };
 
 struct GenerationResult {
@@ -411,8 +423,8 @@ struct GenerationResult {
     // Element i is the logprob of `generated_token_ids[i]` given everything before it, over the
     // sampler's token domain. Always the same size as `generated_token_ids`; a token whose producing
     // path does not measure logprobs (the MTP/DFlash licensed tokens) is reported as NaN rather than
-    // being dropped, so the two vectors never describe different tokens. Phase 5.5 of
-    // docs/SCR_ROADMAP.md measures Suffix Cache Reuse with this; the served API does not expose it.
+    // being dropped, so the two vectors never describe different tokens. `docs/SCR.md` §5 measures
+    // Suffix Cache Reuse with this; the served API does not expose it.
     std::vector<float> generated_logprobs;
     // Best-minus-second-best logit gap in nats, parallel to `generated_logprobs`. NaN where a path
     // measured no margin. See ops::logprob_of_choice.

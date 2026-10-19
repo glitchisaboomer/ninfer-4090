@@ -1,7 +1,7 @@
 #pragma once
 
 // Per-layer residual-stream trace of one prefill chunk, for localizing the non-reproducible prefill
-// described in docs/ISSUE_prefill-nondeterminism.md.
+// described in docs/SCR.md.
 //
 // The symptom: two cold prefills of one prompt through one Engine disagree at position 0 by
 // 1.7e-4..5.1e-3 nats, varying per call and present at every prompt length. A token-count sweep cannot
@@ -28,7 +28,7 @@
 // The comparison window is thread_local, and every Engine runs its requests on a worker thread of its
 // own, so the window is per-Engine in practice and an Engine's *first* prefill is always a baseline.
 // That makes the two-Engine case -- two cold materializations of one prompt in one process, which is
-// the case docs/ISSUE_prefill-nondeterminism.md could not name a layer for -- invisible to the
+// the case docs/SCR.md could not name a layer for -- invisible to the
 // same-instance path. `NINFER_PREFILL_TRACE_CROSS=1` closes it: a completed chunk is published to a
 // process-wide table keyed by shape, and an instance with no baseline of its own compares against the
 // last chunk of that shape published by *any* instance. Every compared line then says

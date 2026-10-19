@@ -22,6 +22,7 @@ namespace {
 using ninfer::TokenId;
 using ninfer::targets::qwen3_6::detail::diff_prompt_edit;
 using ninfer::targets::qwen3_6::detail::kPromptEditBlockTokens;
+using ninfer::targets::qwen3_6::detail::longest_shared_prefix_tokens;
 using ninfer::targets::qwen3_6::detail::PromptEditDiff;
 using ninfer::targets::qwen3_6::detail::SurvivingSpan;
 
@@ -441,6 +442,237 @@ void test_plan_relocations_respects_limits() {
     const auto beyond_end = plan_relocations(diff, resident, 0, prompt, prompt, 6);
     expect(beyond_end.size() == 1 && beyond_end.front().tokens == block_tokens(2),
            "a boundary past the final token matches no boundary");
+}
+
+// The segmented selector reported a decline with no reason channel at all: the runtime could see how
+// many survivors the detector produced and how many spans came back, but not which of the two
+// happened. The trace is what tells "the detector never saw anything" from "the selector saw the reuse
+// and threw it away", and it is the same type the tail planner fills.
+void test_plan_relocations_reports_a_trace() {
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::RelocationTrace;
+    using ninfer::targets::qwen3_6::detail::RelocationReject;
+
+    // Scope A: [P R S] -> [P S], so exactly one survivor plus the leading prefix.
+    Tokens previous;
+    append(previous, segment(1, 2));
+    append(previous, segment(2, 2));
+    append(previous, segment(3, 2));
+    Tokens current;
+    append(current, segment(1, 2));
+    append(current, segment(3, 2));
+    append(current, segment(4, 1));
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    RelocationTrace trace;
+    const auto spans = plan_relocations(diff, resident, 0, prompt, std::nullopt, 6, &trace);
+    expect(spans.size() == 1, "the trace fixture still relocates its survivor");
+    expect(trace.prompt_tokens == prompt, "the trace reports the prompt length");
+    expect(trace.prefix_reuse_tokens == 0 && trace.resident_kv_tokens == resident,
+           "the trace reports the reuse frontier and the resident frontier");
+    expect(trace.max_spans == 6, "the trace reports the cap it was given");
+    expect(trace.limit == prompt - 16, "the trace reports the limit the plan was planned against");
+    expect(!trace.boundary_supplied, "no boundary was supplied");
+    expect(trace.spans_seen == 2, "the trace counts every span the detector produced");
+    expect(trace.candidates.size() == 1, "the trace keeps the candidates the limits let through");
+    expect(trace.declined == nullptr, "a plan that relocated something did not decline");
+    expect(trace.early_exit == nullptr, "the selector did not exit early");
+    expect(trace.rejected.size() == 1, "one span was rejected: the leading prefix");
+    if (trace.rejected.size() == 1) {
+        const RelocationReject& reject = trace.rejected.front();
+        expect(std::string_view(reject.reason) == "leading span is prefix reuse",
+               "the rejection names why the leading span is not relocation");
+        expect(reject.old_begin == 0 && reject.new_begin == 0 && reject.tokens == block_tokens(2),
+               "the rejection describes the span it refused");
+    }
+
+    // A trace is filled whether or not anything was relocated, and each degeneracy has its own name.
+    RelocationTrace capped;
+    expect(plan_relocations(diff, resident, 0, prompt, std::nullopt, 0, &capped).empty(),
+           "a zero cap still relocates nothing");
+    expect(capped.early_exit != nullptr &&
+               std::string_view(capped.early_exit) == "max_spans == 0",
+           "a zero cap is named as the reason");
+
+    RelocationTrace frontier;
+    expect(plan_relocations(diff, resident, prompt, prompt, std::nullopt, 6, &frontier).empty(),
+           "a prompt that is entirely prefix reuse relocates nothing");
+    expect(frontier.early_exit != nullptr &&
+               std::string_view(frontier.early_exit) ==
+                   "prompt is not longer than the prefix frontier",
+           "a prompt at the frontier is named as the reason");
+
+    // Every survivor refused by the limits is a decline, and it says so.
+    RelocationTrace all_refused;
+    const auto base = block_tokens(4);
+    expect(plan_relocations(diff, resident, base, prompt, std::nullopt, 6, &all_refused).empty(),
+           "a frontier past every survivor relocates nothing");
+    expect(all_refused.candidates.empty(), "and no candidate survives the limits");
+    expect(all_refused.declined != nullptr &&
+               std::string_view(all_refused.declined) == "no surviving span survived the limits",
+           "a decline is named as a decline");
+    expect(all_refused.spans_seen == 2, "the decline still reports what the detector produced");
+    expect(all_refused.rejected.size() == 2, "and why each span was refused");
+}
+
+// The packed range plane names at most one relocated interval per destination page, so two spans
+// landing in one page cannot both be described. The aligned detector cannot produce such a pair, but
+// the all-offset one can, and a plan that breaks the rule is refused whole by the runtime -- giving up
+// every span in it rather than the one that broke it. The selector has to keep the most valuable
+// survivor and drop the rest itself.
+void test_plan_relocations_keeps_one_span_per_destination_page() {
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::plan_shifted_relocations;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_refusal;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::RelocationTrace;
+
+    // Two survivors whose destinations do not overlap but do share page 2: the first ends at 164 and
+    // the second begins there, so no page boundary separates them. Page 2 is [128, 192).
+    PromptEditDiff diff;
+    diff.spans = {
+        SurvivingSpan{.old_begin = 0, .new_begin = 64, .tokens = 100},
+        SurvivingSpan{.old_begin = 256, .new_begin = 164, .tokens = 16},
+    };
+    diff.reusable_tokens = 116;
+
+    const std::uint32_t prompt = block_tokens(8);
+
+    // The two-span plan is one the runtime would refuse, which is what the selector is avoiding.
+    const std::vector<RelocatedSpan> both{
+        RelocatedSpan{.source_begin = 0, .dest_begin = 64, .tokens = 100},
+        RelocatedSpan{.source_begin = 256, .dest_begin = 164, .tokens = 16}};
+    expect(std::string_view(relocation_refusal(both, relocation_prefill_ranges(both, 0, prompt), 0,
+                                               prompt, true)) == "spans share a destination page",
+           "the runtime refuses two spans that share a destination page");
+
+    RelocationTrace trace;
+    const auto kept = plan_relocations(diff, prompt, 0, prompt, std::nullopt, 6, &trace);
+    expect(kept.size() == 1, "only one of the two conflicting spans is relocated");
+    if (kept.size() == 1) {
+        expect(kept.front().source_begin == 0 && kept.front().dest_begin == 64 &&
+                   kept.front().tokens == 100,
+               "the longer survivor is the one kept");
+    }
+    expect(relocation_is_expressible(kept, relocation_prefill_ranges(kept, 0, prompt), 0, prompt,
+                                     true),
+           "the plan the selector returns is one the runtime can execute");
+    expect(trace.rejected.size() == 1, "the dropped span is reported, not silently lost");
+    if (trace.rejected.size() == 1) {
+        expect(std::string_view(trace.rejected.front().reason) ==
+                   "destination page already claimed by a longer span",
+               "and it says why");
+        expect(trace.rejected.front().new_begin == 164 && trace.rejected.front().tokens == 16,
+               "and describes the span it dropped");
+    }
+
+    // A page the reused prefix only partly covers belongs to the prefix: the frontier page can carry
+    // the prefix's own interval, so a span may not begin inside it. Only reachable when the frontier
+    // itself is not page aligned, which is why the rule watches for that rather than applying always.
+    PromptEditDiff straddling;
+    straddling.spans = {SurvivingSpan{.old_begin = 0, .new_begin = 40, .tokens = block_tokens(1)}};
+    straddling.reusable_tokens = block_tokens(1);
+
+    RelocationTrace partial;
+    expect(plan_relocations(straddling, prompt, 40, prompt, std::nullopt, 6, &partial).empty(),
+           "a span inside the unaligned prefix frontier's page is not relocated");
+    expect(partial.rejected.size() == 1 &&
+               std::string_view(partial.rejected.front().reason) ==
+                   "destination in the prefix frontier's partial page",
+           "and the reason names the frontier page");
+
+    // The same span is fine once the frontier is page aligned, so the rule costs nothing in the
+    // aligned case every default run takes.
+    const auto aligned = plan_relocations(straddling, prompt, 0, prompt, std::nullopt, 6);
+    expect(aligned.size() == 1, "the rule is inert when the frontier is a whole page");
+
+    // The copied-path selector is the one that can actually produce an off-grid destination, so it is
+    // the one the collision rule matters for: without it the fallback returned both spans and the
+    // runtime refused the whole plan, losing the reuse the fallback exists to recover.
+    const auto copied = plan_shifted_relocations(diff, prompt, 0, prompt, std::nullopt, 6, true);
+    expect(copied.size() == 1, "the copied-path selector separates the same collision");
+    expect(relocation_is_expressible(copied, relocation_prefill_ranges(copied, 0, prompt), 0,
+                                     prompt, true),
+           "and the plan it returns is one the runtime can execute");
+}
+
+// The refusal has to name the condition, not just report that the plan was refused: a selector that
+// over-produced and a prompt the runtime cannot express need different fixes. The label and the
+// predicate are the same code path, so they cannot disagree.
+void test_relocation_refusal_names_the_rule() {
+    using ninfer::targets::qwen3_6::detail::PrefillRange;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+    using ninfer::targets::qwen3_6::detail::relocation_refusal;
+
+    const auto label = [](const char* refusal) {
+        return std::string_view(refusal == nullptr ? "(expressible)" : refusal);
+    };
+    // Derived ranges, so a case only has to name its spans and the arc it expects them to hold.
+    const auto refuse = [&](const std::vector<RelocatedSpan>& spans, std::uint32_t base,
+                            std::uint32_t prompt, bool source_may_shift) {
+        return label(relocation_refusal(spans, relocation_prefill_ranges(spans, base, prompt), base,
+                                        prompt, source_may_shift));
+    };
+    const auto span = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = source, .dest_begin = dest, .tokens = tokens};
+    };
+
+    // Every case is also checked against the predicate, so the two entry points stay one rule.
+    const std::vector<RelocatedSpan> run{span(0, block_tokens(1), block_tokens(1))};
+    const std::uint32_t three_blocks = block_tokens(3);
+    expect(refuse(run, 0, three_blocks, true) == "(expressible)",
+           "a whole-page span with a head and a tail is expressible");
+    expect(relocation_is_expressible(run, relocation_prefill_ranges(run, 0, three_blocks), 0,
+                                     three_blocks, true),
+           "and the predicate agrees");
+
+    expect(label(relocation_refusal(run, {}, block_tokens(2), block_tokens(2), true)) ==
+               "prompt is not longer than the prefix frontier",
+           "an empty suffix is named");
+    expect(label(relocation_refusal(run, {}, 0, block_tokens(2), true)) == "no prefilled range",
+           "a plan that prefills nothing is named");
+    expect(refuse({span(0, block_tokens(1), 0)}, 0, block_tokens(2), true) == "empty span",
+           "an empty span is named");
+    expect(refuse({span(7, block_tokens(1), block_tokens(1))}, 0, block_tokens(2), false) ==
+               "span is not whole blocks in both prompts",
+           "the re-pointing path's block alignment is named");
+    expect(refuse({span(7, block_tokens(1), block_tokens(1))}, 0, three_blocks, true) ==
+               "(expressible)",
+           "the same off-grid source is fine when the payload is copied");
+    expect(refuse({span(0, block_tokens(1), block_tokens(1))}, block_tokens(2), block_tokens(3),
+                  true) == "span starts below the prefix frontier",
+           "a destination inside the prefix reuse is named");
+    expect(refuse({span(0, block_tokens(3), block_tokens(1))}, 0, block_tokens(3), true) ==
+               "span reaches the final prompt token",
+           "a span reaching the final token is named");
+    expect(refuse({span(0, 40, block_tokens(1))}, 40, block_tokens(4), true) ==
+               "span shares the prefix frontier's partial page",
+           "a span inside an unaligned frontier page is named");
+    expect(refuse({span(0, block_tokens(1), block_tokens(1)),
+                   span(block_tokens(3), block_tokens(1) + 7, 64)},
+                  0, block_tokens(4), true) == "spans overlap",
+           "overlapping destinations are named");
+    expect(refuse({span(0, 64, 100), span(256, 164, 16)}, 0, block_tokens(8), true) ==
+               "spans share a destination page",
+           "two spans in one destination page are named");
+
+    // Ranges that do not tile the suffix, by a gap or past the end.
+    const std::vector<PrefillRange> gapped{PrefillRange{0, block_tokens(1)}};
+    expect(label(relocation_refusal(run, gapped, 0, three_blocks, true)) ==
+               "ranges and spans do not tile the suffix",
+           "a gap between the ranges and the spans is named");
+    const std::vector<PrefillRange> overrun{PrefillRange{0, block_tokens(1)},
+                                            PrefillRange{block_tokens(2), block_tokens(5)}};
+    expect(label(relocation_refusal(run, overrun, 0, three_blocks, true)) ==
+               "ranges and spans do not tile the suffix",
+           "ranges running past the prompt are named");
 }
 
 void test_relocation_prefill_ranges() {
@@ -1039,6 +1271,40 @@ void test_shifted_detector_finds_a_run_off_the_block_grid() {
            "reuse is counted over both runs");
 }
 
+void test_segmented_plan_needs_the_shifted_detector() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::plan_shifted_relocations;
+    using ninfer::targets::qwen3_6::detail::relocation_is_expressible;
+    using ninfer::targets::qwen3_6::detail::relocation_prefill_ranges;
+
+    // The wiring rather than the arithmetic: the runtime builds one diff and hands it to whichever
+    // selector the mode names, so a detector that cannot see the edit's survivors empties every plan
+    // built from it. That is the failure this pins -- an off-grid edit looked exactly like SCR
+    // declining to engage, when in fact nothing downstream was ever given anything to keep.
+    Tokens previous;
+    Tokens current;
+    shifted_scenario(previous, current);
+
+    const PromptEditDiff aligned = diff_prompt_edit(previous, current);
+    const PromptEditDiff shifted = diff_prompt_edit_shifted(previous, current);
+    const auto resident = static_cast<std::uint32_t>(previous.size());
+    const auto prompt   = static_cast<std::uint32_t>(current.size());
+
+    expect(plan_relocations(aligned, resident, 0, prompt, std::nullopt, 6).empty(),
+           "the segmented selector keeps nothing from the aligned diff: its only survivor was the "
+           "leading prefix, which is ordinary prefix reuse");
+    expect(plan_shifted_relocations(aligned, resident, 0, prompt, std::nullopt, 6, true).empty(),
+           "and the shifted fallback cannot recover what that detector never found");
+
+    const auto spans =
+        plan_shifted_relocations(shifted, resident, 0, prompt, std::nullopt, 6, true);
+    expect(!spans.empty(), "the all-offset diff hands the fallback the run the edit moved");
+    const auto ranges = relocation_prefill_ranges(spans, 0, prompt);
+    expect(relocation_is_expressible(spans, ranges, 0, prompt, true),
+           "and the plan built from it is one the copied route can execute");
+}
+
 void test_shifted_selector_quantizes_only_the_destination() {
     using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
     using ninfer::targets::qwen3_6::detail::plan_shifted_relocations;
@@ -1071,6 +1337,20 @@ void test_shifted_selector_quantizes_only_the_destination() {
            "a whole-page destination with an off-grid source is expressible when the payload is copied");
     expect(!relocation_is_expressible(spans, ranges, 0, prompt),
            "and refused by the re-pointing path, whose source has to name a page that holds it");
+
+    const auto destination_free =
+        plan_shifted_relocations(diff, resident, 0, prompt, std::nullopt, 6, true);
+    expect(destination_free.size() == 1, "boundary-aware attention keeps the untrimmed run");
+    if (destination_free.size() == 1) {
+        expect(destination_free.front().dest_begin == block_tokens(3) + 3,
+               "destination freedom preserves the run's exact token offset");
+         expect(destination_free.front().tokens == block_tokens(5),
+             "the full surviving run is retained when it ends before the prompt tail");
+        const auto destination_free_ranges =
+            relocation_prefill_ranges(destination_free, 0, prompt);
+        expect(relocation_is_expressible(destination_free, destination_free_ranges, 0, prompt, true),
+               "token-granular copied ranges still tile the prompt");
+    }
 }
 
 void test_plan_copied_page_remap_acquires_every_relocated_page() {
@@ -1104,8 +1384,17 @@ void test_plan_copied_page_remap_acquires_every_relocated_page() {
     const std::vector<RelocatedSpan> partial{
         RelocatedSpan{.source_begin = block_tokens(3), .dest_begin = block_tokens(2) + 1,
                       .tokens = block_tokens(2)}};
-    expect(plan_copied_page_remap(resident, partial, 0, block_tokens(6)).empty(),
-           "a destination that is not whole pages is refused");
+    const auto partial_remap = plan_copied_page_remap(resident, partial, 0, block_tokens(6));
+    expect(partial_remap.size() == 6, "a partial copied span still has a complete page mapping");
+    if (partial_remap.size() == 6) {
+        expect(partial_remap[2] == kRemapAcquirePage && partial_remap[3] == kRemapAcquirePage,
+               "both pages touched by a partial destination span are acquired");
+        // The span is [129, 257), so its last token (256) lies in page 4: a destination that starts
+        // and ends inside a page still owns every page its *end* touches, not only the pages it
+        // fills. That tail is what a duration-based count gets wrong, and the copy writes it.
+        expect(partial_remap[4] == kRemapAcquirePage,
+               "the page its final partial token falls in is acquired as well");
+    }
     const std::vector<RelocatedSpan> beyond{
         RelocatedSpan{.source_begin = 0, .dest_begin = block_tokens(6), .tokens = block_tokens(2)}};
     expect(plan_copied_page_remap(resident, beyond, 0, block_tokens(6)).empty(),
@@ -1156,6 +1445,7 @@ void test_copied_price_covers_the_substitution_the_copier_performs() {
     using ninfer::plan_relocated_page_moves;
     using ninfer::plan_relocated_page_substitution;
     using ninfer::RelocatedCopySpan;
+    using ninfer::RelocatedPageCounts;
     using ninfer::RelocatedPageMove;
     using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
     using ninfer::targets::qwen3_6::detail::plan_copied_page_remap;
@@ -1166,76 +1456,95 @@ void test_copied_price_covers_the_substitution_the_copier_performs() {
     expect(kRemapAcquirePage == kPagedKVAquirePage,
            "the planner's acquire sentinel is the one the core substitution spells");
 
-    bool saw_a_strict_case = false;
-    bool saw_an_exact_case = false;
+    bool saw_a_strict_case            = false;
+    bool saw_an_exact_case            = false;
+    bool saw_a_shrinking_case         = false;
+    bool saw_source_above_the_mapping = false;
     for (std::uint32_t resident = 12; resident <= 20; resident += 4) {
         for (std::uint32_t offset = 0; offset < kPromptEditBlockTokens; offset += 13) {
             for (std::uint32_t dest_page = 1; dest_page <= 3; ++dest_page) {
-                // An identity mapping, so a logical page and its physical page are told apart by the
-                // arithmetic under test rather than by the ids looking different.
-                std::vector<std::int32_t> current(resident);
-                for (std::uint32_t page = 0; page < resident; ++page) {
-                    current[page] = static_cast<std::int32_t>(30 + page);
-                }
-                const std::uint32_t prompt_tokens = resident * kPromptEditBlockTokens;
-                const std::uint32_t prefix_reuse  = kPromptEditBlockTokens;
-                const std::vector<RelocatedSpan> spans{
-                    RelocatedSpan{.source_begin = 4 * kPromptEditBlockTokens + offset,
-                                  .dest_begin   = dest_page * kPromptEditBlockTokens,
-                                  .tokens       = 3 * kPromptEditBlockTokens}};
+                // The published prompt is the resident one on the first pass and on the second as
+                // short as the span's destination allows -- a deletion deep enough that the span's
+                // *source* lies above the published mapping's end. That is the shape the copied
+                // path could not serve while the source bound was the destination's length, and
+                // the price has to cover the substitution for it, which the equal-length pass
+                // never reaches.
+                for (const std::uint32_t published_pages : {resident, dest_page + 3}) {
+                    // An identity mapping, so a logical page and its physical page are told apart by
+                    // the arithmetic under test rather than by the ids looking different.
+                    std::vector<std::int32_t> current(resident);
+                    for (std::uint32_t page = 0; page < resident; ++page) {
+                        current[page] = static_cast<std::int32_t>(30 + page);
+                    }
+                    const std::uint32_t prompt_tokens = published_pages * kPromptEditBlockTokens;
+                    const std::uint32_t prefix_reuse  = kPromptEditBlockTokens;
+                    const std::vector<RelocatedSpan> spans{
+                        RelocatedSpan{.source_begin = 4 * kPromptEditBlockTokens + offset,
+                                      .dest_begin   = dest_page * kPromptEditBlockTokens,
+                                      .tokens       = 3 * kPromptEditBlockTokens}};
 
-                const std::vector<std::int32_t> remap =
-                    plan_copied_page_remap(current, spans, prefix_reuse, prompt_tokens);
-                expect(!remap.empty(), "a whole-page destination is an expressible copied relocation");
-                if (remap.empty()) { continue; }
+                    const std::vector<std::int32_t> remap =
+                        plan_copied_page_remap(current, spans, prefix_reuse, prompt_tokens);
+                    expect(!remap.empty(),
+                           "a whole-page destination is an expressible copied relocation");
+                    if (remap.empty()) { continue; }
+                    if (remap.size() < current.size()) { saw_a_shrinking_case = true; }
+                    if (spans[0].source_begin + spans[0].tokens > prompt_tokens) {
+                        saw_source_above_the_mapping = true;
+                    }
 
-                const std::vector<RelocatedCopySpan> copy_spans{RelocatedCopySpan{
-                    spans[0].source_begin, spans[0].dest_begin, spans[0].tokens}};
-                const std::vector<RelocatedPageMove> moves =
-                    plan_relocated_page_moves(copy_spans, current.size());
+                    const std::vector<RelocatedCopySpan> copy_spans{RelocatedCopySpan{
+                        spans[0].source_begin, spans[0].dest_begin, spans[0].tokens}};
+                    const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(
+                        copy_spans, RelocatedPageCounts{.source      = current.size(),
+                                                        .destination = remap.size()});
 
-                // What the runtime prices: the pages the moves read, in logical coordinates. Not a
-                // page-by-page walk of the source range -- that misses the page holding the span's
-                // last token whenever the span does not end on a page boundary, which is every
-                // off-grid span, and a price one page short is a refusal after the fact.
-                std::vector<std::uint32_t> source_logical;
-                for (const RelocatedPageMove& move : moves) {
-                    source_logical.push_back(static_cast<std::uint32_t>(move.source_page));
-                }
-                std::sort(source_logical.begin(), source_logical.end());
-                source_logical.erase(std::unique(source_logical.begin(), source_logical.end()),
-                                     source_logical.end());
-                const std::uint32_t price =
-                    shifted_relocation_pages_from_pool(current, remap, source_logical);
+                    // What the runtime prices: the pages the moves read, in logical coordinates.
+                    // Not a page-by-page walk of the source range -- that misses the page holding
+                    // the span's last token whenever the span does not end on a page boundary,
+                    // which is every off-grid span, and a price one page short is a refusal after
+                    // the fact.
+                    std::vector<std::uint32_t> source_logical;
+                    for (const RelocatedPageMove& move : moves) {
+                        source_logical.push_back(static_cast<std::uint32_t>(move.source_page));
+                    }
+                    std::sort(source_logical.begin(), source_logical.end());
+                    source_logical.erase(std::unique(source_logical.begin(), source_logical.end()),
+                                         source_logical.end());
+                    const std::uint32_t price =
+                        shifted_relocation_pages_from_pool(current, remap, source_logical);
 
-                std::vector<std::int32_t> protected_pages;
-                protected_pages.reserve(moves.size());
-                for (const RelocatedPageMove& move : moves) {
-                    protected_pages.push_back(
-                        current[static_cast<std::size_t>(move.source_page)]);
-                }
-                const ninfer::RelocatedPageSubstitution substitution =
-                    plan_relocated_page_substitution(current, remap, protected_pages);
+                    std::vector<std::int32_t> protected_pages;
+                    protected_pages.reserve(moves.size());
+                    for (const RelocatedPageMove& move : moves) {
+                        protected_pages.push_back(
+                            current[static_cast<std::size_t>(move.source_page)]);
+                    }
+                    const ninfer::RelocatedPageSubstitution substitution =
+                        plan_relocated_page_substitution(current, remap, protected_pages);
 
-                if (price < substitution.from_pool) {
-                    std::cerr << "FAIL: resident=" << resident << " offset=" << offset
-                              << " dest_page=" << dest_page << " priced " << price
-                              << " but the copier spends " << substitution.from_pool << '\n';
-                    ++failures;
-                }
-                if (source_logical.front() > prefix_reuse / kPromptEditBlockTokens) {
-                    // Every page the copies read is above the carried prefix, so all of them are
-                    // dropped and the two functions are counting the same occurrences.
-                    saw_an_exact_case = true;
-                    if (price != substitution.from_pool) {
-                        std::cerr << "FAIL: resident=" << resident << " offset=" << offset
+                    if (price < substitution.from_pool) {
+                        std::cerr << "FAIL: resident=" << resident
+                                  << " published=" << published_pages << " offset=" << offset
                                   << " dest_page=" << dest_page << " priced " << price
-                                  << " against a demand of " << substitution.from_pool << '\n';
+                                  << " but the copier spends " << substitution.from_pool << '\n';
                         ++failures;
                     }
-                }
-                if (remap_pages_from_pool(current, remap) < substitution.from_pool) {
-                    saw_a_strict_case = true;
+                    if (source_logical.front() > prefix_reuse / kPromptEditBlockTokens) {
+                        // Every page the copies read is above the carried prefix, so all of them
+                        // are dropped and the two functions are counting the same occurrences.
+                        saw_an_exact_case = true;
+                        if (price != substitution.from_pool) {
+                            std::cerr << "FAIL: resident=" << resident
+                                      << " published=" << published_pages << " offset=" << offset
+                                      << " dest_page=" << dest_page << " priced " << price
+                                      << " against a demand of " << substitution.from_pool << '\n';
+                            ++failures;
+                        }
+                    }
+                    if (remap_pages_from_pool(current, remap) < substitution.from_pool) {
+                        saw_a_strict_case = true;
+                    }
                 }
             }
         }
@@ -1243,9 +1552,271 @@ void test_copied_price_covers_the_substitution_the_copier_performs() {
     expect(saw_an_exact_case, "the sweep reached a shape where the two agree exactly");
     expect(saw_a_strict_case,
            "and one where the re-pointing price would have understated the copying one");
+    expect(saw_a_shrinking_case,
+           "and a published mapping shorter than the resident one, the shape the copy serves");
+    expect(saw_source_above_the_mapping,
+           "and one where the source lies above the published mapping's end, the bound's regression");
 }
 
 } // namespace
+
+// The measurement the shared-prefix reuse path resumes on: how much of a prompt an edit made inside
+// it can still keep from resident KV. Every branch here is a different cap, because each one is a
+// separate fact about the lane -- the ledger, the prompt, the resident KV extent, and the rule that
+// the final token is prefilled -- and getting one wrong either claims KV nothing verified or throws
+// away reuse the lane could serve.
+//
+// The block floor is the part worth stating outright: the answer becomes a reuse base, resident KV
+// is addressed in whole pages, and a base that is not a whole block would leave the page behind it
+// partly valid and partly stale. So a run is reported in blocks, and a run shorter than one block is
+// reported as no reuse at all rather than as a fraction of a block.
+void test_longest_shared_prefix_tokens() {
+    const std::uint32_t block = kPromptEditBlockTokens;
+
+    // A whole shared run, with the prompt then diverging.
+    {
+        Tokens resident = segment(1, 4);
+        Tokens prompt   = segment(1, 4);
+        append(prompt, std::vector<TokenId>{99});
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(4),
+                                           static_cast<std::uint32_t>(prompt.size())) ==
+                   block_tokens(4),
+               "a whole shared run is reported in full");
+    }
+    // The same run plus half a block, which is not claimed: the partial block is dropped, never
+    // rounded up, because rounding up would claim KV the comparison never confirmed.
+    {
+        Tokens resident = segment(1, 4);
+        Tokens prompt   = segment(1, 4);
+        for (std::uint32_t i = 0; i < block / 2; ++i) { prompt.push_back(7); }
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(4),
+                                           static_cast<std::uint32_t>(prompt.size())) ==
+                   block_tokens(4),
+               "a partial trailing block is not claimed");
+    }
+    // Divergence inside a block drops that whole block rather than the part of it that still
+    // matches: the base has to name a page the prompt wants in full.
+    {
+        Tokens resident = segment(1, 5);
+        Tokens prompt   = segment(1, 5);
+        prompt[block_tokens(4) + 1] = 12345;
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(5),
+                                           static_cast<std::uint32_t>(prompt.size())) ==
+                   block_tokens(4),
+               "a divergence inside a block drops that block");
+    }
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 2), segment(2, 2), block_tokens(2),
+                                           block_tokens(2)) == 0,
+               "unrelated prompts share nothing");
+    }
+    // One whole block is the smallest base this reports, which is the threshold the caller applies
+    // too -- so a plan never resumes on less than a block.
+    {
+        const Tokens resident = segment(1, 1);
+        const Tokens prompt   = segment(1, 1);
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(1), block_tokens(1)) ==
+                   block_tokens(1),
+               "one whole block is a reuse base");
+    }
+    // Half a block of genuine token agreement is still no reuse base, though the tokens match and
+    // every cap allows it: the answer has to land on a page boundary.
+    {
+        const Tokens resident = segment(1, 1);
+        Tokens prompt;
+        for (std::uint32_t i = 0; i < block / 2; ++i) { prompt.push_back(resident[i]); }
+        prompt.push_back(7777);
+        expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(1),
+                                           static_cast<std::uint32_t>(prompt.size())) == 0,
+               "a sub-block match is not a reuse base");
+    }
+    // Capped by the resident KV the lane holds, even where both ledgers agree further: KV past the
+    // resident frontier does not exist, so a longer match cannot be reused.
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 4), segment(1, 4), block_tokens(2),
+                                           block_tokens(4)) == block_tokens(2),
+               "the resident KV caps the shared run");
+    }
+    // Capped by `limit`, which is how the final prompt token stays prefilled.
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 4), segment(1, 4), block_tokens(4),
+                                           block_tokens(4) + block - 1) == block_tokens(4),
+               "a limit past the shared run does not extend it");
+        expect(longest_shared_prefix_tokens(segment(1, 4), segment(1, 4), block_tokens(4),
+                                           block_tokens(3)) == block_tokens(3),
+               "the limit caps the shared run");
+    }
+    // The shorter sequence ends the run, and degenerate inputs answer zero rather than throwing:
+    // every request that reaches the fallback calls this one.
+    {
+        expect(longest_shared_prefix_tokens(segment(1, 2), segment(1, 4), block_tokens(4),
+                                           block_tokens(4)) == block_tokens(2),
+               "the shorter sequence bounds the run");
+        expect(longest_shared_prefix_tokens({}, segment(1, 2), block_tokens(2), block_tokens(2)) == 0,
+               "an empty resident ledger shares nothing");
+        expect(longest_shared_prefix_tokens(segment(1, 2), {}, 0, 0) == 0,
+               "an empty prompt shares nothing");
+    }
+    // Measured, not assumed: the same inputs answer the same number every time, so the base a plan
+    // is built on is reproducible across a suite run.
+    {
+        const Tokens resident = segment(3, 6);
+        const Tokens prompt   = segment(3, 6);
+        for (int i = 0; i < 8; ++i) {
+            expect(longest_shared_prefix_tokens(resident, prompt, block_tokens(6),
+                                               block_tokens(6)) == block_tokens(6),
+                   "the shared-prefix measurement is deterministic");
+        }
+    }
+}
+
+// The tail after the last relocated run is always prefilled, and it has to be long enough for the
+// recurrent layers to summarise the prompt's own final tokens. A run that would otherwise reach the
+// prompt end is trimmed back a whole block when the remaining tail would be shorter than the floor.
+void test_relocation_leaves_a_forwarded_tail() {
+    using ninfer::targets::qwen3_6::detail::kMinimumForwardedTailTokens;
+    using ninfer::targets::qwen3_6::detail::plan_relocations;
+    using ninfer::targets::qwen3_6::detail::plan_tail_relocation;
+    using ninfer::targets::qwen3_6::detail::relocation_limit;
+
+    // The floor itself, and the boundary that can pull it earlier still.
+    expect(relocation_limit(0, std::nullopt) == 0, "an empty prompt has no relocatable tail");
+    expect(relocation_limit(kMinimumForwardedTailTokens, std::nullopt) == 0,
+           "a prompt no longer than the floor leaves nothing to relocate");
+    expect(relocation_limit(kMinimumForwardedTailTokens + 1, std::nullopt) == 1,
+           "one token past the floor leaves one token reachable");
+    expect(relocation_limit(block_tokens(4), std::nullopt) ==
+               block_tokens(4) - kMinimumForwardedTailTokens,
+           "the limit is the prompt end less the floor");
+    expect(relocation_limit(block_tokens(4), 7) == 7, "a boundary inside the tail wins");
+
+    // [P RRR SSS] -> [P SSS xxxxxxxx]: the survivor would reach the prompt end if it kept all three
+    // blocks, leaving only a partial block (8 tokens) to forward. The floor trims it to two.
+    Tokens previous;
+    append(previous, segment(1, 1)); // P
+    append(previous, segment(2, 3)); // R, deleted by the edit
+    append(previous, segment(3, 3)); // S, survives and moves left
+    Tokens current;
+    append(current, segment(1, 1));
+    append(current, segment(3, 3));
+    for (int i = 0; i < 8; ++i) { current.push_back(11000 + i); } // trailing text, not a whole block
+
+    const PromptEditDiff diff = diff_prompt_edit(previous, current);
+    const auto resident        = static_cast<std::uint32_t>(previous.size());
+    const auto prompt          = static_cast<std::uint32_t>(current.size());
+
+    const auto plan = plan_tail_relocation(diff, resident, 0, prompt, 6);
+    expect(plan.viable, "the survivor still relocates when the tail would otherwise be short");
+    expect(plan.spans.size() == 1, "the short-tail fixture yields one relocated run");
+    if (plan.spans.size() == 1) {
+        expect(plan.spans.front().tokens == block_tokens(2),
+               "the run keeps the blocks that leave a full forwarded tail");
+        expect(plan.spans.front().dest_end() + kMinimumForwardedTailTokens <= prompt,
+               "the run ends early enough to leave the floor to be prefilled");
+        expect(plan.tail.tokens() >= kMinimumForwardedTailTokens,
+               "the tail carries at least the floor to be prefilled");
+    }
+
+    const auto general = plan_relocations(diff, resident, 0, prompt, std::nullopt, 6);
+    expect(general.size() == 1 && general.front().tokens == block_tokens(2),
+           "the general selector forwards the same tail");
+}
+
+// Trimming a run's trailing edge moves its end back into text both prompts share, which is what the
+// second token-predicting layer's row pairing needs. A run with nothing to give is dropped, and a
+// run's earlier spans keep their full length because they do not end at the divergence.
+void test_trim_relocated_run_tails() {
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::trim_relocated_run_tails;
+
+    const auto span = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = source, .dest_begin = dest, .tokens = tokens};
+    };
+
+    // A single run loses exactly one block from its end and keeps its start.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(3))};
+        trim_relocated_run_tails(spans, kPromptEditBlockTokens);
+        expect(spans.size() == 1, "a run longer than the trim survives");
+        if (spans.size() == 1) {
+            expect(spans.front().source_begin == block_tokens(1) &&
+                       spans.front().dest_begin == block_tokens(2),
+                   "the trim keeps the run's start");
+            expect(spans.front().tokens == block_tokens(2), "the run loses one block from its end");
+        }
+    }
+    // A run no longer than the trim has nothing left to relocate.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(1))};
+        trim_relocated_run_tails(spans, kPromptEditBlockTokens);
+        expect(spans.empty(), "a run with nothing to give is dropped");
+    }
+    // Two spans whose destinations touch are one run: only the second ends at the divergence, so the
+    // first keeps its full length and the second gives back a block.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(1)),
+                                         span(block_tokens(2), block_tokens(3), block_tokens(2))};
+        trim_relocated_run_tails(spans, kPromptEditBlockTokens);
+        expect(spans.size() == 2, "both spans of a split run survive the trim");
+        if (spans.size() == 2) {
+            expect(spans.front().tokens == block_tokens(1), "the run's earlier span is untouched");
+            expect(spans.back().tokens == block_tokens(1), "the run's last span gives back a block");
+        }
+    }
+    // A zero trim leaves the plan alone.
+    {
+        std::vector<RelocatedSpan> spans{span(block_tokens(1), block_tokens(2), block_tokens(1))};
+        trim_relocated_run_tails(spans, 0);
+        expect(spans.size() == 1 && spans.front().tokens == block_tokens(1),
+               "a zero trim changes nothing");
+    }
+}
+
+namespace {
+
+// `mtp_frontier_forward_applies` is constexpr and every case below passes it compile-time constants,
+// so the compiler folds each call, folds the branch inside `expect` to a constant, and emits an
+// empty function: the checks then pass without running, which is what this file's build did before
+// these helpers existed. Reading the arguments back through a volatile copy keeps the calls opaque.
+std::uint32_t opaque_tokens(std::uint32_t blocks) {
+    volatile std::uint32_t value = block_tokens(blocks);
+    return value;
+}
+
+bool opaque_flag(bool flag) {
+    volatile bool value = flag;
+    return value;
+}
+
+} // namespace
+
+// The MTP frontier forward is only usable when there is a prefix to read and a following token to
+// pair the recovered hidden with. Both ends matter: a zero base has no reused prefix, and a base at
+// the prompt end would read the token after the prompt while writing the row before it. A prompt
+// carrying media is excluded outright, because the forward runs the Text prefill for one token while
+// that request's prefill is driven by the Vision session it stages.
+void test_mtp_frontier_forward_applies() {
+    using ninfer::targets::qwen3_6::detail::mtp_frontier_forward_applies;
+
+    expect(!mtp_frontier_forward_applies(opaque_tokens(0), opaque_tokens(0), opaque_flag(false)),
+           "an empty prompt has no frontier to forward");
+    expect(!mtp_frontier_forward_applies(opaque_tokens(0), opaque_tokens(4), opaque_flag(false)),
+           "a zero base has no reused prefix to read");
+    expect(!mtp_frontier_forward_applies(opaque_tokens(4), opaque_tokens(4), opaque_flag(false)),
+           "a base at the prompt end has no following token");
+    expect(!mtp_frontier_forward_applies(opaque_tokens(5), opaque_tokens(4), opaque_flag(false)),
+           "a base past the prompt end has no following token");
+    expect(mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(4), opaque_flag(false)),
+           "a base with a prefix and a following token applies");
+    expect(mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(2), opaque_flag(false)),
+           "the one-token prefix with one following token applies");
+    // The media exclusion is the part a plan can get wrong: it satisfies every positional rule, so
+    // without this case the branch is only reachable through a multimodal request at run time.
+    expect(!mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(4), opaque_flag(true)),
+           "a prompt carrying media never selects the frontier forward");
+    expect(!mtp_frontier_forward_applies(opaque_tokens(1), opaque_tokens(2), opaque_flag(true)),
+           "the shortest applicable prefix is still declined for a media prompt");
+}
 
 int main() {
     test_identical_prompts();
@@ -1259,6 +1830,9 @@ int main() {
     test_plan_relocations();
     test_plan_relocations_keeps_longest();
     test_plan_relocations_respects_limits();
+    test_plan_relocations_reports_a_trace();
+    test_plan_relocations_keeps_one_span_per_destination_page();
+    test_relocation_refusal_names_the_rule();
     test_relocation_prefill_ranges();
     test_relocation_prefill_splits();
     test_relocation_is_expressible();
@@ -1266,14 +1840,19 @@ int main() {
     test_plan_tail_relocation_respects_turn_rewrite_boundary();
     test_plan_tail_relocation_picks_one_run();
     test_plan_tail_relocation_merges_adjacent_survivors();
+    test_relocation_leaves_a_forwarded_tail();
+    test_trim_relocated_run_tails();
+    test_mtp_frontier_forward_applies();
     test_plan_page_remap();
     test_plan_page_remap_second_allocation();
     test_remap_pages_from_pool();
     test_shifted_detector_finds_a_run_off_the_block_grid();
+    test_segmented_plan_needs_the_shifted_detector();
     test_shifted_selector_quantizes_only_the_destination();
     test_plan_copied_page_remap_acquires_every_relocated_page();
     test_shifted_pricing_excludes_the_copy_sources();
     test_copied_price_covers_the_substitution_the_copier_performs();
+    test_longest_shared_prefix_tokens();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

@@ -79,6 +79,40 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
+// Produce the MTP row at `frontier` (`base - 1`) for a prompt whose reused prefix holds no hidden
+// at that position. The `BeforeSuffix` bridge reads a hidden the lane kept; the suffix-cache paths
+// do not have one, so this forwards the single token at `frontier` over the resident prefix and
+// lets the ordinary MTP prefill write the row. With `text_kv_base` at `frontier` and a nominal
+// length of one, the alignment window pairs the hidden at `frontier` with the embedding of the
+// following prompt token, which is the pairing the row needs.
+//
+// Forwarding that one token is a real prefill of the position: it writes Text KV there and advances
+// the recurrent summary. The reused prefix is exact by the reuse contract, so the position's page
+// is gathered before the forward and scattered back after, leaving the prefix as the relocation
+// found it. The caller documents why the recurrent summary is left as the forward leaves it.
+void mtp_frontier_forward_row(PrefillContext state, ninfer::PagedKVPool& text_pool,
+                              std::int32_t frontier_page, std::span<const TokenId> prompt,
+                              std::uint32_t frontier) {
+    // The forward reads the token at `frontier` and pairs its hidden with the token after it, so
+    // both have to be inside the prompt.
+    if (frontier == 0 || static_cast<std::size_t>(frontier) + 2 > prompt.size()) {
+        throw std::invalid_argument("MTP frontier forward is outside the prompt");
+    }
+    cudaStream_t stream = state.execution.device.stream;
+    void* staging       = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&staging, text_pool.total_page_bytes(), stream));
+    const std::int32_t page_ids[1]        = {frontier_page};
+    const std::span<const std::int32_t> pages(page_ids, 1);
+    text_pool.gather_to_contiguous_device(pages, staging, stream);
+    state.text_kv_base = frontier;
+    const PrefillChunkResult result = prefill_text_chunk(state, prompt, 1, std::nullopt, false);
+    if (result.processed_tokens != 1 || result.finalized) {
+        throw std::logic_error("MTP frontier forward did not prefill exactly one token");
+    }
+    text_pool.scatter_from_contiguous_device(pages, staging, stream);
+    CUDA_CHECK(cudaFreeAsync(staging, stream));
+}
+
 PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,

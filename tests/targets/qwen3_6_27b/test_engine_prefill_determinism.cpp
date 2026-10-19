@@ -19,7 +19,7 @@ namespace {
 // This test exists because four `ninfer-serve` processes given identical flags (the scr-quality
 // harness's `baseline` and `control` phases) disagreed at position 0 by 3e-4..3e-3 nats, which is
 // large enough to invalidate the Suffix Cache Reuse quality harness's noise floor. See
-// docs/ISSUE_prefill-nondeterminism.md.
+// docs/SCR.md.
 //
 // The tolerance is a deliberate tripwire, not a numerical criterion: it exists so that any future
 // divergence fails loudly. `NINFER_PREFILL_DET_TOL` overrides it -- set it to 0 to demand
@@ -208,7 +208,7 @@ int compare_cold_prefills(const ninfer::GenerationResult& first,
         std::cerr << subject << " disagreed at position 0: logprob=" << a << " vs " << b
                   << " delta=" << delta << " (tolerance " << limit << ")\n"
                   << "Prefill is not bit-reproducible; see "
-                     "docs/ISSUE_prefill-nondeterminism.md\n";
+                     "docs/SCR.md\n";
         return 1;
     }
     return 0;

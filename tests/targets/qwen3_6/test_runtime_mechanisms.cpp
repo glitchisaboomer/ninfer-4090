@@ -149,7 +149,7 @@ void test_round_layout() {
            "DFlash layout does not allocate MTP storage");
 }
 
-// Phase 5.5 of docs/SCR_ROADMAP.md scores the reuse paths with per-token logprobs, so every
+// `docs/SCR.md` §5 scores the reuse paths with per-token logprobs, so every
 // generated token needs a logprob beside it: the sampled one in the ordinary decode egress, and
 // the prompt's first token in the round state (prefill has no egress POD to carry it). Both are
 // bound here over a host backing, which is all this mechanism needs -- it is pointer arithmetic,
