@@ -169,9 +169,9 @@ ninfer_add_test(ninfer_paged_kv_reassign_pages_test
 set_tests_properties(ninfer_paged_kv_reassign_pages_test PROPERTIES SKIP_RETURN_CODE 77)
 # The copied counterpart, whose own shape -- a published mapping shorter than the resident one -- is
 # what a deletion produces and what the re-pointing oracle above never exercises.
-ninfer_add_test(ninfer_paged_kv_copied_relocation_test
+ninfer_add_op_test(ninfer_paged_kv_copied_relocation_test
   SOURCES test_paged_kv_copied_relocation.cpp
-  LIBRARIES ninfer_core)
+  LIBRARIES ninfer_core ninfer_ops)
 set_tests_properties(ninfer_paged_kv_copied_relocation_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test

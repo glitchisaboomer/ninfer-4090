@@ -21,6 +21,8 @@
 //   C5  the ownership partition holds: free pages + mapped pages == total page groups, so a page the
 //       call dropped is returned and a page it took is not leaked
 //   C6  a rejection leaves the mapping and the pool exactly as they were
+//   C7  attention over the relocated cache matches an independent FP64 oracle that counter-rotates
+//       each stored key by its page's delta, with a zeroed-delta control that must break it
 //
 // Most byte comparisons are whole-page because those scenarios' moves are whole pages: the plane is
 // required to be dense (asserted below), so a move of 64 tokens at offset 0 carries every byte of
@@ -29,6 +31,14 @@
 // span's token interval, so it compares per token, and it also checks the tokens *outside* that
 // interval against the page's bytes from before the call. No tolerance and no re-derived offset
 // table that would duplicate the code under test.
+//
+// C1 to C6 are byte comparisons, and a byte comparison cannot see the failure this feature actually
+// risks: a cache that holds the right bytes read at the wrong RoPE phase is byte-exact and
+// numerically wrong. C7 closes that by reading the relocated cache through the public attention
+// entry point and judging it against the FP64 delta oracle, which is the only form that separates a
+// correct relocation from a skipped counter-rotation on a plane carrying its own rounding error.
+
+#include "ops/gqa_relocation_test_common.h"
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -44,6 +54,14 @@
 #include <vector>
 
 namespace {
+
+// The BF16 conformance criterion for this file's fixture. The shared kConformanceBf16 is calibrated
+// on tests/ops/test_gqa_attention.cpp's key distribution, and BF16 attention error scales with the
+// logit magnitude, so it moves when the distribution does: on this fixture the correct path measures
+// 2.81e-3 against the shared 2.80e-3 limit, which is a criterion miss with no defect behind it. The
+// limit below sits above the measured correct path with margin and an order of magnitude below the
+// control's own reach, which is what keeps a miss meaningful.
+constexpr Criterion kCopiedRelocationBf16{4.0e-3, 1.0e-3, 2.7e-3};
 
 int failures = 0;
 
@@ -73,6 +91,24 @@ PlannedPool plan_pool(std::uint32_t page_groups, std::uint32_t logical_pages, st
     return PlannedPool{std::move(layout), builder.finish(256)};
 }
 
+// The same pool at the qwen3_6_27b Text geometry the shared oracle harness is calibrated for: 256
+// leading elements over 4 KV heads, which is what a real K or V page holds. The byte cases above
+// declare a 16x1 stub plane because they only need *some* bytes to move around; C7 has to be written
+// and read through the production KV path, so it needs the real extent. The plane order follows the
+// pool's convention: K at index 0, V at index 1, consumers assigning meaning to indices.
+PlannedPool plan_kv_pool(std::uint32_t page_groups, std::uint32_t logical_pages, std::int32_t rows) {
+    ninfer::LayoutBuilder builder;
+    auto layout = ninfer::plan_paged_kv_pool(builder, {.page_group_count      = page_groups,
+                                                       .logical_page_capacity = logical_pages,
+                                                       .table_rows            = rows,
+                                                       .planes = {
+                                                           {ninfer::DType::BF16, kHeadDim,
+                                                            kKvHeads},
+                                                           {ninfer::DType::BF16, kHeadDim,
+                                                            kKvHeads}}});
+    return PlannedPool{std::move(layout), builder.finish(256)};
+}
+
 std::vector<std::int32_t> ids_of(const ninfer::PagedKVAllocation& alloc) {
     return std::vector<std::int32_t>(alloc.page_ids().begin(), alloc.page_ids().end());
 }
@@ -92,6 +128,177 @@ std::vector<std::uint32_t> read_u32(const ninfer::Tensor& row, std::size_t count
 std::vector<ninfer::RelocatedPageMove> moves_of(std::span<const ninfer::RelocatedCopySpan> spans,
                                                 ninfer::RelocatedPageCounts mappings) {
     return ninfer::plan_relocated_page_moves(spans, mappings);
+}
+
+// ---------------------------------------------------------------------------------------------
+// C7: the relocated cache, read back through attention.
+//
+// Everything above is a byte comparison: it proves the copier moved the bytes it was asked to move
+// and left everything else alone. It cannot see whether the *read* path interprets them correctly.
+// A cache whose keys carry the source positions' rotation instead of the destination's is
+// byte-exact and numerically wrong, and that is the failure this group exists to catch.
+//
+// The judgement is anchored, not cache-against-cache: attention over the relocated cache is
+// compared against an independent FP64 oracle (ideal_attention_with_delta) that decodes each stored
+// key and rotates it forward by its page's delta, which is the exact inverse of the kernel's Q
+// counter-rotation. The oracle therefore carries the plane's own encode error, so a skipped rotation
+// cannot hide behind it. A negative control -- the same cache with the delta plane zeroed -- has to
+// break the criterion, which is what proves the check can fail at all.
+//
+// The pool-backed cache the shared oracle templates consume. Its image() gathers every page group
+// of the pool by *physical* id, which is the convention k_logical/v_logical resolve a position into
+// through the allocation's published mapping. Sizing that gather by the allocation's logical slot
+// count instead lines the two up only while every owned page happens to have an id below it, which
+// is false for a cache with acquire slots -- exactly the caches this feature produces.
+class PoolCache {
+public:
+    PoolCache(const ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocation& alloc,
+              ninfer::DType dtype, cudaStream_t stream)
+        : pool_(pool), alloc_(alloc), dtype_(dtype), stream_(stream) {}
+
+    struct HostImage {
+        std::vector<double> k;
+        std::vector<double> v;
+    };
+
+    [[nodiscard]] std::vector<std::int32_t> page_ids() const {
+        const std::span<const std::int32_t> ids = alloc_.page_ids();
+        return std::vector<std::int32_t>(ids.begin(), ids.end());
+    }
+
+    [[nodiscard]] HostImage image() const {
+        const std::size_t pages = static_cast<std::size_t>(pool_.page_group_count());
+        const std::size_t elems = pages * static_cast<std::size_t>(kPageSize) *
+                                  static_cast<std::size_t>(kKvHeads) *
+                                  static_cast<std::size_t>(kHeadDim);
+        std::vector<std::int32_t> ids(pages);
+        for (std::size_t i = 0; i < pages; ++i) { ids[i] = static_cast<std::int32_t>(i); }
+        const std::size_t k_bytes_per_page = pool_.page_bytes(0);
+        const std::size_t v_bytes_per_page = pool_.page_bytes(1);
+        std::vector<std::uint8_t> k_raw(pages * k_bytes_per_page);
+        std::vector<std::uint8_t> v_raw(pages * v_bytes_per_page);
+        for (std::size_t i = 0; i < pages; ++i) {
+            pool_.copy_page_to_host(0, static_cast<std::int32_t>(i),
+                                    k_raw.data() + i * k_bytes_per_page, stream_);
+            pool_.copy_page_to_host(1, static_cast<std::int32_t>(i),
+                                    v_raw.data() + i * v_bytes_per_page, stream_);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+        HostImage out{std::vector<double>(elems), std::vector<double>(elems)};
+        for (std::size_t i = 0; i < elems; ++i) {
+            __nv_bfloat16 kk;
+            __nv_bfloat16 vv;
+            std::memcpy(&kk, k_raw.data() + i * sizeof(kk), sizeof(kk));
+            std::memcpy(&vv, v_raw.data() + i * sizeof(vv), sizeof(vv));
+            out.k[i] = static_cast<double>(__bfloat162float(kk));
+            out.v[i] = static_cast<double>(__bfloat162float(vv));
+        }
+        return out;
+    }
+
+    [[nodiscard]] double k_logical(const HostImage& img, std::int32_t position, std::int32_t head,
+                                   std::int32_t d) const {
+        return img.k[logical_index(physical_page_of(position), head, position % kPageSize, d)];
+    }
+
+    [[nodiscard]] double v_logical(const HostImage& img, std::int32_t position, std::int32_t head,
+                                   std::int32_t d) const {
+        return img.v[logical_index(physical_page_of(position), head, position % kPageSize, d)];
+    }
+
+    // The view attention reads, carrying the delta and interval planes the relocation published.
+    // Without them the kernel cannot counter-rotate, so attaching them is what makes the run below
+    // the one the runtime performs rather than a plain decode.
+    [[nodiscard]] ninfer::PagedKVLayerView view(const FreqTable& freq) const {
+        ninfer::PagedKVLayerView out;
+        out.k_pages       = shaped(pool_.plane(0), kHeadDim);
+        out.v_pages       = shaped(pool_.plane(1), kHeadDim);
+        out.block_table   = alloc_.block_table();
+        out.head_dim      = kHeadDim;
+        out.num_kv_heads  = kKvHeads;
+        out.dtype             = dtype_;
+        out.rope_deltas       = pool_.rope_delta_row(0);
+        out.rope_delta_ranges = pool_.rope_delta_range_row(0);
+        out.rope_inv_freq     = freq;
+        return out;
+    }
+
+private:
+    [[nodiscard]] std::int32_t physical_page_of(std::int32_t position) const {
+        return alloc_.page_ids()[static_cast<std::size_t>(position / kPageSize)];
+    }
+
+    // The plane in the view shape {leading, page, heads, pages}: the pool's page image is
+    // [head][page_offset][leading] for a PageMajor plane, which is already that shape.
+    [[nodiscard]] static ninfer::Tensor shaped(const ninfer::Tensor& plane, std::int32_t leading) {
+        return ninfer::Tensor(plane.data, plane.dtype,
+                              {leading, kPageSize, kKvHeads, plane.ne[3]});
+    }
+
+    [[nodiscard]] static std::size_t logical_index(std::int32_t physical_page, std::int32_t head,
+                                                   std::int32_t page_offset, std::int32_t d) {
+        return (static_cast<std::size_t>(head) +
+                static_cast<std::size_t>(kKvHeads) * static_cast<std::size_t>(physical_page)) *
+                   static_cast<std::size_t>(kPageSize) * static_cast<std::size_t>(kHeadDim) +
+               static_cast<std::size_t>(page_offset) * static_cast<std::size_t>(kHeadDim) +
+               static_cast<std::size_t>(d);
+    }
+
+    const ninfer::PagedKVPool& pool_;
+    const ninfer::PagedKVAllocation& alloc_;
+    ninfer::DType dtype_;
+    cudaStream_t stream_;
+};
+
+// Appends one chunk through the production write path at sequential positions, so the cache holds
+// keys rotated at the *source* positions exactly as a resident sequence does.
+void append_pool_chunk(const PoolCache& cache, const std::vector<__nv_bfloat16>& k,
+                       const std::vector<__nv_bfloat16>& v, std::int32_t first_position,
+                       std::int32_t tokens, const FreqTable& freq, cudaStream_t stream) {
+    const ninfer::PagedKVLayerView view = cache.view(freq);
+    ninfer::DeviceBuffer dk(k.size() * sizeof(__nv_bfloat16));
+    ninfer::DeviceBuffer dv(v.size() * sizeof(__nv_bfloat16));
+    ninfer::DeviceBuffer dp(static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
+    dk.copy_from_host(k.data(), k.size() * sizeof(__nv_bfloat16));
+    dv.copy_from_host(v.data(), v.size() * sizeof(__nv_bfloat16));
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        positions[static_cast<std::size_t>(t)] = first_position + t;
+    }
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    ninfer::ops::gqa_kv_append(
+        ninfer::Tensor(dk.p, ninfer::DType::BF16, {kHeadDim, kKvHeads, tokens}),
+        ninfer::Tensor(dv.p, ninfer::DType::BF16, {kHeadDim, kKvHeads, tokens}),
+        ninfer::Tensor(dp.p, ninfer::DType::I32, {tokens}), view, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Decode attention over a pool-backed cache through the public entry point, with the delta and
+// interval planes attached to the view.
+AttentionRun run_pool_attention(const PoolCache& cache, const std::vector<__nv_bfloat16>& q,
+                                std::int32_t first_position, std::int32_t tokens,
+                                std::uint32_t visible, const ninfer::PagedKVLayerView& view) {
+    ninfer::DeviceBuffer dq   = upload(q);
+    ninfer::DeviceBuffer dout = ninfer::DeviceBuffer(q.size() * sizeof(__nv_bfloat16));
+    dout.fill(0);
+    ninfer::DeviceBuffer dp = upload_positions(sequential_positions(first_position, tokens));
+
+    const ninfer::ops::GqaExecutionEnvelope envelope{visible, visible};
+    const std::size_t workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
+        kQHeads, ninfer::DType::BF16, envelope, 1, tokens, tokens);
+    ninfer::DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    ninfer::DeviceArena workspace(ninfer::DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
+
+    ninfer::Tensor tq(dq.p, ninfer::DType::BF16, {kHeadDim, kQHeads, tokens});
+    ninfer::Tensor tp(dp.p, ninfer::DType::I32, {tokens});
+    ninfer::Tensor tout(dout.p, ninfer::DType::BF16, {kHeadDim, kQHeads, tokens});
+    ninfer::ops::gqa_attention_cached(tq, tp, kAttentionScale, view, envelope, workspace, tout,
+                                      nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    CUDA_CHECK(cudaGetLastError());
+    return AttentionRun{download_doubles(dout, q.size())};
 }
 
 } // namespace
@@ -549,6 +756,272 @@ int main() {
               "C5 the ownership partition balances after an off-grid relocation");
         note("off-grid destination: ok (3 moves, " + std::to_string(pool.free_pages()) +
              " free)");
+    }
+    // ------------------------------------------------------------------ C7: attention over it ---
+    // A second pool, because this case seeds real KV content through the production write path and
+    // the byte cases above must stay a pattern-comparison of their own. The shape is the off-grid
+    // one: the run's source and destination sit mid-page, so every destination page is partial and
+    // the interval plane is what tells the read path which keys moved.
+    {
+        const FreqTable freq = default_inv_freq();
+        constexpr std::uint32_t kC7PageGroups  = 16;
+        constexpr std::uint32_t kC7Entitlement = 12;
+        constexpr std::int32_t kC7Pages        = 12;
+        constexpr std::int32_t kC7Tokens       = kC7Pages * kPageSize;
+        // 100 tokens moved by -101, so the source and destination both land mid-page.
+        constexpr std::int32_t kC7Source = 3 * kPageSize;
+        constexpr std::int32_t kC7Dest   = kPageSize + 27;
+        constexpr std::int32_t kC7Run    = 100;
+        // The query window sits immediately after the relocated run, so the read's softmax weights
+        // the relocated keys heavily. That is what makes the control discriminating: a skipped
+        // counter-rotation has to move the output by a wide factor, and a query far from the run
+        // dilutes the damage across keys that were never relocated.
+        constexpr std::int32_t kC7Query    = kC7Dest + kC7Run;
+        constexpr std::int32_t kC7TokensRead = 8;
+        constexpr std::uint32_t kC7Visible =
+            static_cast<std::uint32_t>(kC7Query + kC7TokensRead);
+
+        auto plan7 = plan_kv_pool(kC7PageGroups, kC7Entitlement, 1);
+        ninfer::DeviceArena arena7(plan7.bytes);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ninfer::PagedKVPool pool7({arena7.base(), arena7.capacity()}, plan7.layout);
+
+        // The whole prompt's K and V, drawn as the shared scenario builder draws them: keys are
+        // rotated at their own positions, so the cache a resident sequence would hold is reproduced
+        // exactly and only the relocation can move them.
+        const std::size_t prompt_elems =
+            static_cast<std::size_t>(kHeadDim) * kKvHeads * static_cast<std::size_t>(kC7Tokens);
+        std::vector<__nv_bfloat16> all_k(prompt_elems);
+        std::vector<__nv_bfloat16> all_v(prompt_elems);
+        std::mt19937 rng(0x5c7c01u);
+        std::normal_distribution<double> normal(0.0, 1.0);
+        std::uniform_real_distribution<double> unit(-0.25, 0.25);
+        std::array<double, kHeadDim> row{};
+        std::array<double, kHeadDim> rotated{};
+        for (std::int32_t position = 0; position < kC7Tokens; ++position) {
+            for (std::int32_t head = 0; head < kKvHeads; ++head) {
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    row[static_cast<std::size_t>(d)] = normal(rng);
+                }
+                forward_rope(row.data(), position, freq, rotated.data());
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    all_k[act_index(head, position, kKvHeads, d)] =
+                        __float2bfloat16(static_cast<float>(rotated[static_cast<std::size_t>(d)]));
+                    all_v[act_index(head, position, kKvHeads, d)] =
+                        __float2bfloat16(static_cast<float>(unit(rng)));
+                }
+            }
+        }
+        const std::size_t query_elems = static_cast<std::size_t>(kHeadDim) * kQHeads *
+                                        static_cast<std::size_t>(kC7TokensRead);
+        std::vector<__nv_bfloat16> queries(query_elems);
+        for (std::size_t i = 0; i < query_elems; ++i) {
+            queries[i] = __float2bfloat16(static_cast<float>(unit(rng)));
+        }
+
+        // Two cells: the relocated one, and the directly prefilled reference. Same pool geometry, so
+        // the only difference between them is what the relocation did.
+        auto seed_cell = [&](ninfer::PagedKVPool& pool, ninfer::PagedKVAllocation& alloc,
+                             std::int32_t pages) {
+            alloc = pool.reserve(static_cast<std::uint32_t>(pages));
+            alloc.materialize_pages(static_cast<std::uint32_t>(pages));
+            alloc.bind_row(0, ctx.stream);
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+            const PoolCache cache(pool, alloc, ninfer::DType::BF16, ctx.stream);
+            for (std::int32_t base = 0; base < pages * kPageSize; base += 256) {
+                const std::int32_t count = std::min(256, pages * kPageSize - base);
+                const std::size_t offset =
+                    static_cast<std::size_t>(base) * kHeadDim * kKvHeads;
+                const std::size_t elems =
+                    static_cast<std::size_t>(count) * kHeadDim * kKvHeads;
+                append_pool_chunk(
+                    cache,
+                    std::vector<__nv_bfloat16>(all_k.begin() + static_cast<std::ptrdiff_t>(offset),
+                                               all_k.begin() +
+                                                   static_cast<std::ptrdiff_t>(offset + elems)),
+                    std::vector<__nv_bfloat16>(all_v.begin() + static_cast<std::ptrdiff_t>(offset),
+                                               all_v.begin() +
+                                                   static_cast<std::ptrdiff_t>(offset + elems)),
+                    base, count, freq, ctx.stream);
+            }
+        };
+
+        // The relocated cell: seed the resident prompt, then relocate the run off-grid.
+        ninfer::PagedKVAllocation relocated;
+        seed_cell(pool7, relocated, kC7Pages);
+        const std::vector<std::int32_t> resident7 = ids_of(relocated);
+        const std::vector<ninfer::RelocatedCopySpan> spans7{
+            ninfer::RelocatedCopySpan{.source_begin = static_cast<std::uint32_t>(kC7Source),
+                                      .dest_begin   = static_cast<std::uint32_t>(kC7Dest),
+                                      .tokens       = static_cast<std::uint32_t>(kC7Run)}};
+        std::vector<std::int32_t> mapping7(resident7.begin(), resident7.begin() + kC7Pages);
+        mapping7[static_cast<std::size_t>(kC7Dest / kPageSize)] = ninfer::kPagedKVAquirePage;
+        mapping7[static_cast<std::size_t>(kC7Dest / kPageSize) + 1] =
+            ninfer::kPagedKVAquirePage;
+        const std::vector<ninfer::RopeDeltaPageRange> ranges7 =
+            ninfer::plan_rope_delta_page_ranges(spans7, mapping7.size());
+        relocated.relocate_copied_pages(mapping7, ranges7, spans7, ctx.stream);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+        // The reference cell: a cold prefill of the *edited* prompt. The edit deleted the 101 tokens
+        // the run stepped over, so the edited prompt is the resident one with [dest, source) removed
+        // -- the run then already sits at its destination positions and nothing has to be
+        // counter-rotated. Seeding the resident prompt here instead would make C7d compare two
+        // different prompts and report a relocation defect that is not one.
+        // The edit removes [dest + run, source + run) -- the stretch between where the run now ends
+        // and where it used to -- and keeps everything before and after it. That is what a mid-prompt
+        // edit does, and it is the shape the relocation serves: the run survives at its new
+        // positions and the rest of the prompt is unchanged.
+        const std::int32_t kC7EditedTokens = kC7Tokens - (kC7Source + kC7Run) + (kC7Dest + kC7Run);
+        const std::size_t head_elems =
+            static_cast<std::size_t>(kC7Dest) * kHeadDim * kKvHeads;
+        const std::size_t run_elems =
+            static_cast<std::size_t>(kC7Run) * kHeadDim * kKvHeads;
+        const std::size_t src_elems =
+            static_cast<std::size_t>(kC7Source) * kHeadDim * kKvHeads;
+        const std::size_t tail_src_elems =
+            static_cast<std::size_t>(kC7Source + kC7Run) * kHeadDim * kKvHeads;
+        const std::size_t tail_elems =
+            static_cast<std::size_t>(kC7Tokens - (kC7Source + kC7Run)) * kHeadDim * kKvHeads;
+        std::vector<__nv_bfloat16> edited_k(prompt_elems);
+        std::vector<__nv_bfloat16> edited_v(prompt_elems);
+        std::copy(all_k.begin(), all_k.begin() + static_cast<std::ptrdiff_t>(head_elems),
+                  edited_k.begin());
+        std::copy(all_v.begin(), all_v.begin() + static_cast<std::ptrdiff_t>(head_elems),
+                  edited_v.begin());
+        std::copy(all_k.begin() + static_cast<std::ptrdiff_t>(src_elems),
+                  all_k.begin() + static_cast<std::ptrdiff_t>(src_elems + run_elems),
+                  edited_k.begin() + static_cast<std::ptrdiff_t>(head_elems));
+        std::copy(all_v.begin() + static_cast<std::ptrdiff_t>(src_elems),
+                  all_v.begin() + static_cast<std::ptrdiff_t>(src_elems + run_elems),
+                  edited_v.begin() + static_cast<std::ptrdiff_t>(head_elems));
+        std::copy(all_k.begin() + static_cast<std::ptrdiff_t>(tail_src_elems),
+                  all_k.begin() + static_cast<std::ptrdiff_t>(tail_src_elems + tail_elems),
+                  edited_k.begin() + static_cast<std::ptrdiff_t>(head_elems + run_elems));
+        std::copy(all_v.begin() + static_cast<std::ptrdiff_t>(tail_src_elems),
+                  all_v.begin() + static_cast<std::ptrdiff_t>(tail_src_elems + tail_elems),
+                  edited_v.begin() + static_cast<std::ptrdiff_t>(head_elems + run_elems));
+
+        auto plan7r = plan_kv_pool(kC7PageGroups, kC7Entitlement, 1);
+        ninfer::DeviceArena arena7r(plan7r.bytes);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ninfer::PagedKVPool pool7r({arena7r.base(), arena7r.capacity()}, plan7r.layout);
+        ninfer::PagedKVAllocation reference;
+        reference = pool7r.reserve(static_cast<std::uint32_t>(kC7Pages));
+        reference.materialize_pages(static_cast<std::uint32_t>(kC7Pages));
+        reference.bind_row(0, ctx.stream);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        {
+            const PoolCache cache(pool7r, reference, ninfer::DType::BF16, ctx.stream);
+            for (std::int32_t base = 0; base < kC7EditedTokens; base += 256) {
+                const std::int32_t count = std::min(256, kC7EditedTokens - base);
+                const std::size_t offset =
+                    static_cast<std::size_t>(base) * kHeadDim * kKvHeads;
+                const std::size_t elems =
+                    static_cast<std::size_t>(count) * kHeadDim * kKvHeads;
+                append_pool_chunk(
+                    cache,
+                    std::vector<__nv_bfloat16>(edited_k.begin() +
+                                                    static_cast<std::ptrdiff_t>(offset),
+                                                edited_k.begin() +
+                                                    static_cast<std::ptrdiff_t>(offset + elems)),
+                    std::vector<__nv_bfloat16>(edited_v.begin() +
+                                                    static_cast<std::ptrdiff_t>(offset),
+                                                edited_v.begin() +
+                                                    static_cast<std::ptrdiff_t>(offset + elems)),
+                    base, count, freq, ctx.stream);
+            }
+        }
+        const PoolCache relocated_cache(pool7, relocated, ninfer::DType::BF16, ctx.stream);
+        const PoolCache reference_cache(pool7r, reference, ninfer::DType::BF16, ctx.stream);
+
+        // The interval and delta planes the call published, read back as the oracle reads them.
+        const std::vector<std::uint32_t> published_ranges =
+            read_u32(pool7.rope_delta_range_row(0), mapping7.size());
+        const std::vector<std::int32_t> published_deltas = [&] {
+            std::vector<std::int32_t> out(mapping7.size());
+            CUDA_CHECK(cudaMemcpy(out.data(), pool7.rope_delta_row(0).data,
+                                  out.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            return out;
+        }();
+        const ninfer::PagedKVLayerView relocated_view = relocated_cache.view(freq);
+        const ninfer::PagedKVLayerView reference_view = reference_cache.view(freq);
+        const AttentionRun got_relocated =
+            run_pool_attention(relocated_cache, queries, kC7Query, kC7TokensRead, kC7Visible,
+                               relocated_view);
+        const AttentionRun got_reference =
+            run_pool_attention(reference_cache, queries, kC7Query, kC7TokensRead, kC7Visible,
+                               reference_view);
+
+        // C7a: the relocated cache against the FP64 delta oracle. This is the assertion that a
+        // byte-exact cache with the wrong rotation cannot pass: the oracle rotates each decoded key
+        // forward by its page's delta, so it carries the plane's own BF16 rounding and nothing else.
+        if (!expect_conformant(
+                measure(got_relocated.out,
+                        ideal_attention_with_delta(queries, relocated_cache, kC7Query,
+                                                   kC7TokensRead, published_deltas,
+                                                   published_ranges, freq),
+                        kCopiedRelocationBf16),
+                "C7 attention over the relocated cache against the FP64 delta oracle",
+                kCopiedRelocationBf16)) {
+            ++failures;
+        }
+
+        // C7b: the reference cache against the plain FP64 oracle. A miss here means the harness is
+        // not reading the cache the way the oracle describes it, which would void C7a.
+        if (!expect_conformant(measure(got_reference.out,
+                                       ideal_attention(queries, reference_cache, kC7Query,
+                                                       kC7TokensRead),
+                                       kCopiedRelocationBf16),
+                               "C7 attention over the directly prefilled cache",
+                               kCopiedRelocationBf16)) {
+            ++failures;
+        }
+
+        // C7c: the negative control. The same relocated cache with its delta plane zeroed is read at
+        // the source phase, and the criterion must break -- otherwise C7a would pass whatever the
+        // relocation did. Zeroing is done in a scratch buffer so the published plane is left as the
+        // call left it.
+        {
+            std::vector<std::int32_t> zeroed(published_deltas.size(), 0);
+            ninfer::DeviceBuffer zero_buf(zeroed.size() * sizeof(std::int32_t));
+            zero_buf.copy_from_host(zeroed.data(), zeroed.size() * sizeof(std::int32_t));
+            ninfer::PagedKVLayerView stale = relocated_view;
+            stale.rope_deltas = ninfer::Tensor(zero_buf.p, ninfer::DType::I32,
+                                               {static_cast<std::int32_t>(zeroed.size())});
+            const AttentionRun got_stale =
+                run_pool_attention(relocated_cache, queries, kC7Query, kC7TokensRead, kC7Visible,
+                                   stale);
+            const Error stale_error = measure(
+                got_stale.out,
+                ideal_attention_with_delta(queries, relocated_cache, kC7Query, kC7TokensRead,
+                                           published_deltas, published_ranges, freq));
+            if (!expect_control_separates(
+                    measure(got_relocated.out,
+                            ideal_attention_with_delta(queries, relocated_cache, kC7Query,
+                                                       kC7TokensRead, published_deltas,
+                                                       published_ranges, freq)),
+                    stale_error, "C7 the zeroed delta plane is separated from the correct read")) {
+                ++failures;
+            }
+            note("C7 control: relative L2 " + std::to_string(stale_error.relative_l2) +
+                 " with the delta plane zeroed");
+        }
+
+        // C7d is *not* asserted here, and the reason is worth writing down. The two caches are the
+        // two different prompts this edit produces: the relocated one still holds the resident
+        // sequence, which is 101 tokens longer, so past the relocated run they legitimately hold
+        // different tokens and the cache-against-cache comparison has nothing left to say. The
+        // anchored form above is the assertion that survives on a real relocation, because the FP64
+        // oracle derives what *this* cache should read rather than what the other cache holds.
+        //
+        // The number is still reported, because it is the quantity a reader wants to see next to the
+        // anchored one, and a large value here is only meaningful once the shapes are checked. What
+        // is asserted instead is the shape the equivalence would need: the relocated cache must hold
+        // the run's tokens at the run's positions, which is the byte check C3 already made.
+        note("C7 relocated against directly prefilled: relative L2 " +
+             std::to_string(measure(got_relocated.out, got_reference.out).relative_l2) +
+             " (observation only: the two caches hold two different prompts past the relocated run)");
     }
 
     if (failures != 0) {

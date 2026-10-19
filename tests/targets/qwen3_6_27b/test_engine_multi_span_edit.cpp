@@ -20,9 +20,17 @@
 //
 // The read-out is the same one the single-span case uses: the greedy continuation of a cold prefill
 // versus the reused leg, the first-token logprob delta, and the MTP drafted/accepted counts. The
-// cases are held only to "the reuse leg actually relocated something", because a silent fall back to
-// a cold prefill would make every number true for the wrong reason. A numeric budget can be imposed
-// without editing the source by setting NINFER_MULTISPAN_MIN_AGREED / NINFER_MULTISPAN_FIRST_NAT.
+// cases are held to a numeric budget by default, so a regression fails the binary rather than
+// printing a number nobody reads. `NINFER_MULTISPAN_MIN_AGREED` /
+// `NINFER_MULTISPAN_FIRST_NAT` override it for a run that wants a different budget. The budget is on
+// by default rather than opt-in because CI is not an option here: it would need a runner with an
+// sm_89 device, which neither the Forgejo server nor GitHub has.
+//
+// The budget is 8 agreed and 0.12 nats. The agreement count is only the assertion that the reuse leg
+// relocated anything at all -- the counts move between runs, because prefill is not bit-reproducible
+// (test_engine_prefill_determinism) -- and the first-token delta is what carries the accuracy. 0.12
+// clears the measured spread (0.021-0.046 over ten repeats) by ~2x and still catches the 0.18-1.1
+// nats failure recorded before the quantized decode kernel was fixed.
 //
 // The source-shift path is what the live failure used, so it is the default here; exporting
 // NINFER_SCR_SOURCE_SHIFT=0 (or running with it unset in the environment and setting
@@ -32,19 +40,14 @@
 // Measured at 228e10b5 on the host, in five of the six KV formats (rk2v4-e8 was not run), on the
 // route that copies a kept run into new pages: every case matched a cold run on all eight generated
 // tokens, and the first token's log-probability moved by 0.002 to 0.061 nats. Ten repeats of the
-// one-deep-cut case on rk4v4-e8 stayed between 0.021 and 0.046 nats, so that is the spread to budget
-// above.
+// one-deep-cut case on rk4v4-e8 stayed between 0.021 and 0.046 nats, so that is the spread the
+// default budget above sits clear of.
 //
 // An earlier version of this comment reported the quantized formats failing on this route by 0.2 to
 // 1.1 nats and blamed the quantized prefill kernel. That run predated 228e10b5, which rewrote the
 // quantized decode kernel (a query tile that was being overwritten, plus a missing barrier), and the
 // failure does not reproduce. The reasoning behind it did not hold either: bf16 uses a different
 // decode kernel as well as a different prefill one, so the comparison could not separate the two.
-//
-// The count alone is still not something to gate on -- prefill is not reproducible
-// (test_engine_prefill_determinism) -- so read `first_logprob_delta`, and use
-// NINFER_MULTISPAN_MIN_AGREED / NINFER_MULTISPAN_FIRST_NAT to impose a budget. A budget of 8 agreed
-// and 0.12 nats clears the observed spread and still catches the old failure.
 //
 // `NINFER_MULTISPAN_CASE` selects one case by letter or name (`A`, `A-one-span-large`, ...) so the
 // one-span case can be run on its own; unset runs all three. Case A deletes one contiguous stretch
@@ -244,25 +247,29 @@ Outcome run_case(ninfer::Engine& engine, const Case& test) {
                           std::string(reuse_path_name(reused.prefix_reuse_path)) + ")";
     }
 
-    // Optional numeric gates, off unless asked for, so the cases can be run as a measurement first
-    // and tightened to a regression budget once the numbers are known.
+    // Defaults rather than opt-in, because nothing else would ever enforce them: with no CI (the
+    // suite needs a real sm_89 device), the only thing that runs this binary is a person. The
+    // environment overrides let a run ask for a different budget; they are not a way to turn it off.
     if (outcome.valid) {
+        constexpr std::size_t kDefaultMinAgreed = 8;
+        constexpr double kDefaultFirstNat      = 0.12;
         const char* min_agreed = std::getenv("NINFER_MULTISPAN_MIN_AGREED");
         const char* first_nat  = std::getenv("NINFER_MULTISPAN_FIRST_NAT");
-        if (min_agreed != nullptr && *min_agreed != '\0') {
-            const std::size_t budget = static_cast<std::size_t>(std::stoul(min_agreed));
-            if (agreement(cold, reused) < budget) {
-                outcome.valid   = false;
-                outcome.problem = "greedy agreement fell below the requested budget";
-            }
+        const std::size_t agreed_budget =
+            (min_agreed != nullptr && *min_agreed != '\0')
+                ? static_cast<std::size_t>(std::stoul(min_agreed))
+                : kDefaultMinAgreed;
+        const double nat_budget =
+            (first_nat != nullptr && *first_nat != '\0') ? std::stod(first_nat) : kDefaultFirstNat;
+        if (agreement(cold, reused) < agreed_budget) {
+            outcome.valid   = false;
+            outcome.problem = "greedy agreement fell below the budget of " +
+                              std::to_string(agreed_budget);
         }
-        if (first_nat != nullptr && *first_nat != '\0') {
-            const double budget = std::stod(first_nat);
-            const double delta  = first_logprob_delta(cold, reused);
-            if (delta < 0.0 || delta > budget) {
-                outcome.valid   = false;
-                outcome.problem = "the first-token logprob moved past the requested budget";
-            }
+        if (first_logprob_delta(cold, reused) < 0.0 || first_logprob_delta(cold, reused) > nat_budget) {
+            outcome.valid   = false;
+            outcome.problem = "the first-token logprob moved past the budget of " +
+                              std::to_string(nat_budget) + " nats";
         }
     }
     return outcome;
