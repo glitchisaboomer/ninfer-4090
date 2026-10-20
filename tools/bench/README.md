@@ -127,6 +127,89 @@ schema-v8 serving startup record. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
 not alter the measurement method.
 
+## MTP acceptance sweep
+
+`run_gate_b_acceptance_sweep.py` answers one question that op-level benchmarks cannot: **how does
+acceptance decay across proposal positions, and what does each extra draft token cost in round
+time?** It starts one server per `(workload, K)` point — the memory plan and execution graphs are
+startup-fixed, so `K` cannot change in-process — issues the same prompts at every K, and derives
+per-position acceptance from the full-precision structured request log.
+
+```bash
+python tools/bench/run_gate_b_acceptance_sweep.py \
+    --server build/apps/Release/ninfer-serve.exe \
+    --model  E:/models/qwen3_8_27b.ninfer \
+    --out    profiles/bench/gate-b \
+    --workloads reasoning,freeform,structured --ks 1,2,3,5,7,10,15
+```
+
+Four built-in workloads span the acceptance range the decode campaign cares about: `reasoning`
+(chain-of-thought, the campaign target), `freeform` (low-acceptance prose control), `structured`
+(highly regular output), and `longctx` (~39K-token padded prompts, for the campaign's 40K working
+context — issue #96 measured acceptance falling 0.724 to 0.603 going from 145 to 133K context, so
+this arm is required before changing a production default). Everything except K is pinned:
+`--max-concurrency 1`, `--kv-dtype rk4v4-e8`, `--lm-head-draft`, `temperature 0`, fixed seed,
+identical prompts.
+
+Note that raising `--max-context` alone does not exercise long context: the prompts themselves must
+be long, or the model never sits at depth. The summary prints a **"Context depth actually
+reached"** table from the server's own `computed_prefill_tokens`, so a short-prompt run cannot be
+mistaken for a long-context one — check the `final_ctx` column. Pad `longctx` deeper with
+`--longctx-repeats N` (roughly 140 tokens per repeat; treat that as an approximation and calibrate
+against the reported `prefill_tok`).
+
+Per-position acceptance is derived with exact denominators — `drafted_at_0 = rounds` and
+`drafted_at_i = accepted_at_{i-1}` — rather than assuming a flat histogram. This matters because the
+aggregate `accepted_tokens / drafted_tokens` is a different and much smaller quantity than
+per-position q (at per-position q=0.50, K=3 the aggregate is 0.29), and conflating them inverts
+conclusions about whether wider speculation can pay.
+
+Outputs under `--out`: `gate_b_points.json` (full record), `gate_b_summary.csv`, the raw append-mode
+`server.requests.jsonl`, and one server log per point. Rationale and interpretation live in
+[`../docs/optimization-findings.md`](../docs/optimization-findings.md) under Gate B.
+
+## Verify-path profiling
+
+`profile_verify_path.py` answers "where does the extra round time at a wider draft width go?" by
+running the server under Nsight Systems once per K and comparing GPU kernel time per kernel. Pure
+Python, so it works on Windows with no shell.
+
+```bat
+python tools\bench\profile_verify_path.py ^
+    --server build\apps\Release\ninfer-serve.exe ^
+    --model  E:\models\qwen3_8_27b.ninfer
+```
+
+Start short: a short prompt keeps prefill instant and makes the per-column kernels stand out. It does
+not, however, size the deployment regime. A short trace accounts for roughly half of the per-column
+cost measured at 150K, and attention nearly doubles per call inside the real verify path even though
+the isolated op benchmark reports it as flat in K. For a deep run, pad the prompt and raise the window:
+
+```bat
+python tools\bench\profile_verify_path.py ^
+    --server ... --model ... --max-context 40000 --longctx-repeats 280
+```
+
+Every run prints the context depth each request actually reached and calibrates tokens-per-repeat
+from it — `--max-context` alone moves the ceiling, not the prompts. Depth is `prompt_tokens`, the
+context the decode ran against, and *not* `computed_prefill_tokens`: the warmup request primes the
+same prompt, so the measured request reuses the prefix and prefills almost nothing while still
+decoding at full depth. Both numbers are printed.
+
+To re-read profiles copied in from another machine, profile nothing:
+
+```bat
+python tools\bench\profile_verify_path.py --analyze-only --out profiles\verify-profile
+```
+
+It starts no server, reports each point's trace and request-log timestamps so a stale trace cannot
+pass for the current run, and never re-exports an empty `.nsys-rep` over a working `.sqlite`.
+
+The script passes `--no-cuda-graph` because verify otherwise runs inside a
+captured CUDA Graph that nsys reports as one opaque node; the K-vs-K delta is the meaningful quantity,
+not the absolute times. Full beginner walkthrough, Windows install paths for nsys, and how to read the
+output are in [`../docs/optimization-findings.md`](../docs/optimization-findings.md) under Gate B.
+
 ## Concurrent serving benchmark
 
 `run_serve_concurrency.py` measures two separate concurrency properties through real loopback
