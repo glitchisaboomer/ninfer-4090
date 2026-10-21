@@ -210,6 +210,26 @@ captured CUDA Graph that nsys reports as one opaque node; the K-vs-K delta is th
 not the absolute times. Full beginner walkthrough, Windows install paths for nsys, and how to read the
 output are in [`../docs/optimization-findings.md`](../docs/optimization-findings.md) under Gate B.
 
+## MTP verify-attention Nsight Compute profile
+
+`profile_attention_width_ncu.py` captures the first target-verify attention kernel matching the
+width-4 specialization for K=3 or width-6 specialization for K=5. It starts one server per K with
+CUDA Graphs disabled, sends a padded ~45K-context request, and saves an `.ncu-rep` plus server and
+request logs. NCU's default `full` metric set is intentionally limited to one matching launch per K;
+its replay timing is for attribution, not latency comparison.
+
+```bat
+python tools\bench\profile_attention_width_ncu.py ^
+    --server build\apps\Release\ninfer-serve.exe ^
+    --model E:\models\qwen3_8_27b.ninfer
+```
+
+Outputs default to `profiles/attention-width-ncu/k3/` and `k5/`. Verify the request log reports the
+intended prompt depth, then compare `LaunchStats`, `Occupancy`, `SchedulerStats`,
+`MemoryWorkloadAnalysis`, and `WarpStateStats` in Nsight Compute. If the padding lands below 40K,
+increase `--longctx-repeats`; use `--ncu` if `ncu.exe` is not on PATH or in a standard install
+location. `--launch-count 16` profiles all 16 target full-attention launches, but takes longer.
+
 ## Concurrent serving benchmark
 
 `run_serve_concurrency.py` measures two separate concurrency properties through real loopback
