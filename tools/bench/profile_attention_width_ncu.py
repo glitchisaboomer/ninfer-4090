@@ -216,7 +216,7 @@ def run_point(args: argparse.Namespace, ncu: Path, k: int, port: int) -> dict[st
     # string: NCU splits a value on commas itself only for `--metrics`, and a shell that mangles a
     # line continuation turns each fragment into its own argv token, which NCU then reports as
     # "'<metric>' does not exist or is not an executable" because it treats it as the application.
-    command: list[str] = []
+    command: list[str] = [str(ncu)]
     if not sections and not metrics:
         command += ["--set", args.metric_set]
     for name in sections:
