@@ -224,11 +224,32 @@ python tools\bench\profile_attention_width_ncu.py ^
     --model E:\models\qwen3_8_27b.ninfer
 ```
 
-Outputs default to `profiles/attention-width-ncu/k3/` and `k5/`. Verify the request log reports the
-intended prompt depth, then compare `LaunchStats`, `Occupancy`, `SchedulerStats`,
+Outputs default to `profiles/attention-width-ncu/k3/` and `k5/`, with reports named
+`attention_k<K>_width<W>.ncu-rep` so an import cannot pick the wrong file. Verify the request log
+reports the intended prompt depth, then compare `LaunchStats`, `Occupancy`, `SchedulerStats`,
 `MemoryWorkloadAnalysis`, and `WarpStateStats` in Nsight Compute. If the padding lands below 40K,
 increase `--longctx-repeats`; use `--ncu` if `ncu.exe` is not on PATH or in a standard install
 location. `--launch-count 16` profiles all 16 target full-attention launches, but takes longer.
+
+**Pass `--launch-skip` or you will profile the warmup.** The server warms up before it listens, and
+that warmup (`GenerationService::warmup` sends `"hi"` with `max_tokens = 4`) launches the same
+specialized kernel once per full-attention layer per decode round — roughly **64 matching launches**
+for 16 layers, not 16. `--launch-count 1` with no skip, or with a skip smaller than that, captures a
+`Grid (4,4,1)` = 16-block warmup and reports it as if it were the long-context request. A run that
+does this still looks healthy: the request log shows the intended depth, because the request did
+run; NCU simply profiled something else earlier.
+
+The reliable check is **`Grid Size`**, which grows with the window: a 3-token warmup gives 16 blocks,
+a 40K request gives `(4,64,1)` = 256. The script now computes the captured grid from the exported
+CSV and warns when it is smaller than the requested depth implies, naming `--launch-skip` as the
+fix. If it warns, raise the skip (128 is a safe overshoot past the warmup) and re-run; the request
+itself always runs at full depth, so nothing else about the run needs to change.
+
+Every point also writes `<report>.csv` beside the report, produced by `ncu --import --csv` and
+trimmed to occupancy, register, stall, hit-rate, spill, instruction, cycle, block-size, and grid-size
+rows — about 40% of the full export. That is the file to move off the profiling machine: the binary
+report's bulk is raw counters, and nothing in this repository reads it. If `--import` fails the
+error is reported and the report is kept.
 
 ## Concurrent serving benchmark
 

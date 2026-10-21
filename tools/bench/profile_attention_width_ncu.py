@@ -18,8 +18,10 @@ occupancy/resource/stall metrics and use the existing end-to-end measurements fo
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -84,6 +86,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kv-dtype", default="rk4v4-e8")
     parser.add_argument("--launch-count", type=int, default=1,
                         help="matching specialization launches to profile per K (default 1)")
+    # The server warms up before it listens, with a one-word prompt (`GenerationService::warmup`
+    # sends "hi" for 4 tokens). That warmup launches the same specialized kernel, so with
+    # `--launch-count 1` and no skip NCU profiles the WARMUP -- a ~16-block grid at minimum
+    # splits -- and reports it as if it were the long-context request. Skipping the warmup's
+    # attention launches is what makes the captured launch the one this tool claims to measure.
+    parser.add_argument("--launch-skip", type=int, default=0,
+                        help="matching launches to skip before profiling; set past the server's "
+                             "warmup (its attention launch count, typically 16-32 for 16 "
+                             "full-attention layers) or use --launch-skip-auto to size it")
     parser.add_argument("--set", dest="metric_set", default="full",
                         help="Nsight Compute metric set (default: full)")
     parser.add_argument("--startup-timeout", type=float, default=600.0)
@@ -109,6 +120,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("require --max-context > --min-context >= 1")
     if args.longctx_repeats < 1 or args.output_tokens < 1 or args.launch_count < 1:
         parser.error("--longctx-repeats, --output-tokens, and --launch-count must be positive")
+    if args.launch_skip < 0:
+        parser.error("--launch-skip must be nonnegative")
     return args
 
 
@@ -151,7 +164,10 @@ def run_point(args: argparse.Namespace, ncu: Path, k: int, port: int) -> dict[st
     tag = f"k{k}"
     directory = args.out / tag
     directory.mkdir(parents=True, exist_ok=True)
-    report_stem = directory / f"attention_width{ k + 1 }"
+    # Self-describing: the verify width is `k + 1`, and naming the report after it alone made
+    # `attention_width4` mean K=3 in one directory and get re-imported as K=5 in another. Both the
+    # K and the width belong in the name so an import cannot pick the wrong file.
+    report_stem = directory / f"attention_k{k}_width{k + 1}"
     report = report_stem.with_suffix(".ncu-rep")
     log_path = directory / "ncu-server.log"
     request_log = directory / "server.requests.jsonl"
@@ -163,14 +179,18 @@ def run_point(args: argparse.Namespace, ncu: Path, k: int, port: int) -> dict[st
         raise RuntimeError(f"port {port} is already serving /health ({why}); choose another --port")
 
     # The regex matches the exact width/warp/min-block specialization identified in the Nsys
-    # traces. NCU captures the first such launch, which occurs in target verify before MTP
-    # alignment/proposal attention launches.
+    # traces. With a nonzero `--launch-skip` this skips the server's warmup launches, so the
+    # captured launch belongs to the long-context request this tool sends.
     kernel_regex = KERNEL_SPECIALIZATIONS[k]
     command = [
         str(ncu), "--set", args.metric_set,
         "--kernel-name-base", "demangled",
         "--kernel-name", kernel_regex,
         "--launch-count", str(args.launch_count),
+    ]
+    if args.launch_skip > 0:
+        command += ["--launch-skip", str(args.launch_skip)]
+    command += [
         "--force-overwrite",
         "--export", str(report_stem),
         "--", str(args.server), str(args.model),
@@ -188,6 +208,7 @@ def run_point(args: argparse.Namespace, ncu: Path, k: int, port: int) -> dict[st
         "kernel_filter": kernel_regex,
         "metric_set": args.metric_set,
         "launch_count": args.launch_count,
+        "launch_skip": args.launch_skip,
         "max_context": args.max_context,
         "longctx_repeats": args.longctx_repeats,
         "output_tokens": args.output_tokens,
@@ -226,10 +247,113 @@ def run_point(args: argparse.Namespace, ncu: Path, k: int, port: int) -> dict[st
             shared._LIVE_PIDS.discard(process.pid)
 
     if not report.exists() or report.stat().st_size < 100_000:
-        raise RuntimeError(f"NCU report missing or suspiciously small: {report}; inspect {log_path}")
+        raise RuntimeError(
+            f"NCU report missing or suspiciously small: {report}; inspect {log_path}" +
+            ncu_tail(log_path))
     shared.log(f"K={k}: saved {report} ({report.stat().st_size:,} bytes)")
+
+    # The report is a binary whose bulk is raw per-metric counters, and nothing in this repository
+    # reads it -- it exists for the Nsight Compute GUI. Export the text view beside it so the
+    # interesting rows survive when the report itself is too large to move off the profiling box.
+    csv_path = report_stem.with_suffix(".csv")
+    exported = export_report(ncu, report_stem, csv_path)
+    if exported:
+        shared.log(f"K={k}: exported {csv_path} ({csv_path.stat().st_size:,} bytes)")
+
+    # Verify the captured launch is the long-context one. `--launch-skip` is a guess about how many
+    # matching launches the server's warmup performs, and getting it wrong is silent: the request
+    # still runs at full depth, so the request log looks correct while NCU profiled a 3-token
+    # warmup. The warmup launches a minimal-split grid, so an unexpectedly small grid is the
+    # signature of that mistake. `splits` grows with the window, so the real verify launch of a
+    # 40K request is (KVHeads, 64, batch) -- hundreds of blocks, not tens.
+    grid = exported.get("Grid Size")
+    if grid:
+        blocks = 1
+        for factor in re.findall(r"\d+", grid.replace(",", "")):
+            blocks *= int(factor)
+        expected_floor = 4 * max(1, int(args.min_context // 1024))
+        shared.log(f"K={k}: captured launch grid {grid} = {blocks} blocks")
+        if blocks < expected_floor:
+            shared.log(f"  WARNING: only {blocks} blocks for a {args.min_context}-token request "
+                       f"(expected >= {expected_floor}). This looks like a warmup launch -- raise "
+                       f"--launch-skip (warmup runs max_tokens=4 over 16 full-attention layers, so "
+                       f"~64 matching launches precede the request).")
+    else:
+        shared.log(f"K={k}: grid size unavailable; check --launch-skip by hand")
     return {"k": k, "depth": depth, "completion_tokens": completion,
-            "report": str(report), "command": command}
+            "report": str(report), "csv": str(csv_path) if exported else None,
+            "command": command}
+
+
+# Metrics the width comparison is actually decided on. Extracting only these keeps the text export
+# small enough to commit or paste, which the full `--set full` dump is not. `block size` and
+# `grid size` stay because they are how a warmup launch is told apart from the real request: the
+# warmup sends "hi" and lands a minimal-split grid, which is the mistake this tool made once.
+FOCUS_METRIC_PATTERN = (
+    "occupancy|warps?_|stall|hit rate|sectors|eligible|throughput|duration|registers"
+    "|shared memory|spill|instructions|cycles|block size|grid size"
+)
+
+
+def ncu_tail(log_path: Path, lines: int = 20) -> str:
+    """Return the tail of an NCU run log for an error message.
+
+    NCU writes its own failures -- `ERR_NVGPUCTRPERM`, `Could not open report file`, an empty
+    `0 kernels` match -- to the redirected stdout, never to this process. Without this the only
+    symptom of a failed profile is a missing report, which is indistinguishable from a slow flush.
+    """
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    interesting = [line for line in text if "==ERROR==" in line or "ERR_" in line]
+    if not interesting:
+        interesting = text[-lines:]
+    return "\n  " + "\n  ".join(interesting[-lines:])
+
+
+def export_report(ncu: Path, report_stem: Path, csv_path: Path) -> dict[str, str]:
+    """Export a saved report to CSV with `ncu --import`, keeping only the focus metrics.
+
+    Failure is reported and swallowed: the report itself is still valid and the caller may be
+    running on a machine without a working `--import`. Returns the kept metric/value pairs so the
+    caller can check the launch it captured.
+    """
+    raw = csv_path.with_name(csv_path.stem + ".full.csv")
+    try:
+        completed = subprocess.run(
+            [str(ncu), "--import", str(report_stem.with_suffix(".ncu-rep")), "--csv"],
+            capture_output=True, check=False, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        shared.log(f"  CSV export skipped: {error}")
+        return {}
+    text = completed.stdout.decode("utf-8", errors="replace")
+    if completed.returncode != 0 or not text.strip():
+        detail = completed.stderr.decode("utf-8", errors="replace").strip().splitlines()
+        shared.log(f"  CSV export failed (rc={completed.returncode}): "
+                   f"{(detail[0] if detail else 'no stderr')}")
+        return {}
+    raw.write_text(text, encoding="utf-8")
+    try:
+        columns = list(csv.DictReader(text.splitlines()))
+        pattern = re.compile(FOCUS_METRIC_PATTERN, re.IGNORECASE)
+        kept = [row for row in columns if pattern.search(row.get("Metric Name") or "")]
+    except (csv.Error, StopIteration) as error:
+        shared.log(f"  CSV export kept unparsed: {error}")
+        raw.replace(csv_path)
+        return {}
+    if not kept:
+        shared.log("  CSV export matched no focus metrics; keeping the full export")
+        raw.replace(csv_path)
+        return {}
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(kept[0].keys()))
+        writer.writeheader()
+        writer.writerows(kept)
+    raw.unlink(missing_ok=True)
+    shared.log(f"  kept {len(kept)} of {len(columns)} metric rows")
+    return {row["Metric Name"]: row["Metric Value"] for row in kept
+            if (row.get("Metric Name") or "").strip()}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
