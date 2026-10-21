@@ -41,9 +41,22 @@ DEFAULT_NCU_ROOTS = [
     Path(r"C:\NVIDIA\Nsight Compute"),
 ]
 KERNEL_SPECIALIZATIONS = {
-    3: r"regex:.*gqa_attention_decode_i8_tiled_kernel.*\(int\)4, \(int\)8, \(int\)2,",
-    5: r"regex:.*gqa_attention_decode_i8_tiled_kernel.*\(int\)6, \(int\)6, \(int\)1,",
+    3: r"regex:.*gqa_attention_decode_i8_tiled_kernel.*\(int\)4, \(int\)8,",
+    5: r"regex:.*gqa_attention_decode_i8_tiled_kernel.*\(int\)6, \(int\)6,",
 }
+
+# The two specializations differ in more than width: 4 query tokens take `<4, 8, 2, 32>` and 6 take
+# `<6, 6, <min-blocks>, 32>`. Pinning the min-blocks value in the filter above made it stop matching
+# the moment that value was tuned, which looks exactly like "no kernel found" and like a warmup
+# capture. Match the token tile and warp count, which identify the launch, and let the tuning
+# parameters vary.
+
+# `ncu --list-sets` offers basic/detailed/full/nvlink/pmsampling/roofline. `LaunchStats` is a
+# *section* inside those, not a set, so asking for it collects nothing and the report comes out
+# empty with "No metrics to collect found in sections". `basic` is the cheap set -- LaunchStats,
+# Occupancy, SpeedOfLight, WorkloadDistribution, 213 metrics in one replay pass instead of 45 for
+# `full` -- which is what an occupancy question needs.
+VALID_SETS = ("basic", "detailed", "full", "nvlink", "pmsampling", "roofline")
 
 
 def find_ncu(explicit: str | None) -> Path:
@@ -93,10 +106,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # attention launches is what makes the captured launch the one this tool claims to measure.
     parser.add_argument("--launch-skip", type=int, default=0,
                         help="matching launches to skip before profiling; set past the server's "
-                             "warmup (its attention launch count, typically 16-32 for 16 "
-                             "full-attention layers) or use --launch-skip-auto to size it")
+                             "warmup, which is about 64 launches (4 decode rounds over 16 "
+                             "full-attention layers). The grid-size warning says when it was "
+                             "too small")
     parser.add_argument("--set", dest="metric_set", default="full",
-                        help="Nsight Compute metric set (default: full)")
+                        choices=VALID_SETS,
+                        help="Nsight Compute metric set (default: full). Use 'basic' while "
+                             "iterating: it answers occupancy and throughput in one replay pass")
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument("--request-timeout", type=float, default=1800.0)
     parser.add_argument("--flush-seconds", type=float, default=5.0)
