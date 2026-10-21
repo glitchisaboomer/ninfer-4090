@@ -175,13 +175,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     } else if constexpr (TokenTile == 6) {
         // Three Q row tiles for the 27B group of six (RowTiles = 3).
         if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<6, 2, 32, false>();
+            launch.template operator()<6, 1, 32, false>();
         } else if (implementation_window <= 2054) {
-            launch.template operator()<6, 2, 32, false>();
+            launch.template operator()<6, 1, 32, false>();
         } else if (implementation_window <= 8198) {
-            launch.template operator()<6, 2, 64, true>();
+            launch.template operator()<6, 1, 64, true>();
         } else {
-            launch.template operator()<6, 2, 32, false>();
+            launch.template operator()<6, 1, 32, false>();
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {
