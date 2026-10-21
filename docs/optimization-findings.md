@@ -46,7 +46,9 @@ RTX 5090 results do not establish RTX 4090 behavior.
 | 0 | Fix `$ExtraArgs` splatting in serving script | correctness | **TODO** |
 | 0 | Confirm `text/draft_head` in artifact | gates 1.1 | **TODO** |
 | 1.1 | `--lm-head-draft` | 10-15% | **Already applied** |
+| 1.2 | MTP hidden copy-back → ping-pong buffers | 0.013% at K=5 | **RETIRED (measured)** — a copy node costs ~1.5 µs, linear in `K-1`: 4.05 µs at K=5 against a 31.31 ms round, and ~22 µs at K=15 against ~52 ms. Payload is 10 KiB (~10 ns), so the cost is launch overhead, not bandwidth. Below the round-time noise floor; no implementation exists in `src/` |
 | 1.3 / 1.4 | GDN decode grid sizing | **RETIRED (measured)** | Production grid is 384 blocks × 128 threads = exactly 3.0 waves on 128 SMs. Prototype compared 4 grid/block variants under batch=1 with a bit-exactness gate: no candidate beat production (6–47% slower at T=16) |
+| 2 | MTP verify attention at width 6 | ~+5% at K=5 | **MECHANISM FOUND (NCU, 40K)** — width 6 costs +72% per call (93.6 → 160.6 µs) because the third Q row tile pushes registers 128 → 238, dropping block residency to 1 and occupancy to 12.4%. DRAM falls 52% → 29% while instructions rise only 15%: latency-hiding collapse, not extra work. Fix is to restore 2-block residency at width 6 |
 | 1.5 | INT8 group-64 activation prefill (from `sergiuszm/ninfer-4090`) | **+71% prefill / -7.6% decode** | **Open — different axis (TTFT)** |
 | 2 | Cost × acceptance curve vs K | decision | **MEASURED at four context depths. Short context peaks at K=5 (+10% over K=3); at 44.5K, the campaign's operating point, K=3 and K=5 are a tie within noise; at 150K K=5 loses to K=3 by 11%. Width is not the lever: the marginal cost of a draft column at 44.5K is 51% MTP proposal and 42% attention** |
 | 3 | Scan-based GDN verify | ~+6% ceiling | **RETIRED at the reported acceptance regime; reopen only per Gate B** |
@@ -464,9 +466,9 @@ tok/rd, ms/rd and acceptance come from the profiled request; tok/s lists every s
 |---|---|---|---|---|---|---|
 | 1 | 132 | 1.939 | 25.34 | 76.5 | 0.924 | 0.924 |
 | 3 | 76 | 3.368 | 28.32 | **119.0 / 114.8 / 110.7** | 0.788 | 0.908 / 0.826 / 0.912 |
-| 5 | 73 | 3.507 | 31.31 | 112.0 / 115.2 | 0.508 | 0.877 / 0.734 / 0.787 / 0.622 / 0.478 |
+| 5 | 73 | 3.507 | 31.31 | 115.2 / 112.0 | 0.508 | 0.877 / 0.734 / 0.787 / 0.622 / 0.478 |
 
-**K=3 and K=5 are a tie at 44.5K** (spread within K exceeds the gap); both 46–56% over K=1. The same
+**K=3 and K=5 are a tie at 44.5K** (spread within K exceeds the gap); both 46–55% over K=1. The same
 shape on `swift1_5_27b` (45,435-token prompts) also ties: K=3 119.2 / 105.4, K=5 118.1 / 118.1. The
 extra columns do earn tokens (+0.14 tok/rd) but cost **1.50–1.94 ms per draft column** across sample
 pairs.
@@ -493,6 +495,54 @@ Action plan, in order:
    `gqa_attention_decode_i8_tiled` at verify width 4 vs 6 at 44.5K: compare achieved occupancy, L2
    hit rate, and the mask/page-layout path against the isolated bench. Success = per-call time flat
    in width; worth ~+5% at K=5.
+
+   **Mechanism found (NCU, width 4 vs 6, at depth).** Profiled on the production verify kernel with
+   `tools/bench/profile_attention_width_ncu.py --launch-skip 128`, capturing a launch between the
+   request's submit and completion at `prompt_tokens 40736`:
+
+   | metric | width 4 (K=3) | width 6 (K=5) | delta |
+   |---|---|---|---|
+   | specialization | `<4, 8, 2, 32>` | `<6, 6, 1, 32>` | — |
+   | grid × block | 256 × 256 | 256 × 192 | block −25% |
+   | **duration** | **93.60 µs** | **160.64 µs** | **+71.6%** |
+   | **registers/thread** | **128** | **238** | **+86%** |
+   | block limit (registers) | 2 | **1** | −50% |
+   | **theoretical occupancy** | **33.3%** | **12.5%** | **−62.5%** |
+   | **achieved occupancy** | **31.25%** | **12.41%** | **−60.3%** |
+   | eligible warps/scheduler | 0.60 | 0.28 | −53.3% |
+   | no eligible | 61.9% | 75.3% | +21.6% |
+   | **DRAM throughput** | **52.4%** | **29.0%** | **−44.6%** |
+   | L2 hit rate | 35.9% | 32.4% | −9.6% |
+   | executed instructions | 44.9 M | 51.7 M | +15.2% |
+
+   This reproduces the Nsys per-call figure independently: **96.0 → 155.6 µs (+62%)** there,
+   **93.6 → 160.6 µs (+71.6%)** here. The isolated `causal_softmax_attention_bench` reporting it flat
+   was the wrong proxy, and that question is now settled.
+
+   The cause is a **third Q row tile**: `TokenTile × GroupSize` is 24 rows at width 4 (2 row tiles)
+   but 36 at width 6 (3 row tiles), so the launcher selects `<6, 6, 1, 32>` instead of
+   `<4, 8, 2, 32>`. At 238 registers `Block Limit Registers` falls to 1 and occupancy — theoretical
+   and achieved alike — collapses to ~12%: one 192-thread block per SM. The kernel is
+   **memory-bound at width 4 and starved of warps at width 6**: DRAM utilisation falls 52% → 29%
+   while duration rises 72%, and executed instructions rise only 15%, so the extra time is not extra
+   work — it is the loss of latency hiding. It is the repository's own `__launch_bounds__` trade
+   from `AGENTS.md` landing on the wrong side: 128 registers buy occupancy at width 4, and the extra
+   row tile spends it.
+
+   **A warmup capture gets the bottleneck wrong, not just the µs.** Two earlier runs (skip 0 and
+   skip 16) profiled the server's warmup instead — `max_tokens=4` over 16 full-attention layers puts
+   ~64 matching launches before the request, so a skip of 16 lands inside it. That capture showed a
+   16-block grid at DRAM 1.4% and read as *latency-bound*; at real depth the same kernel runs at 52%
+   of DRAM peak. `Grid Size` is the discriminator (16 blocks vs 256), and the tool now warns when the
+   captured grid is too small for the requested depth rather than reporting numbers for the wrong
+   launch.
+
+   **Next experiment, now targeted:** the width-6 specialization already concedes
+   `MinBlocksPerSm = 1`. Cutting its register demand enough to restore 2-block residency — fewer
+   live accumulators per row tile, or a serialized third row tile — is the specific change that would
+   flatten the width curve; nothing in the memory path needs to move. At 29% DRAM against 52% for
+   width 4, there is headroom for a second resident block to exploit. Measure with
+   `--launch-skip 128` and check `Achieved Occupancy` and `DRAM Throughput` move together.
 2. **Halve the proposal bytes** (51% of the delta). 770 MiB/column today; Q4G64 MTP layer + a
    65,536-row draft head gives 385 MiB (~880 → ~450 µs/column), ~+5% at K=3 and ~+8% at K=5. Gate on
    per-position acceptance at 44.5K within ~1% of the current curve.
@@ -579,7 +629,7 @@ Copy the `profiles\verify-profile` directory back into the repo to continue the 
 | Regime | Best K | Gain vs K=1 | Gain vs current K=3 baseline |
 |---|---|---|---|
 | Short context (~1.2K, 512–1024 tok out) | **K=5** | +66% | +10% |
-| **44.5K (the campaign's operating point)** | **K=3 / K=5 tie** | K=3 +56%, K=5 +46% | **0% — within run-to-run noise** |
+| **44.5K (the campaign's operating point)** | **K=3 / K=5 tie** | K=3 +55%, K=5 +46% | **0% — within run-to-run noise** |
 | Long context (150K) | **K=3** (already the baseline) | +42% | **0% — no change** |
 
 **Do not change the production default.** The campaign runs at `--max-context 131144`, and at both
@@ -778,6 +828,57 @@ The serving script already passes it, and the artifact resolves to
 Verification always uses the full head, so generated text is unchanged (greedy: bit-identical).
 The flag trades slightly lower acceptance for markedly faster rounds — measure the product, not
 one factor.
+
+### MTP hidden copy-back — not worth implementing (measured)
+
+`mtp_impl.h:183` copies the hidden state back after every draft step:
+
+```cpp
+CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
+                           cudaMemcpyDeviceToDevice, state.execution.device.stream));
+```
+
+A ping-pong buffer pair would delete that copy. `bench/ops/mtp_hidden_copy_bench.cu` isolates the
+removable graph-node cost by capturing two chains at the production shape (`hidden=5120`, BF16,
+batch=1, so 10 KiB per step) and comparing graph topology and replay time.
+
+**The payload is not the problem.** 10,240 B at 86% of 1 TB/s is ~10 ns. What a copy node costs is
+fixed launch overhead. Measured on the RTX 4090 (`--repeats 60000 --samples 20`, clock ramped to
+2,670 MHz first):
+
+| K | steps | copy-back µs | ping-pong µs | delta µs | graph nodes (copy/ping) |
+|---|---|---|---|---|---|
+| 1 | 0 | 0.1356 | 0.1341 | +0.00 | 0 / 0 |
+| 3 | 2 | 7.1526 | 6.8688 | +0.28 | 4/2 vs 2/0 |
+| 5 | 4 | 11.0968 | 7.0494 | +4.05 | 8/4 vs 4/0 |
+| 7 | 6 | 13.9271 | 9.1395 | +4.79 | 12/6 vs 6/0 |
+| 15 | 14 | 34.5911 | 12.7392 | +21.85 | 28/14 vs 14/0 |
+
+~1.5 µs per copy node, linear in `K-1` as expected. **The node counts are the reproducible result;
+the microseconds are order-of-magnitude only.** The default `--repeats 500` is too short to resolve
+a 0.13 µs/launch workload — short runs reported ping-pong *slower* than copy-back at K=3 and K=5,
+which is physically impossible — and the WSL/`dxgkrnl` submission path plus the P8→P2 clock ramp add
+jitter of the same magnitude. Repeat runs at K=15 gave 21.9 / 42.7 / 44.3 µs.
+
+**Verdict: do not implement ping-pong.** Against the 31.31 ms K=5 round measured at 44.5K context
+(§ fourth run above), 4.05 µs is **0.013%**. Even the pessimistic K=15 delta is ~0.04% of a ~52 ms
+round. The measured marginal cost of a draft column is 1.50–1.94 ms, four orders of magnitude
+larger. A measurable delta here would only have justified an end-to-end A/B; there is not one.
+
+There is no ping-pong implementation in `src/` to A/B — `grep -rn ping_pong src/` is empty. The bench
+compares two chains captured for the purpose, so its numbers are a proxy, not a speedup.
+
+**Confirmed end-to-end, and closed.** `ninfer_qwen3_6_27b_mtp_round_bench` on `qwen3_8_27b.ninfer`
+at `--draft-tokens 3` reports `mtp_round_mean_ms` 24.2044 with `mtp_round_min_ms` 24.0845 and
+`mtp_round_max_ms` 24.2762. The within-run spread is **192 µs**, so the 4.05 µs copy node is
+**0.017% of the round** — nearly three orders of magnitude inside the instrument's own noise. An
+effect this far below the noise floor is not worth an implementation, and this is the measurement
+that says so rather than the arithmetic alone. Two caveats if the figure is ever quoted: that run
+logged `fallback_steps 4` of 32 rounds, so its mean blends MTP rounds with native-decode rounds and
+is **not** comparable to the 24.08 ms K=3 reasoning row above (which licenses 3.08 tokens/round
+against this run's 1.87); and `mtp_round_mean_ms` averages both regimes together. Note also the
+instrument cannot resolve what it was built to find — that is the finding, not a shortcoming of
+the run.
 
 ### GDN decode grid sizing — retired by measurement
 
