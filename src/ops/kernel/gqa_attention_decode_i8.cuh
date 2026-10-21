@@ -71,6 +71,16 @@ inline constexpr std::size_t gqa_attention_decode_i8_shift_bytes() {
            gqa_attention_decode_i8_scale_bytes<Geometry, TokenTile>();
 }
 
+// The K/V arena holds two full-width tiles when it lives in the dynamic arena: K as int8 and V
+// widened to bf16. It used to hold three -- K int8, V codes, and the widened copy -- because the
+// codes were staged in shared memory and read back immediately to be converted. Both the kernel's
+// region offsets and the launcher's cudaFuncSetAttribute size come from here, so they cannot
+// disagree about how large the arena is.
+template <int KeyBlock>
+__host__ __device__ inline constexpr std::size_t gqa_attention_decode_i8_arena_bytes() {
+    return static_cast<std::size_t>(3 * KeyBlock * kGqaHeadDim);
+}
+
 // Decode-specialized producer/consumer kernel for T=1..6. One producer warp per
 // m16 row tile computes QK + online softmax, while all CTA warps partition the
 // tile's 256-wide PV output. This keeps each thread's PV accumulator at 16, 32,
@@ -118,7 +128,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     // parameters; the total the launcher requests comes from gqa_attention_decode_i8_shift_bytes, so
     // the two agree by construction on the size and differ only in where this one stops.
     constexpr std::size_t kDynamicScaleOffsetBytes =
-        (DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0ULL) +
+        (DynamicArena ? gqa_attention_decode_i8_arena_bytes<KeyBlock>() : 0ULL) +
         static_cast<std::size_t>(Br) * (kGqaKvShiftB16PerRow * 2 + sizeof(float));
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask   = 0xffffffffu;
@@ -135,7 +145,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     // registers across the whole kernel. The main arena holds K i8, V i8, and
     // V bf16 during the key loop.
     __shared__ __align__(16) std::int8_t q_s[Br * D];
-    __shared__ __align__(16) std::int8_t static_r_s[DynamicArena ? 16 : 4 * Bc * D];
+    // K stays int8 (its dequant scale factors out of the QK contraction) and V is widened to bf16
+    // in place of the codes, so the arena holds two full-width tiles rather than three. `q_shift_i8`
+    // still starts at the end of the K/V region when one is present, so its offset is unchanged.
+    __shared__ __align__(16) std::int8_t static_r_s[DynamicArena ? 16 : 3 * Bc * D];
     extern __shared__ __align__(16) std::int8_t dynamic_r_s[];
     std::int8_t* r_s      = DynamicArena ? dynamic_r_s : static_r_s;
     std::int8_t* q_i8     = q_s;
@@ -143,13 +156,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     // The shifted rotary group rides in the dynamic arena: after the K/V arena when there is one,
     // otherwise it is the whole request. A partial page needs group 0 in both frames at once, and
     // the arena is where staging that exceeds the static tiles belongs.
-    std::int8_t* q_shift_i8 = DynamicArena ? dynamic_r_s + 4 * Bc * D : dynamic_r_s;
+    std::int8_t* q_shift_i8 =
+        DynamicArena ? dynamic_r_s + gqa_attention_decode_i8_arena_bytes<Bc>() : dynamic_r_s;
     float* q_shift_scale    = reinterpret_cast<float*>(q_shift_i8 + ShiftBytes);
     __nv_bfloat16* q_b16  = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* q_shift_b16 = reinterpret_cast<__nv_bfloat16*>(q_shift_i8);
     __nv_bfloat16* k_b16  = reinterpret_cast<__nv_bfloat16*>(k_i8);
-    std::int8_t* v_i8     = r_s + Bc * D;
-    __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * D);
+    // V is dequantized straight from the cache into this tile; there is no intermediate int8 stage.
+    // The codes used to be copied into shared memory only to be read back and converted on the next
+    // line, which cost a whole Bc * D region for a value that was never read twice. The conversion
+    // helper documents that its source pointer may be in global memory, so the cache read and the
+    // widening are one step. At 6 query tokens that region was 8 KiB of a 52.8 KiB block, and its
+    // removal is what lets two blocks be resident.
+    __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(r_s + Bc * D);
     __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
     // One float per (row, group) of the staged Q tile. Deliberately its own storage rather than an
     // overlay on p_s: p_s is written by the producer warps every key block and read by the consumer
@@ -429,47 +448,32 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                     *reinterpret_cast<uint64_t*>(&dst[0]) = *reinterpret_cast<const uint64_t*>(dec8_0);
                     *reinterpret_cast<uint64_t*>(&dst[8]) = *reinterpret_cast<const uint64_t*>(dec8_1);
-                    const std::int64_t voff = gqa_kv_i4_code_index<Geometry>(
-                        physical_page, kv_head, d / 2, key & kPagedKVPageMask);
-                    gqa_kv_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
                 } else if constexpr (PackedK) {
                     const std::int64_t koff = gqa_kv_i4_code_index<Geometry>(
                         physical_page, kv_head, d / 2, key & kPagedKVPageMask);
                     std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                     gqa_kv_unpack_i4x16(&reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff], dst);
-                    const std::int64_t voff = gqa_kv_i4_code_index<Geometry>(
-                        physical_page, kv_head, d / 2, key & kPagedKVPageMask);
-                    gqa_kv_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
                 } else {
                     const std::int64_t off = gqa_kv_quant_code_index<Geometry>(
                         physical_page, kv_head, d, key & kPagedKVPageMask);
                     std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                     ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                    if constexpr (PackedV) {
-                        const std::int64_t voff = gqa_kv_i4_code_index<Geometry>(
-                            physical_page, kv_head, d / 2, key & kPagedKVPageMask);
-                        gqa_kv_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
-                    } else {
-                        ninfer::ops::cp_async<16>(&v_i8[key_l * D + d],
-                                                  &reinterpret_cast<std::int8_t*>(cache_v_codes)[off]);
-                    }
                 }
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));
-                store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
             }
         }
         ninfer::ops::cp_commit();
     };
 
     // Zero the staging arenas before anything is issued into them. The order matters: the
-    // cp_async copies below write k_i8/v_i8/k_scale_s/v_scale_s, and the Q staging writes q_i8,
-    // q_scale_s, q_shift_i8 and q_shift_scale. Issuing the tile first, as this did until the
-    // partial-page scale tile got its own storage, put an async copy's destination writes in the
-    // same window as these ordinary stores -- racecheck flagged the pair as a write/write hazard on
-    // the shared memory. The fills are ordinary stores, so one barrier after them is enough to keep
-    // them ahead of both the async copies and the Q staging that follows.
+    // cp_async copies below write k_i8/k_scale_s/v_scale_s, the V loader writes v_bf16, and the Q
+    // staging writes q_i8, q_scale_s, q_shift_i8 and q_shift_scale. Issuing the tile first, as this
+    // did until the partial-page scale tile got its own storage, put an async copy's destination
+    // writes in the same window as these ordinary stores -- racecheck flagged the pair as a
+    // write/write hazard on the shared memory. The fills are ordinary stores, so one barrier after
+    // them is enough to keep them ahead of both the async copies and the Q staging that follows.
     for (int i = tid; i < (Br * D) / 16; i += Threads) {
         store_vec(reinterpret_cast<int4*>(q_i8) + i, make_int4(0, 0, 0, 0));
     }
@@ -838,7 +842,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 if (key >= split_start && key < split_end) {
                     const int grp  = d >> 6;
                     const float vs = __half2float(v_scale_s[key_l * Groups + grp]);
-                    store_vec(dst, gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], vs));
+                    // `physical_page` already points at the NEXT tile by the time this runs, so the
+                    // page holding this key is resolved here rather than reused.
+                    const int vpage = block_table[key >> kPagedKVPageShift];
+                    const int voff_key = key & kPagedKVPageMask;
+                    if constexpr (PackedV) {
+                        const std::int64_t voff =
+                            gqa_kv_i4_code_index<Geometry>(vpage, kv_head, d / 2, voff_key);
+                        std::int8_t codes[16];
+                        gqa_kv_unpack_i4x16(&cache_v_codes[voff], codes);
+                        store_vec(dst, gqa_kv_dequant_i8x8_from(codes, vs));
+                    } else {
+                        const std::int64_t voff =
+                            gqa_kv_quant_code_index<Geometry>(vpage, kv_head, d, voff_key);
+                        store_vec(dst, gqa_kv_dequant_i8x8_from(
+                                          &reinterpret_cast<const std::int8_t*>(cache_v_codes)[voff],
+                                          vs));
+                    }
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }

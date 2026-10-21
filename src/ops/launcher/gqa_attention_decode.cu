@@ -135,7 +135,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         // overlays p_s, both ride in the dynamic arena -- so every INT8 configuration opts in now,
         // including the ones whose K/V arena is a static tile.
         constexpr std::size_t kDynamicBytes =
-            (DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0ULL) +
+            (DynamicArena ? gqa_attention_decode_i8_arena_bytes<KeyBlock>() : 0ULL) +
             gqa_attention_decode_i8_shift_bytes<Geometry, TokenTile>();
         static const cudaError_t attr = cudaFuncSetAttribute(
             gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
@@ -175,13 +175,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     } else if constexpr (TokenTile == 6) {
         // Three Q row tiles for the 27B group of six (RowTiles = 3).
         if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<6, 1, 32, false>();
+            launch.template operator()<6, 2, 32, false>();
         } else if (implementation_window <= 2054) {
-            launch.template operator()<6, 1, 32, false>();
+            launch.template operator()<6, 2, 32, false>();
         } else if (implementation_window <= 8198) {
-            launch.template operator()<6, 1, 64, true>();
+            launch.template operator()<6, 2, 64, true>();
         } else {
-            launch.template operator()<6, 1, 32, false>();
+            launch.template operator()<6, 2, 32, false>();
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {
