@@ -1403,6 +1403,85 @@ rather than contradicting it, and its FP8 advantage is architecture-bound.
 
 ---
 
+## MTP verify attention at 6 query tokens: what the occupancy work bought
+
+The width-6 verify attention kernel (§ MTP verify width) carries 50% more query rows than width 4
+but ran 72% slower per call, which looked like room to recover. The gap traced to a shared-memory
+allocation that capped the kernel at one resident block per SM. Removing it recovered a real but
+modest 6.6%, and the profile then showed the residual gap was never an inefficiency at all.
+
+**The change.** The V tile was staged in shared memory as int8 codes and then read back on the very
+next line to be widened to bf16 for the MMA. It was a pure pass-through: written once, read once,
+never referenced again. `gqa_kv_dequant_i8x8_from` already documents that its source pointer may be
+global or shared, so the cache read and the widening became one step and the intermediate region
+disappeared. At 6 query tokens that region was 8 KiB of a 52.8 KiB block; per-block shared memory
+fell to 44.7 KiB and two blocks fit the 102.4 KiB budget with 13 KiB spare. The K tile stays int8
+because its dequant scale factors out of the QK contraction; V's does not factor out of P·V, which
+is why V has to be bf16 and K does not.
+
+The arena size is now produced by one `gqa_attention_decode_i8_arena_bytes<KeyBlock>()` helper used
+by both the kernel's region offsets and the launcher's `cudaFuncSetAttribute`, so the two cannot
+disagree about how large it is — previously each had its own `4 * Bc * D` literal.
+
+**The result, and what it does not explain.** Registers went 238 → 168 with zero spills, and
+`No Eligible` improved from 60.6% to 72.8%. Duration went 160.64 → 150.11 µs, a 6.6% gain. But DRAM
+throughput *fell*, 29.0% → 31.9%, against a prediction that it would exceed 45%: occupancy was a
+symptom, not the bottleneck. `Warp Cycles Per Issued Instruction` is 10.9 with 0.34 eligible warps
+per scheduler, i.e. warps are issuing about once every 11 cycles — fed, not starved. The 72.8%
+`No Eligible` is arithmetic, not a resource stall: one block of 6 warps cannot fill four schedulers.
+
+**The residual gap is the work itself.** Per verified token the cost is 23.40 µs at width 4 against
+25.02 µs at width 6, about 7%. Padded PV work per query is `Br × D`, with `Br` rounding 24 rows to
+32 and 36 rows to 48 — 25% padding either way, and 36/24 = 1.50 while the measured duration ratio
+is 1.604. Width 6 is very nearly linear in padded MMA work. Both widths pay the same 25% row
+padding, so the 7% is the smaller per-warp column share (`PVNtPerWarp` 8 → 16 as
+`ConsumerWarpsPerTile` drops 4 → 2), not a fixable stall.
+
+Closing that 7% would mean a `RowTiles`-specialized geometry to avoid padding 36 rows into 48 — a
+structural rewrite of the tiling for one of sixteen layers. Not worth it. **The kernel is done:**
+keep the commit for its 6.6%, and look for MTP speed elsewhere.
+
+A correction for the record: `Gqa27Geometry = GqaGeometry<24, 4, 1>` gives `GroupSize = 24/4 = 6`,
+not 4. Register and accumulator figures in the earlier width-6 analysis that used 4 are wrong; the
+conclusions hold, the arithmetic in them does not.
+
+## Improving MTP draft acceptance
+
+Acceptance is a better lever than any remaining kernel work. At the observed 30% acceptance the
+engine does a 6-token verify to bank ~2.5 tokens per round, so most of the verify cost is discarded
+work. The rule itself is a plain longest-prefix match — `speculative_accept_greedy_drafts_kernel`
+advances while `target_tokens[a] == drafts[a]` and emits the target's own next token as the bonus
+— so at temperature 0 acceptance is entirely a property of the draft model agreeing with the
+target, not of anything in the acceptance path. Four levers, in rough order of value per unit of
+risk:
+
+1. **Set draft width from acceptance, not from a constant.** Acceptance decays with position: the
+   first draft is usually right, later ones rarely are. Rounds beyond the expected accepted length
+   pay full verify cost for tokens that are almost surely discarded. Earlier work already found
+   adaptive width beats a fixed one (Follow-up 4); the measured 30% at K=5 says the fixed point is
+   set too wide. Track per-position acceptance and set `--draft-tokens` to the expected accepted
+   prefix plus one.
+
+2. **Check the draft head's context.** The draft shares the target's KV but consumes a different
+   hidden state (`--lm-head-draft`). If the draft head is fed the pre-norm continuation hidden
+   state rather than the same normalization the target's LM head sees, agreement suffers in a way
+   that looks exactly like a modelling problem. Cheap to inspect, and it is the kind of mismatch
+   that no amount of kernel tuning can compensate for.
+
+3. **Improve the sampling agreement.** At nonzero temperature the acceptance test resamples against
+the target distribution with a penalty overlay for already-accepted drafts. Temperature and
+`top_p`/`top_k` disagreement between draft and target silently lowers acceptance; at greedy it is
+irrelevant, which is why the 30% figure on a greedy request is the number to chase first.
+
+4. **Measure acceptance per position before changing anything.** The round benchmark already logs
+   `accepted_draft_tokens`, `drafted_tokens`, and `speculative_rounds`. Per-position histograms turn
+   the four levers above from guesses into a decision: if position 0 accepts 95% and position 4
+   accepts 5%, the answer is lever 1 alone and the other three are noise.
+
+What not to do: keep raising K. Verify cost is linear in K while accepted tokens are not, so a
+wider draft is negative once per-position acceptance falls below the break-even rate — which the
+30% aggregate already suggests it has.
+
 ## Caveats
 
 - The reported 95/42 tok/s and acceptance figures are user-provided, not independently verified
