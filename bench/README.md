@@ -568,6 +568,27 @@ cmake --build build --parallel --target ninfer_mtp_pack_bench
 ./build/bench/ninfer_mtp_pack_bench --op split --tokens 1,2,3,4,5,6,48
 ```
 
+## MTP hidden copy-back CUDA-Graph proxy
+
+`ninfer_mtp_hidden_copy_bench` compares two captured graph chains with the production MTP
+hidden-state shape and dependency pattern: one uses a D2D copy-back after each synthetic forward
+step; the other alternates the two hidden buffers. It validates equal final sentinel values and
+reports graph node counts and comparative replay timings. The synthetic step is deliberately not the MTP
+network, so this isolates the removable copy-node overhead; it is **not** an end-to-end speedup
+claim. Confirm any positive result with the target MTP round benchmark below.
+
+For Qwen3.8-27B (`hidden=5120`, BF16, batch 1), the copy is 10 KiB per extra draft step and the
+production loop has `K-1` such copies:
+
+```bash
+cmake --build build --parallel --target ninfer_mtp_hidden_copy_bench
+./build/bench/ninfer_mtp_hidden_copy_bench \
+  --hidden 5120 --batch 1 --ks 1,3,5,7,15
+```
+
+Use the RTX 4090 and repeat with the relevant batch size. A tiny delta here is a reason not to add
+ping-pong complexity; a measurable delta only justifies an end-to-end A/B, not a production change.
+
 ## Target MTP round benchmark
 
 `ninfer_qwen3_6_27b_mtp_round_bench` measures the registered target's native proposal and

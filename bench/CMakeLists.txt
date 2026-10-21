@@ -59,6 +59,10 @@ ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
 
+# CUDA-Graph proxy for the MTP hidden copy-back vs ping-pong buffer-chain overhead.
+add_executable(ninfer_mtp_hidden_copy_bench ops/mtp_hidden_copy_bench.cu)
+target_link_libraries(ninfer_mtp_hidden_copy_bench PRIVATE ${NINFER_CUDART_TARGET})
+
 # End-to-end product benchmark: public Engine API and native .ninfer artifacts only.
 add_executable(ninfer_bench targets/qwen3_6_27b/ninfer_bench.cpp targets/qwen3_6_27b/ninfer_bench_support.cpp)
 target_include_directories(ninfer_bench PRIVATE
