@@ -251,6 +251,34 @@ rows — about 40% of the full export. That is the file to move off the profilin
 report's bulk is raw counters, and nothing in this repository reads it. If `--import` fails the
 error is reported and the report is kept.
 
+**`--set full` is 45 replay passes and it does not always finish.** On the 27B model the resident
+weights leave too little device memory for NCU's save-and-restore buffer, so the run prints
+`Backing up device memory in system memory. Kernel replay might be slow` and may stop after a
+fraction of the passes. The report is still written and looks like a success, but the metrics those
+passes would have collected are simply absent — no stall reasons, no instruction or spill counters.
+That reads exactly like the export dropping them, so compare the `N passes` line in the NCU log
+between runs before trusting a missing metric.
+
+Name the sections you need instead of asking for the whole set. `--sections` and `--metrics` skip
+`--set` entirely and collect only what is asked for, in a handful of passes:
+
+```bat
+python tools\bench\profile_attention_width_ncu.py ^
+    --server build\apps\Release\ninfer-serve.exe ^
+    --model E:\models\qwen3_8_27b.ninfer ^
+    --ks 5 --launch-skip 128 --sections SchedulerStats,WarpStateStats,InstructionStats
+```
+
+`SchedulerStats` gives warp cycles per issued instruction and eligible/issued ratios;
+`WarpStateStats` gives the per-reason stall breakdown. Together they separate a kernel that is
+waiting on memory from one that is simply doing more work.
+
+Do not pass a comma-joined metric list through a shell line continuation. A `^` that fails to join
+turns every metric after the first into its own argv token, and NCU reports the second one as
+`'<metric>' does not exist or is not an executable` because it treats it as the application to
+launch. `--metrics` is passed as one argument by the script, so the quoting is the script's problem,
+not yours.
+
 ## Concurrent serving benchmark
 
 `run_serve_concurrency.py` measures two separate concurrency properties through real loopback

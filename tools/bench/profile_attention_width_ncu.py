@@ -113,6 +113,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         choices=VALID_SETS,
                         help="Nsight Compute metric set (default: full). Use 'basic' while "
                              "iterating: it answers occupancy and throughput in one replay pass")
+    # `--set full` costs 45 replay passes. On a 16.67 GiB model that overflows NCU's save-and-restore
+    # buffer ("Backing up device memory in system memory"), and a run that gives up after 8 passes
+    # writes a report with the decisive metrics simply absent -- which reads exactly like the tool
+    # dropped them. Naming sections instead collects only what the question needs, in a handful of
+    # passes. `LaunchStats`, `Occupancy`, `SpeedOfLight` and `WorkloadDistribution` are enabled by
+    # default, so these are additive.
+    parser.add_argument("--sections", default="",
+                        help="comma-separated NCU section names to add (e.g. "
+                             "SchedulerStats,WarpStateStats,InstructionStats). Overrides --set, "
+                             "which is then not passed at all")
+    parser.add_argument("--metrics", default="",
+                        help="comma-separated raw NCU metric names to add on top of --sections")
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument("--request-timeout", type=float, default=1800.0)
     parser.add_argument("--flush-seconds", type=float, default=5.0)
@@ -198,8 +210,20 @@ def run_point(args: argparse.Namespace, ncu: Path, k: int, port: int) -> dict[st
     # traces. With a nonzero `--launch-skip` this skips the server's warmup launches, so the
     # captured launch belongs to the long-context request this tool sends.
     kernel_regex = KERNEL_SPECIALIZATIONS[k]
-    command = [
-        str(ncu), "--set", args.metric_set,
+    sections = [part.strip() for part in args.sections.split(",") if part.strip()]
+    metrics = [part.strip() for part in args.metrics.split(",") if part.strip()]
+    # `--section` and `--metrics` are passed as separate argv entries, never as one comma-joined
+    # string: NCU splits a value on commas itself only for `--metrics`, and a shell that mangles a
+    # line continuation turns each fragment into its own argv token, which NCU then reports as
+    # "'<metric>' does not exist or is not an executable" because it treats it as the application.
+    command: list[str] = []
+    if not sections and not metrics:
+        command += ["--set", args.metric_set]
+    for name in sections:
+        command += ["--section", name]
+    if metrics:
+        command += ["--metrics", ",".join(metrics)]
+    command += [
         "--kernel-name-base", "demangled",
         "--kernel-name", kernel_regex,
         "--launch-count", str(args.launch_count),
@@ -222,7 +246,9 @@ def run_point(args: argparse.Namespace, ncu: Path, k: int, port: int) -> dict[st
         "k": k,
         "verify_width": k + 1,
         "kernel_filter": kernel_regex,
-        "metric_set": args.metric_set,
+        "metric_set": args.metric_set if not sections and not metrics else None,
+        "sections": sections,
+        "metrics": metrics,
         "launch_count": args.launch_count,
         "launch_skip": args.launch_skip,
         "max_context": args.max_context,
