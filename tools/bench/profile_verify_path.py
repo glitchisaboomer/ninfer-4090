@@ -50,10 +50,22 @@ WHAT YOU GET
     kernel-time table automatically, sorted by how much each kernel grew, and the context
     depth each request actually reached.
 
-IMPORTANT: the server is run with --no-cuda-graph. Verify normally runs inside a captured
-CUDA Graph, which nsys would show as one opaque node, hiding exactly what we want. Turning
-the graph off makes every kernel visible. Absolute timings will be inflated by launch
+IMPORTANT: by default the server is run with --no-cuda-graph. Verify normally runs inside a
+captured CUDA Graph, which nsys would show as one opaque node, hiding exactly what we want.
+Turning the graph off makes every kernel visible. Absolute timings will be inflated by launch
 overhead, but the K=3-vs-K=5 DIFFERENCE is still valid -- and that is what we care about.
+
+GRAPH-ON MODE
+    That launch inflation is fatal to one specific question: is a kernel launch-bound or
+    compute-bound? With graphs off, a kernel called 26,000 times looks expensive because of
+    dispatch, and optimising its arithmetic would be wasted work. Pass
+
+        --cuda-graph --cuda-graph-trace=node
+
+    to leave graphs ENABLED while nsys still records every kernel inside each graph separately.
+    Per-kernel GPU time stays readable and the dispatch cost is realistic. Compare a graph-on
+    and a graph-off trace of the same request: a kernel whose time collapses is launch-bound;
+    one that barely moves is genuinely compute-bound and worth optimising.
 
 If nsys is not on PATH, the script probes the usual Windows install locations. Point it at
 yours with --nsys if it still cannot find it.
@@ -573,7 +585,8 @@ def find_report(directory: Path) -> Path | None:
     return None
 
 
-def print_comparison(out_dir: Path, ks: Sequence[int], nsys: Path | None = None) -> None:
+def print_comparison(out_dir: Path, ks: Sequence[int], nsys: Path | None = None,
+                     cuda_graph: bool = False) -> None:
     data: dict[int, dict[str, tuple[float, int]]] = {}
     reasons: dict[int, str] = {}
     for k in ks:
@@ -647,8 +660,14 @@ def print_comparison(out_dir: Path, ks: Sequence[int], nsys: Path | None = None)
     print("=" * 110)
     print()
     print("Read the top of this list: those kernels are where the extra round time goes.")
-    print("Absolute numbers are inflated by launch overhead because --no-cuda-graph is on;")
-    print("the DELTA between K values is the meaningful quantity.")
+    if cuda_graph:
+        print("The server ran with CUDA Graphs ON, so launch overhead is realistic and per-kernel")
+        print("time is close to what production pays. The DELTA between K values is still the")
+        print("quantity to read; absolute totals now include graph-replay dispatch.")
+    else:
+        print("Absolute numbers are inflated by launch overhead because --no-cuda-graph is on;")
+        print("the DELTA between K values is the meaningful quantity. Re-run with")
+        print("--cuda-graph --cuda-graph-trace=node to judge whether a kernel is launch-bound.")
     print()
     header = (f"{'kernel':<52}"
               + "".join(f"{'K=' + str(k):>15}" for k in usable)
@@ -684,6 +703,14 @@ def run_point(args: argparse.Namespace, k: int, nsys: Path, port: int,
         # cuda + nvtx only: portable across nsys builds. 'osrt' is Linux-only and some
         # Windows builds reject it outright (and 'wddm' is not accepted by older ones).
         "--trace=cuda,nvtx",
+    ]
+    # Without an explicit mode, nsys records a CUDA Graph as one opaque node and every kernel
+    # inside it loses its identity -- which is exactly what this tool exists to measure. 'node'
+    # keeps each kernel visible while the graph still runs as a graph, so launch overhead stays
+    # realistic instead of being inflated by graph-off dispatch.
+    if args.cuda_graph_trace:
+        command.append(f"--cuda-graph-trace={args.cuda_graph_trace}")
+    command += [
         "--sample=none",
         "--cpuctxsw=none",
         "--stats=false",
@@ -697,7 +724,10 @@ def run_point(args: argparse.Namespace, k: int, nsys: Path, port: int,
         "--max-context", str(args.max_context),
         "--max-concurrency", "1",
         "--kv-dtype", args.kv_dtype,
-        "--no-cuda-graph",
+    ]
+    if not args.cuda_graph:
+        command.append("--no-cuda-graph")
+    command += [
         "--spec", "mtp",
         "--draft-tokens", str(k),
         "--lm-head-draft",
@@ -877,6 +907,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=float, default=900.0)
     parser.add_argument("--flush-seconds", type=float, default=5.0,
                         help="seconds to wait after the request before shutting down")
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="leave CUDA Graphs ENABLED in the server (default: off). Graph-off "
+                             "inflates launch overhead, which flatters high-launch-count kernels, "
+                             "so use this when the question is whether a kernel is launch-bound "
+                             "or compute-bound. Pair it with --cuda-graph-trace=node or the whole "
+                             "graph appears as one opaque node")
+    parser.add_argument("--cuda-graph-trace", default=None, choices=("node", "graph"),
+                        help="nsys --cuda-graph-trace mode. 'node' records every kernel inside a "
+                             "captured graph separately, which is what keeps per-kernel GPU time "
+                             "readable while the graph runs; 'graph' collapses each graph to a "
+                             "single entry. Ignored when the server runs with graphs disabled")
     args = parser.parse_args(argv)
 
     if args.analyze_only:
@@ -982,7 +1023,7 @@ def run_analyze_only(args: argparse.Namespace, nsys: Path | None) -> int:
                 f"request log {log_at}")
             log(f"k{k}: if those timestamps are far apart, the table below is from a different run")
     print_depth(points, args)
-    print_comparison(args.out, args.k_values, nsys)
+    print_comparison(args.out, args.k_values, nsys, args.cuda_graph)
     readable = [k for k in args.k_values
                 if (report := find_report(args.out / f"k{k}")) is not None
                 and sqlite_kernel_rows(report.with_suffix(".sqlite"))]
@@ -1066,7 +1107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               f"{point['client_tok_s'] or 0:>16.1f}")
 
     print_depth(points, args)
-    print_comparison(args.out, args.k_values, nsys)
+    print_comparison(args.out, args.k_values, nsys, args.cuda_graph)
 
     print()
     print("=" * 110)

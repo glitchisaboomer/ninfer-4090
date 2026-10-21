@@ -207,8 +207,32 @@ pass for the current run, and never re-exports an empty `.nsys-rep` over a worki
 
 The script passes `--no-cuda-graph` because verify otherwise runs inside a
 captured CUDA Graph that nsys reports as one opaque node; the K-vs-K delta is the meaningful quantity,
-not the absolute times. Full beginner walkthrough, Windows install paths for nsys, and how to read the
-output are in [`../docs/optimization-findings.md`](../docs/optimization-findings.md) under Gate B.
+not the absolute times.
+
+That default makes one question unanswerable, though: **is a kernel launch-bound or
+compute-bound?** With graphs off, a kernel called tens of thousands of times looks expensive because
+of dispatch, and optimising its arithmetic is wasted work. Graph-off numbers also overstate
+high-launch-count kernels such as the rmsnorms. For that question, keep graphs on and ask nsys to
+still show every kernel inside them:
+
+```bat
+python tools\bench\profile_verify_path.py ^
+    --server build\apps\Release\ninfer-serve.exe ^
+    --model  E:\models\qwen3_8_27b.ninfer ^
+    --ks 3,5 --max-context 40000 --longctx-repeats 280 ^
+    --cuda-graph --cuda-graph-trace=node
+```
+
+`--cuda-graph-trace=node` records each kernel inside a captured graph separately, so per-kernel GPU
+time stays readable while the graph still runs as a graph. Compare a graph-on and a graph-off trace
+of the same request: a kernel whose time collapses was launch-bound, and one that barely moves is
+compute-bound and worth optimising. `--cuda-graph-trace=graph` collapses each graph to one entry,
+which is why it is not the mode to use here.
+
+The script also prints which mode produced a table, so a graph-off result cannot be mistaken for a
+production-representative one. Full beginner walkthrough, Windows install paths for nsys, and how to
+read the output are in [`../docs/optimization-findings.md`](../docs/optimization-findings.md) under
+Gate B.
 
 ## MTP verify-attention Nsight Compute profile
 
