@@ -76,7 +76,8 @@ target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET}
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
 add_executable(ninfer_qwen3_6_27b_mtp_round_bench
-  targets/qwen3_6_27b/target_mtp_round_bench.cpp)
+  targets/qwen3_6_27b/target_mtp_round_bench.cpp
+  targets/qwen3_6_27b/ninfer_bench_support.cpp)
 target_include_directories(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/src

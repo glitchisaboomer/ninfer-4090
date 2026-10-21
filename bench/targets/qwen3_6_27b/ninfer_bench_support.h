@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -148,6 +149,22 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results);
 
 std::string json_escape(std::string_view value);
+
+// Per-position acceptance from nested round outcomes. `accepted_per_position[i]` counts rounds that
+// accepted draft `i`; because accepting draft `i` implies accepting all earlier drafts, the rounds
+// that ever exposed position `i` are exactly those that accepted `i - 1`, and position 0 is exposed
+// to every speculative round. Returning raw counts over the round count instead would charge late
+// positions for decisions the target never made, which makes any acceptance curve look like a cliff
+// regardless of how the draft actually behaves.
+struct PositionalAcceptance {
+    std::vector<std::uint64_t> accepted;  // as reported by the engine, per position
+    std::vector<double> conditional_rate; // P(accept i | reached i)
+    double overall_rate = 0.0;            // accepted / drafted, matching the engine's own counters
+};
+
+PositionalAcceptance positional_acceptance(std::span<const std::uint64_t> accepted_per_position,
+                                           std::uint64_t rounds, std::uint64_t drafted,
+                                           std::uint64_t accepted_total);
 std::string kv_cache_name(KvCacheStorage storage);
 std::string proposal_head_name(ProposalHead head);
 std::uint64_t file_size_or_zero(const std::string& path);

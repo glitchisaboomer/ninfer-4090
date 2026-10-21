@@ -602,6 +602,19 @@ cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
   --artifact out/qwen3_6_27b.ninfer
 ```
 
+It also reports per-position acceptance, which is what tells you whether to change the draft width.
+`accepted_per_position` is the raw count per draft slot, and
+`conditional_acceptance_per_position` is the rate that matters: the chance draft `i` was accepted
+given the target actually looked at it. Those differ because acceptance is nested — a round that
+stops at position 2 never exposes position 3 — so dividing the raw count by the round count makes
+any draft look like it falls off a cliff. Position 0 is exposed to every speculative round and
+position `i` to the rounds that accepted `i - 1`.
+
+Read the conditional column. A draft that starts high and decays quickly says the width is past its
+useful point; one that stays high says a wider window would still pay. **Raise `--reps` before
+drawing conclusions** — the default 10 rounds gives single-digit samples per position, and the
+benchmark prints a note when the sample is too small to read.
+
 ## 35B complete DFlash round benchmark
 
 `ninfer_qwen3_6_35b_a3b_dflash_round_bench` drives the production Program through consecutive

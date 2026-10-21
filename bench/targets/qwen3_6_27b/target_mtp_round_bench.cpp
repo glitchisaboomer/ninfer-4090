@@ -7,6 +7,8 @@
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/request_memory.h"
 
+#include "ninfer_bench_support.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -96,6 +98,20 @@ struct RoundMeasurement {
     float milliseconds            = 0.0F;
     std::uint32_t licensed_tokens = 0;
 };
+
+std::vector<std::uint64_t> per_position_counts(const ninfer::SpeculativeStats& before,
+                                                const ninfer::SpeculativeStats& after) {
+    const std::size_t width = after.accepted_per_position.size();
+    std::vector<std::uint64_t> delta(width, 0);
+    for (std::size_t i = 0; i < width; ++i) {
+        const std::uint64_t prior = i < before.accepted_per_position.size()
+                                        ? before.accepted_per_position[i]
+                                        : 0;
+        delta[i] = after.accepted_per_position[i] > prior ? after.accepted_per_position[i] - prior
+                                                          : 0;
+    }
+    return delta;
+}
 
 RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
                                std::uint32_t draft_tokens) {
@@ -243,9 +259,38 @@ int run(const Options& options) {
     // Reported, not merely gated: a run at 0 accepted drafts per round is a legitimate outcome on
     // a prompt the model has nothing to draft for, and the round time it produces is native decode.
     // Without these two columns that case is indistinguishable from a well-fitting MTP round.
-    std::cout << "drafted_tokens," << stats.drafted_tokens - before.drafted_tokens << '\n';
+    const std::uint64_t drafted = stats.drafted_tokens - before.drafted_tokens;
+    const std::uint64_t accepted = stats.accepted_tokens - before.accepted_tokens;
+    std::cout << "drafted_tokens," << drafted << '\n';
     std::cout << "fallback_steps," << fallbacks << '\n';
     std::cout << "speculative_rounds," << rounds_run << '\n';
+    std::cout << "acceptance_rate,"
+              << (drafted == 0 ? 0.0 : static_cast<double>(accepted) / static_cast<double>(drafted))
+              << '\n';
+
+    // Per-position acceptance. The engine already accumulates `accepted_per_position`; the rate
+    // math lives in the bench support library so it is covered by a unit test rather than resting
+    // on a claim in a comment.
+    const ninfer::bench::PositionalAcceptance positional =
+        ninfer::bench::positional_acceptance(per_position_counts(before, stats), rounds_run,
+                                             drafted, accepted);
+    std::cout << "accepted_per_position";
+    for (const std::uint64_t count : positional.accepted) {
+        std::cout << ',' << count;
+    }
+    std::cout << '\n';
+    std::cout << "conditional_acceptance_per_position";
+    for (const double rate : positional.conditional_rate) {
+        std::cout << ',' << rate;
+    }
+    std::cout << '\n';
+    // Each rate is a sample of at most `rounds_run` observations, and later positions see far fewer
+    // because only the rounds that reached them count. The default `--reps 10` cannot produce a
+    // curve worth reading; say so rather than letting a two-sample 100% look like a finding.
+    if (rounds_run < 100) {
+        std::cout << "note,per-position rates use only " << rounds_run
+                  << " rounds; raise --reps for a curve that is worth reading\n";
+    }
     return 0;
 }
 

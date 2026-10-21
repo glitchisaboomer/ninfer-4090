@@ -365,6 +365,53 @@ int test_human_and_csv_reports() {
     return failures;
 }
 
+int test_positional_acceptance() {
+    int failures = 0;
+    // A nested round-outcome distribution: of 200 rounds, 190 accepted draft 0, 120 draft 1, 60
+    // draft 2, 25 draft 3, 8 draft 4. Scaling by the 200 rounds that were actually offered the
+    // window must reproduce those as *conditional* rates -- the probability the draft is right
+    // given the target bothered to look -- not as raw fractions of all 200 rounds.
+    const std::vector<std::uint64_t> counts{190, 120, 60, 25, 8};
+    const std::uint64_t rounds  = 200;
+    const std::uint64_t drafted = 200 * 5;
+    std::uint64_t accepted_total = 0;
+    for (const std::uint64_t c : counts) { accepted_total += c; }
+
+    const ninfer::bench::PositionalAcceptance positional =
+        ninfer::bench::positional_acceptance(counts, rounds, drafted, accepted_total);
+
+    failures += expect(positional.conditional_rate.size() == 5, "per-position rate width");
+    failures += expect(positional.accepted == counts, "per-position counts carried through");
+    // Position 0 is exposed to every speculative round; position i to the rounds that accepted i-1.
+    const std::vector<double> expected{190.0 / 200.0, 120.0 / 190.0, 60.0 / 120.0, 25.0 / 60.0,
+                                       8.0 / 25.0};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        const std::string label = "conditional acceptance at position " + std::to_string(i);
+        failures += expect_near(positional.conditional_rate[i], expected[i], label);
+    }
+    failures += expect_near(positional.overall_rate,
+                            static_cast<double>(accepted_total) / static_cast<double>(drafted),
+                            "overall acceptance matches the engine counters");
+
+    // Zero rounds must not divide by zero, and a position never reached must report 0 rather than
+    // inheriting a stale exposure.
+    const ninfer::bench::PositionalAcceptance empty =
+        ninfer::bench::positional_acceptance(counts, 0, 0, 0);
+    failures += expect_near(empty.conditional_rate[0], 0.0, "no rounds yields no rate");
+    failures += expect_near(empty.overall_rate, 0.0, "no drafted tokens yields no rate");
+
+    // A run where the draft is always right should read 1.0 all the way down, which a raw
+    // count-over-rounds calculation cannot produce once the window is narrower than the round count.
+    const std::vector<std::uint64_t> perfect{50, 50, 50};
+    const ninfer::bench::PositionalAcceptance all_right =
+        ninfer::bench::positional_acceptance(perfect, 50, 150, 150);
+    for (std::size_t i = 0; i < all_right.conditional_rate.size(); ++i) {
+        const std::string label = "perfect draft at position " + std::to_string(i);
+        failures += expect_near(all_right.conditional_rate[i], 1.0, label);
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -373,5 +420,6 @@ int main() {
     failures += test_measurement_contract();
     failures += test_report_contract();
     failures += test_human_and_csv_reports();
+    failures += test_positional_acceptance();
     return failures == 0 ? 0 : fail("ninfer_bench support contract failed");
 }

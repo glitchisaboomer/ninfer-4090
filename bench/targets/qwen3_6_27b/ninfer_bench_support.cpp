@@ -191,6 +191,7 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
     return out;
 }
 
+
 std::uint64_t decode_engine_tokens(const TestResult& result, const RepTiming& rep) {
     if (!result.test.has_decode()) { return 0; }
     if (!rep.speculative.enabled) { return static_cast<std::uint64_t>(result.test.n_gen); }
@@ -249,6 +250,27 @@ void append_timings_json(std::ostringstream& out, const GenerationTimings& timin
 }
 
 } // namespace
+
+PositionalAcceptance positional_acceptance(std::span<const std::uint64_t> accepted_per_position,
+                                           std::uint64_t rounds, std::uint64_t drafted,
+                                           std::uint64_t accepted_total) {
+    PositionalAcceptance out;
+    out.accepted.assign(accepted_per_position.begin(), accepted_per_position.end());
+    out.overall_rate = drafted == 0 ? 0.0
+                                    : static_cast<double>(accepted_total) /
+                                          static_cast<double>(drafted);
+    // Exposure walks the nesting: position 0 is exposed to every speculative round, and position i
+    // is exposed only to the rounds that accepted i - 1.
+    std::uint64_t exposure = rounds;
+    out.conditional_rate.reserve(out.accepted.size());
+    for (const std::uint64_t count : out.accepted) {
+        out.conditional_rate.push_back(exposure == 0 ? 0.0
+                                                     : static_cast<double>(count) /
+                                                           static_cast<double>(exposure));
+        exposure = count;
+    }
+    return out;
+}
 
 std::uint32_t BenchTest::requested_output_tokens() const {
     return checked_context(static_cast<std::uint64_t>(has_decode() ? n_gen : 0) + 1ULL,
