@@ -1403,50 +1403,70 @@ rather than contradicting it, and its FP8 advantage is architecture-bound.
 
 ---
 
-## MTP verify attention at 6 query tokens
+## Where MTP decode time actually goes
 
-The "72% slower" number was misleading. It compared a badly configured width 6 (160 µs) against a
-well configured width 4 (94 µs), mixing "broken setup" with "width 6 is slow".
+Two profiling runs at 35,656-token context, 256 tokens generated, CUDA Graphs on, reported as
+decode-only (everything after the 35K prefill burst). **Read decode-only shares, never the whole-run
+aggregate** — that aggregate is ~89% prefill and put the big prefill GEMMs at the top of the list,
+which sent an earlier investigation after the wrong kernels for several sessions.
 
-The real problem was one shared-memory buffer. V was copied in as compressed codes, then read
-straight back to be unpacked for the multiply — written once, read once, never used again. Reading V
-from the cache and unpacking it in one step removed that buffer and let two blocks run per SM.
+| kernel | share of decode | note |
+|---|---|---|
+| `q4_small_t_mma` + `q5_small_t_mma` | **70%** | the decode GEMMs, weight-bound |
+| `w8_small_t_mma` | 13% | MTP draft head, scales with draft width |
+| `gqa_attention_decode_i8_tiled` | 9% | the kernel this document spends most of its length on |
+| everything else | 8% | ~30 kernels, none above 2% |
 
-Result: 160.6 → 150.1 µs, a **6.6% gain**, no spills. I had blamed memory bandwidth; the profiler
-showed the GPU was fed fine and simply doing more work, so that was wrong.
+**Decode runs at 84% of the DRAM roofline.** 17.90 GB of weights ÷ 1008 GB/s = 17.76 ms per round
+at theoretical peak; measured is 21.20 ms. At the ~85–90% streaming bandwidth a 4090 actually
+sustains, the remaining headroom is **~4% realistically, ~16% at absolute best**. That ceiling
+applies to every decode kernel combined, so no single-kernel optimisation can beat it.
 
-Per token it is **23.4 µs at width 4 vs 25.0 µs at width 6 — about 7% more.** Width 6 does 1.5× the
-rows and takes 1.6× the time, so it is nearly proportional. Both widths waste 25% of rows on
-rounding, so the leftover 7% is the narrower column split per warp, not a removable stall.
+Consequences worth recording, because each cost real time to establish:
 
-Closing it needs different tiling to stop rounding 36 rows up to 48 — a rewrite for one of sixteen
-layers. Not worth it: keep the 6.6% and look elsewhere.
+- **CUDA Graphs help by ~4%, uniformly.** Turning graphs on moved every large kernel by ~9% and the
+  decode total by 4.0%, with 66,804 kernels genuinely inside graphs. The `small_t` GEMMs are
+  therefore compute/bandwidth-bound, **not launch-bound** — fusion would win nothing.
+- **`w8_small_t_mma` looks anomalous and is not.** It rises 13 → 19 launches per round from K=3 to
+  K=5, but that tracks draft tokens (1.82 → 2.61 per round, 1.43×), not a defect.
+- **K=5 vs K=3 is a wash, and slightly favours K=5**: 2,234 → 2,186 ms decode-only (−2.2%). The round
+  bench agrees (9.33 vs 9.94 ms/token).
+- **The width-6 attention fix is worth 0.24% of the whole-run aggregate**, or ~2% of decode. It is a
+  correct change and it stays, but it was never the leverage it appeared to be. The "72% slower"
+  figure that motivated it compared a badly-configured width 6 against a well-configured width 4.
 
-Correction: `Gqa27Geometry` has `GroupSize = 6`, not 4. Earlier register figures are wrong; the
-conclusions stand.
+Remaining levers are not kernel-level: batch concurrency amortises the weight stream, and a smaller
+weight format moves the floor itself. Neither is a kernel optimisation.
 
-## Improving MTP draft acceptance
+## MTP draft acceptance, measured
 
-Acceptance is the better lever. At 30% the engine verifies 6 tokens to bank ~2.5, so most of that
-work is discarded. The rule is a plain prefix match — advance while the draft equals the target's
-own token — so at greedy sampling acceptance is purely how often the draft agrees with the target.
+Three round-bench runs, 500 reps each, on a 6-token seed. **Acceptance is 71–79%, not the 30% the
+serve log implies.** That log divides accepted tokens by a full width-5 window (`2.50tok/round
+(30.0%)`) while only ~2.6 drafts were ever requested, so it understates acceptance by construction.
 
-**Set width from acceptance, not a constant.** The first draft is usually right, the fifth rarely
-is, so asking for 5 pays full price for tokens that are discarded anyway. Earlier work found
-adaptive width beats fixed width. At 30%, K=5 is too wide — the win is going narrower.
+Accepted-per-position (`accepted_per_position`, conditional on reaching that position), K=5:
 
-**Check what the draft head is fed.** It shares the target's cache but consumes a different hidden
-state. If that is the pre-normalized state rather than what the target's output head sees, agreement
-drops in a way that looks like a modelling limit. No kernel work can compensate.
+| position | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| rate | 0.86 | 0.72 | 0.42 | 0.34 | 0.36 |
+| tokens/round | 0.86 | 0.62 | 0.26 | 0.089 | 0.032 |
 
-**At non-zero temperature, keep draft and target sampling identical.** Mismatched temperature or
-top-p silently lowers acceptance. Irrelevant to the greedy run behind your 30%.
+Position 4 earns 1.7% of accepted tokens; positions 3–4 together, 6.5%. So the late window is nearly
+dead weight — **but narrowing does not pay**, because the round is 67% weight stream and cutting to
+K=3 saves only ~0.9 ms of attention while losing 6.5% of accepted tokens:
 
-**Measure acceptance per position first.** The round bench already logs accepted drafts and round
-counts; a per-position breakdown turns the levers above from guesses into a decision.
+| K | round ms | banked/round | ms/token | tokens/s |
+|---|---|---|---|---|
+| 3 | 24.19 | 2.435 | 9.94 | 100.7 |
+| 4 | 25.52 | 2.623 | 9.73 | 102.8 |
+| 5 | 26.70 | 2.861 | **9.33** | **107.2** |
 
-Do not raise K. Verify cost grows linearly with K while accepted tokens do not.
+Marginal cost per extra token *falls* as K grows (7.04 ms/token for 3→4, 4.97 for 4→5), so the wide
+end still pays. Note the engine already narrows the window adaptively — `--draft-tokens 5` produced
+2.61 drafts/round — so K is a ceiling, not a width.
 
+Caveat: fallbacks differ across these runs (6.6% of calls at K=3, 1.4% at K=5), which flatters the
+low-K means slightly since a fallback round does no speculative work. It does not change the ranking.
 
 ## Caveats
 
