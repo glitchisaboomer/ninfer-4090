@@ -97,15 +97,118 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+// Probe rows: six column statistics per draft position, then two per-row counters.
+// `probe` is null on the production path, which makes every write below a predicate the compiler
+// removes rather than a branch it has to keep. The layout is documented in
+// include/ninfer/ops/speculative_round.h.
+// `probe` is contiguous [6*K+2, batch], so the row axis is the batch width and a stat cell for
+// (row, column) sits at (6*column)*batch + row. Callers pass `batch` as `stride`.
+__device__ __forceinline__ float* speculative_probe_column(float* probe,
+                                                                std::int32_t row,
+                                                                std::int32_t stride,
+                                                                std::int32_t column) {
+    return probe + static_cast<std::int64_t>(6 * column) * stride + row;
+}
+
+__device__ __forceinline__ void speculative_probe_init_row(float* probe, std::int32_t row,
+                                                           std::int32_t k, std::int32_t stride,
+                                                           std::int32_t tid,
+                                                           std::int32_t block) {
+    const std::int32_t rows = 6 * k + 2;
+    for (std::int32_t r = tid; r < rows; r += block) { probe[r * stride + row] = 0.0f; }
+}
+
+// Fills cells 0..3 of one reached column. `support_idx`/`support_prob` are the normalized truncated
+// support this column will be accepted against; pass null to report a greedy column, which has no
+// truncated support to summarize. `finite` is false when the column's logits contain a non-finite
+// value, in which case the collision probability and draft probability are reported as -1.
+// Cells 4 and 5 are written later by speculative_probe_commit_columns, because only the commit step
+// knows the round's accepted count.
+__device__ __forceinline__ void speculative_probe_write_column(float* probe,
+                                                               std::int32_t row, std::int32_t k,
+                                                               std::int32_t stride,
+                                                               std::int32_t column,
+                                                               const int* support_idx,
+                                                               const float* support_prob,
+                                                               std::int32_t n_support,
+                                                               std::int32_t draft, bool finite) {
+    // Cell 0 (the reached marker) is written by speculative_probe_commit_columns, not here: the
+    // multiblock route builds every offered column's support, so a writer that marked reachability
+    // would claim columns the accept loop never verified.
+    float* cell = speculative_probe_column(probe, row, stride, column);
+    if (support_idx == nullptr) {
+        cell[1 * stride] = -1.0f;
+        cell[2 * stride] = -1.0f;
+        cell[3 * stride] = -1.0f;
+        return;
+    }
+    float sum_sq      = -1.0f;
+    std::int32_t rank = -1;
+    float pd          = 0.0f;
+    if (finite) {
+        sum_sq = 0.0f;
+        for (std::int32_t j = 0; j < n_support; ++j) {
+            const float p = support_prob[j];
+            sum_sq += p * p;
+            if (rank < 0 && support_idx[j] == draft) { rank = j; }
+        }
+        if (rank >= 0) { pd = support_prob[rank]; }
+    }
+    cell[1 * stride] = sum_sq;
+    cell[2 * stride] = static_cast<float>(rank);
+    cell[3 * stride] = pd;
+}
+
+// Writes cells 4 and 5 for the columns this round actually reached. The accept loop breaks at the
+// first rejection, so a column beyond it was offered as a draft but never verified; marking it
+// drafted would put an unverified column in the acceptance denominator and understate q, which is
+// the exact confusion this probe exists to remove. `accepted` is the round's accepted-draft count,
+// and the reached draft columns are 0..accepted inclusive: the rejection column itself is reached
+// and rejected, while accepted == extent means every draft verified.
+__device__ __forceinline__ void speculative_probe_commit_columns(float* probe,
+                                                                std::int32_t row, std::int32_t stride,
+                                                                std::int32_t extent,
+                                                                std::int32_t accepted) {
+    const std::int32_t reached = accepted + 1;
+    const std::int32_t limit   = reached < extent ? reached : extent;
+    for (std::int32_t i = 0; i < limit; ++i) {
+        float* cell      = speculative_probe_column(probe, row, stride, i);
+        cell[0 * stride] = 1.0f;
+        cell[4 * stride] = 1.0f;
+        cell[5 * stride] = (i < accepted) ? 1.0f : 0.0f;
+    }
+    // The multiblock column writer fills a column's statistics as soon as that column's support is
+    // built, which happens for every offered column, not only the verified ones. Clear the
+    // statistics of the offered-but-unverified tail so an unreached column contributes nothing to
+    // the conditioned means and cannot be mistaken for a rejected draft.
+    for (std::int32_t i = limit; i < extent; ++i) {
+        float* cell = speculative_probe_column(probe, row, stride, i);
+        for (std::int32_t stat = 0; stat < 6; ++stat) { cell[stat * stride] = 0.0f; }
+    }
+}
+
+// Writes the two trailing row counters: drafts offered this round, then drafts accepted.
+__device__ __forceinline__ void speculative_probe_write_row_summary(float* probe,
+                                                                    std::int32_t row,
+                                                                    std::int32_t k,
+                                                                    std::int32_t stride,
+                                                                    std::int32_t offered,
+                                                                    std::int32_t accepted) {
+    probe[(6 * k + 0) * stride + row] = static_cast<float>(offered);
+    probe[(6 * k + 1) * stride + row] = static_cast<float>(accepted);
+}
+
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k) {
+    std::int32_t k, float* probe) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
+    // The probe's row axis is the batch width; this kernel launches one block per batch row.
+    const std::int32_t batch_stride = static_cast<std::int32_t>(gridDim.x);
     int extent                      = current_extents[row];
     extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
     const SamplingConfig cfg        = configs[row];
@@ -117,6 +220,12 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
 
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
+
+    if (probe != nullptr) {
+        speculative_probe_init_row(probe, row, k, static_cast<std::int32_t>(gridDim.x), tid,
+                                   blockDim.x);
+        __syncthreads();
+    }
 
     if (!(cfg.temperature > 0.0f)) {
         int first_target = row_targets[0];
@@ -137,6 +246,14 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             accepted[row]        = a;
             anchors[row]         = t_star;
             lengths[row] += produced;
+            if (probe != nullptr) {
+                for (int i = 0; i < extent; ++i) {
+                    speculative_probe_write_column(probe, row, k, batch_stride, i, nullptr,
+                                                   nullptr, 0, row_drafts[i], true);
+                }
+                speculative_probe_commit_columns(probe, row, batch_stride, extent, a);
+                speculative_probe_write_row_summary(probe, row, k, batch_stride, extent, a);
+            }
         }
         return;
     }
@@ -179,6 +296,33 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             sampling_build_truncated_block_fast(row_logits, base, token_domain, column_cfg,
                                                 merge_val, merge_idx, cand_val, cand_idx, prob,
                                                 &n_support, row_drafts, i);
+        }
+        // The probe reads the same normalized `prob` support the acceptance test consumes, so the
+        // collision probability it reports describes the distribution that was actually sampled.
+        // It is evaluated before the accept decision and writes only the probe matrix, so the
+        // decision and every sampled token stay bit-identical to the probe-free path.
+        //
+        // The finiteness scan is split into its own uniform region because speculative_round.h
+        // requires -1 rather than a NaN or Inf for a non-finite logit column, and only this kernel
+        // can tell that apart from a legitimately large collision probability. The all-finite case
+        // is the shipped one and compiles down to one __syncthreads() saving nothing it uses.
+        if (probe != nullptr) {
+            int nonfinite = 0;
+            for (int v = tid; v < token_domain; v += blockDim.x) {
+                if (!isfinite(__bfloat162float(row_logits[base + v]))) {
+                    nonfinite = 1;
+                    break;
+                }
+            }
+            __syncthreads();
+            if (tid == 0 && i < extent) {
+                speculative_probe_write_column(probe, row, k, batch_stride, i, cand_idx, prob,
+                                                n_support, row_drafts[i], nonfinite == 0);
+            } else if (tid == 0) {
+                speculative_probe_write_column(probe, row, k, batch_stride, i, cand_idx, prob,
+                                                n_support, -1, nonfinite == 0);
+            }
+            __syncthreads();
         }
         if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
@@ -227,6 +371,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         accepted[row]        = a;
         anchors[row]         = tstar;
         lengths[row]         = L + produced;
+        if (probe != nullptr) {
+            speculative_probe_commit_columns(probe, row, batch_stride, extent, a_sh);
+            speculative_probe_write_row_summary(probe, row, k, batch_stride, extent, a_sh);
+        }
         if (cfg.token_counts != nullptr) {
             for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[row_tokens[i]], 1); }
         }
@@ -293,12 +441,14 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols,
     std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride) {
+    std::size_t workspace_row_stride, float* probe) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
     const int tid   = threadIdx.x;
     const int k     = cols - 1;
+    // The probe's row axis is the batch width, which this launch carries on gridDim.z.
+    const std::int32_t batch_stride = static_cast<std::int32_t>(gridDim.z);
     int extent      = current_extents[row];
     extent          = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
@@ -330,6 +480,14 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             accepted[row]        = a;
             anchors[row]         = t_star;
             lengths[row] += produced;
+            if (probe != nullptr) {
+                for (int i = 0; i < extent; ++i) {
+                    speculative_probe_write_column(probe, row, k, batch_stride, i, nullptr, nullptr,
+                                                    0, row_drafts[i], true);
+                }
+                speculative_probe_commit_columns(probe, row, batch_stride, extent, a);
+                speculative_probe_write_row_summary(probe, row, k, batch_stride, extent, a);
+            }
         }
         return;
     }
@@ -413,6 +571,23 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
 
+    // Probe: one group, the column's own last group, writes cells 0..3. cand_idx/prob are the same
+    // normalized support the commit loop below reads back from workspace, and this launch's group
+    // ordering guarantees the writer is the one whose support is final.
+    if (probe != nullptr && is_last_group == 1 && tid == 0) {
+        const __nv_bfloat16* col_logits =
+            row_logits + static_cast<std::int64_t>(col) * physical_rows;
+        int nonfinite = 0;
+        for (int v = 0; v < token_domain; ++v) {
+            if (!isfinite(__bfloat162float(col_logits[v]))) {
+                nonfinite = 1;
+                break;
+            }
+        }
+        speculative_probe_write_column(probe, row, k, batch_stride, col, cand_idx, prob, n_support,
+                                        col < extent ? row_drafts[col] : -1, nonfinite == 0);
+    }
+
     if (tid == 0) {
         workspace.dist_support[col] = n_support;
         for (int j = 0; j < n_support; ++j) {
@@ -463,6 +638,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             accepted[row]        = a;
             anchors[row]         = tstar;
             lengths[row]         = L + produced;
+            if (probe != nullptr) {
+                speculative_probe_commit_columns(probe, row, batch_stride, extent, a);
+                speculative_probe_write_row_summary(probe, row, k, batch_stride, extent, a);
+            }
             if (cfg.token_counts != nullptr) {
                 for (int i = 0; i < produced; ++i) {
                     atomicAdd(&cfg.token_counts[row_tokens[i]], 1);

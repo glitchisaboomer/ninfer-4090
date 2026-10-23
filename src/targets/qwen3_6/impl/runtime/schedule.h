@@ -76,6 +76,10 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Acceptance instrumentation: when set, the verify/accept step records per-column draft
+    // statistics into the frame's accept_probe tensor. Off by default, and the captured graph shape
+    // does not depend on it because the probe tensor is always allocated at its full K.
+    bool acceptance_probe_enabled = false;
 };
 
 struct DFlashBatchContext {
@@ -86,6 +90,8 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // See MtpBatchContext::acceptance_probe_enabled.
+    bool acceptance_probe_enabled = false;
 };
 
 struct DFlashAppendContext {
@@ -123,6 +129,9 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
+    // When non-empty, the accept Op records its per-column collision/rank/pd statistics here. Left
+    // empty on the production path so the accept stays exactly the Op that ships.
+    Tensor accept_probe;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;

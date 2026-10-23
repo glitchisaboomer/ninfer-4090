@@ -1,4 +1,5 @@
 #include "ninfer/ops/speculative_round.h"
+#include "core/device.h"
 #include "ops/launcher/speculative_round.h"
 
 #include <algorithm>
@@ -106,28 +107,30 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                                   stream);
 }
 
-void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
-                                      const Tensor& drafts, const Tensor& current_extents,
-                                      Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
-                                      Tensor& licensed_counts, Tensor& accepted,
-                                      std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
-    constexpr const char* op = "speculative_accept_greedy_drafts";
+namespace {
+
+void speculative_accept_greedy_drafts_impl(const Tensor& target_tokens, const Tensor& logits,
+                                          const Tensor& drafts, const Tensor& current_extents,
+                                          Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                                          Tensor& licensed_counts, Tensor& accepted, Tensor* probe,
+                                          std::int32_t token_domain, const SamplingConfig* configs,
+                                          WorkspaceArena& workspace, cudaStream_t stream,
+                                          const char* op) {
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
-    if (k < 1) { throw std::invalid_argument("speculative_accept_greedy_drafts: K must be >=1"); }
+    if (k < 1) { throw std::invalid_argument(std::string(op) + ": K must be >=1"); }
     if (batch < 1) {
-        throw std::invalid_argument("speculative_accept_greedy_drafts: B must be >=1");
+        throw std::invalid_argument(std::string(op) + ": B must be >=1");
     }
     require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
     require_dtype(logits, DType::BF16, op, "logits");
     if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch || logits.ne[3] != 1) {
-        throw std::invalid_argument(
-            "speculative_accept_greedy_drafts: logits must be [physical_rows,K+1,B]");
+        throw std::invalid_argument(std::string(op) +
+                                    ": logits must be [physical_rows,K+1,B]");
     }
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
-        throw std::invalid_argument(
-            "speculative_accept_greedy_drafts: token_domain must be in [1, logits.ne[0]]");
+        throw std::invalid_argument(std::string(op) +
+                                    ": token_domain must be in [1, logits.ne[0]]");
     }
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_vector(current_extents, DType::I32, batch, op, "current_extents");
@@ -137,7 +140,19 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
     require_vector(accepted, DType::I32, batch, op, "accepted");
     if (configs == nullptr) {
-        throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
+        throw std::invalid_argument(std::string(op) + ": configs must be non-null");
+    }
+    if (probe != nullptr) {
+        require_dtype(*probe, DType::FP32, op, "probe");
+        if (probe->ne[0] != 6 * k + 2 || probe->ne[1] != batch || probe->ne[2] != 1 ||
+            probe->ne[3] != 1) {
+            throw std::invalid_argument(std::string(op) + ": probe must be [6*K+2,B] FP32");
+        }
+    }
+    // Zero the probe before the accept launch: every cell this round does not reach must read 0,
+    // not a previous round's value, and the two launched kernels write disjoint subsets of cells.
+    if (probe != nullptr) {
+        CUDA_CHECK(cudaMemsetAsync(probe->data, 0, probe->bytes(), stream));
     }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
@@ -145,7 +160,33 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs, scratch,
+        probe == nullptr ? nullptr : static_cast<float*>(probe->data), stream);
+}
+
+} // namespace
+
+void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
+                                      const Tensor& drafts, const Tensor& current_extents,
+                                      Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                                      Tensor& licensed_counts, Tensor& accepted,
+                                      std::int32_t token_domain, const SamplingConfig* configs,
+                                      WorkspaceArena& workspace, cudaStream_t stream) {
+    speculative_accept_greedy_drafts_impl(target_tokens, logits, drafts, current_extents, lengths,
+                                          anchors, licensed_tokens, licensed_counts, accepted,
+                                          nullptr, token_domain, configs, workspace, stream,
+                                          "speculative_accept_greedy_drafts");
+}
+
+void speculative_accept_greedy_drafts_with_probe(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+    Tensor& licensed_counts, Tensor& accepted, Tensor& probe, std::int32_t token_domain,
+    const SamplingConfig* configs, WorkspaceArena& workspace, cudaStream_t stream) {
+    speculative_accept_greedy_drafts_impl(target_tokens, logits, drafts, current_extents, lengths,
+                                          anchors, licensed_tokens, licensed_counts, accepted,
+                                          &probe, token_domain, configs, workspace, stream,
+                                          "speculative_accept_greedy_drafts_with_probe");
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

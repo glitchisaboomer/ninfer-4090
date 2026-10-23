@@ -124,6 +124,7 @@ struct MtpDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    TensorRegion accept_probe;
     TensorRegion proposal_logits;
     TensorRegion alignment_ids;
     TensorRegion alignment_hidden;
@@ -147,6 +148,7 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    TensorRegion accept_probe;
 };
 
 struct RoundStateLayout {
@@ -241,6 +243,11 @@ struct MtpDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    // Acceptance probe [6*K+2, batch] FP32. Written only by speculative_accept_greedy_drafts_with_probe,
+    // which the runtime calls when acceptance instrumentation is on; the production accept path
+    // leaves it untouched. It is a device tensor rather than a pinned egress field so the
+    // measurement path adds no transfer to the round it is not measuring.
+    Tensor accept_probe;
     Tensor proposal_logits;
     Tensor alignment_ids;
     Tensor alignment_hidden;
@@ -280,6 +287,8 @@ struct DFlashDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    // See MtpDecodeState::accept_probe.
+    Tensor accept_probe;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,

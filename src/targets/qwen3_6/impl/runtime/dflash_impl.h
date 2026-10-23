@@ -311,7 +311,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
                               ops::GqaExecutionEnvelope target_envelope) {
-    return [&state, batch_size, k, envelopes, target_envelope] {
+    const bool probe_enabled = state.acceptance_probe_enabled;
+    return [&state, batch_size, k, envelopes, target_envelope, probe_enabled] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
@@ -381,6 +382,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                  .licensed_counts = licensed_counts,
                                  .accepted_drafts = accepted,
                                  .selected_hidden = selected_hidden,
+                                 .accept_probe    = probe_enabled
+                                                        ? frame.accept_probe.slice(1, 0, batch_size)
+                                                        : Tensor{},
                                  .replay_records  = state.execution.replay_records,
                                  .sampling        = frame.sampling,
                                  .feature_sink    = &sink,

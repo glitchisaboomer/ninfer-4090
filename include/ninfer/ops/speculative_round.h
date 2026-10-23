@@ -94,6 +94,55 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Op: speculative_accept_greedy_drafts_with_probe
+ *
+ * This is speculative_accept_greedy_drafts with one additional, purely observational output. The
+ * acceptance decision, sampled tokens, and every other output are bit-identical to the version
+ * without the probe, which is the contract that lets a measurement run and a production run share
+ * one execution path.
+ *
+ * Probe:
+ *   probe is a distinct device FP32 [6*K+2,B] matrix, K*6 row statistics followed by one row
+ *   summary per batch row. Writing a row is conditioned on the same predicate that governs which
+ *   columns were actually reached, exactly as accepted_per_position is accumulated by callers:
+ *   a column that no round reached contributes nothing, so `probe_drafted` remains the correct
+ *   denominator for acceptance and `probe_collision` its conditional mean over reached columns.
+ *
+ *   Per column i in [0,Pcur[b]) -- the drafts actually offered this round:
+ *     probe[6*i+0,b] = 1                       reachable column marker
+ *     probe[6*i+1,b] = r_i                     collision probability sum_j p_j^2, or -1 when the
+ *                                              logits of column i contain a non-finite value
+ *     probe[6*i+2,b] = rank_i                  index j of drafts[i] in the descending support
+ *                                              cand_idx[j], or -1 when drafts[i] is outside it
+ *     probe[6*i+3,b] = pd_i                    p(drafts[i]), or 0 when drafts[i] is outside it
+ *     probe[6*i+4,b] = drafted_i               1
+ *     probe[6*i+5,b] = accepted_i              1 when this column accepted its draft
+ *   Trailing columns carry zeros.
+ *
+ *   probe[6*K+0,b] = extent_b    drafts offered this round (== the round's `drafted_tokens`)
+ *   probe[6*K+1,b] = A_b         drafts accepted this round (== the round's `accepted_tokens`)
+ *
+ *   The row summary therefore reproduces the aggregate acceptance SpeculativeStats already reports,
+ *   while the per-column cells add the collision ceiling and draft-rank detail that no existing
+ *   counter carries. Column statistics cover only columns reachable in their own round, because a
+ *   later column is only verified once every earlier draft accepted; a caller that wants
+ *   conditioned-on-reaching means aggregates the column cells over reached rounds, which is what
+ *   tools/bench/run_gate_b_acceptance_sweep.py already does for accepted_per_position.
+ *
+ * Numeric:
+ *   r_i and pd_i are accumulated in FP32 from the same normalized `prob` support the acceptance
+ *   test consumes, in descending-probability order, so they describe the distribution that was
+ *   actually sampled rather than a reconstruction of it. Greedy rows (temperature <= 0) report
+ *   -1 in every reachable column cell except cell 0, because that branch never builds a truncated
+ *   support and has no collision probability to report.
+ */
+void speculative_accept_greedy_drafts_with_probe(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+    Tensor& licensed_counts, Tensor& accepted, Tensor& probe, std::int32_t token_domain,
+    const SamplingConfig* configs, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
  * Op: speculative_select_accepted_hidden
  *
  * Math / indexing:

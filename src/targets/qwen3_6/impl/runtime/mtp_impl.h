@@ -69,7 +69,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                            MtpGqaEnvelopes envelopes) {
-    return [&state, batch_size, k, envelopes] {
+    const bool probe_enabled = state.acceptance_probe_enabled;
+    return [&state, batch_size, k, envelopes, probe_enabled] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kMtpDecodeMaximumDrafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
@@ -139,6 +140,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .licensed_counts = licensed_counts,
                                  .accepted_drafts = accepted,
                                  .selected_hidden = selected_hidden,
+                                 .accept_probe    = probe_enabled
+                                                        ? frame.accept_probe.slice(1, 0, batch_size)
+                                                        : Tensor{},
                                  .replay_records  = state.execution.replay_records,
                                  .sampling        = frame.sampling,
                              },

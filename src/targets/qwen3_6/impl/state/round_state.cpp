@@ -160,6 +160,10 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_continuation_hidden =
             add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
                        "MTP decode target continuation hidden");
+        // Acceptance probe, written only when a caller passes it to the accept Op. Sized for the
+        // full configured K so a graph replay never depends on the round's actual extent.
+        decode.accept_probe = add_tensor(builder, DType::FP32, {6 * drafts + 2, batch},
+                                         "MTP decode acceptance probe");
         decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
                                             "MTP decode proposal logits");
         decode.alignment_ids =
@@ -207,6 +211,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+        decode.accept_probe =
+            add_tensor(builder, DType::FP32, {6 * drafts + 2, batch}, "DFlash acceptance probe");
     }
     layout.complete = true;
 }
@@ -279,6 +285,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     target_logits    = layout.target_logits.bind(backing);
     target_hidden    = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    accept_probe               = layout.accept_probe.bind(backing);
     proposal_logits            = layout.proposal_logits.bind(backing);
     alignment_ids              = layout.alignment_ids.bind(backing);
     alignment_hidden           = layout.alignment_hidden.bind(backing);
@@ -336,6 +343,7 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_counts), DType::I32, {batch});
     accepted_drafts =
         egress_tensor(offsetof(DFlashDecodeEgress, accepted_drafts), DType::I32, {batch});
+    accept_probe               = layout.accept_probe.bind(backing);
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
     append_positions           = layout.append_positions.bind(backing);

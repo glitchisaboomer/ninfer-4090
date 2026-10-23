@@ -2,6 +2,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -376,9 +377,386 @@ int select_hidden_case(int rows, int columns, int accepted_value) {
     return failures;
 }
 
+// Independent FP64 oracle for the probe's per-column statistics. It reconstructs the truncated
+// support from the raw logits using the documented sampling.h ordering (adjusted logit descending,
+// lower token id breaking ties) rather than reading the kernel's candidate arrays, so the two
+// derivations share no code beyond the penalty definition.
+struct ProbeColumnOracle {
+    double collision = 0.0;
+    int rank         = -1;
+    double pd        = 0.0;
+    int support      = 0;
+};
+
+ProbeColumnOracle probe_column_oracle(const std::vector<float>& logits, std::size_t base,
+                                      int token_domain, ops::SamplingConfig cfg,
+                                      std::int32_t draft) {
+    // Penalties are deliberately zero in every case that uses this oracle, so the adjusted logit
+    // is the raw BF16-rounded value. Folding a non-zero penalty in here would require mirroring the
+    // round-local overlay, which is a different contract.
+    std::vector<float> adjusted(static_cast<std::size_t>(token_domain));
+    for (int v = 0; v < token_domain; ++v) {
+        adjusted[static_cast<std::size_t>(v)] = logits[base + static_cast<std::size_t>(v)];
+    }
+
+    std::vector<int> order(static_cast<std::size_t>(token_domain));
+    for (int v = 0; v < token_domain; ++v) order[static_cast<std::size_t>(v)] = v;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        const float xa = adjusted[static_cast<std::size_t>(a)];
+        const float xb = adjusted[static_cast<std::size_t>(b)];
+        if (xa != xb) return xa > xb;
+        return a < b;
+    });
+
+    int cap = 20;
+    if (cfg.top_k > 0 && cfg.top_k < cap) cap = cfg.top_k;
+    if (token_domain < cap) cap = token_domain;
+
+    const double inv_temp = 1.0 / static_cast<double>(cfg.temperature);
+    const double m        = static_cast<double>(adjusted[static_cast<std::size_t>(order[0])]) * inv_temp;
+    std::vector<double> weights(static_cast<std::size_t>(cap), 0.0);
+    double total = 0.0;
+    for (int j = 0; j < cap; ++j) {
+        const double e = std::exp(static_cast<double>(adjusted[static_cast<std::size_t>(order[static_cast<std::size_t>(j)])]) * inv_temp - m);
+        weights[static_cast<std::size_t>(j)] = e;
+        total += e;
+    }
+    const double e0          = weights[0];
+    const double min_p_thresh = cfg.min_p > 0.0f ? static_cast<double>(cfg.min_p) * e0 : -1.0;
+    const bool top_p_active  = cfg.top_p < 1.0f;
+    const double top_p_target = static_cast<double>(cfg.top_p) * total;
+    double cum = 0.0;
+    int support = 0;
+    for (int j = 0; j < cap; ++j) {
+        if (min_p_thresh >= 0.0 && weights[static_cast<std::size_t>(j)] < min_p_thresh) break;
+        cum += weights[static_cast<std::size_t>(j)];
+        support = j + 1;
+        if (top_p_active && cum >= top_p_target) break;
+    }
+    if (support < 1) support = 1;
+    double ssum = 0.0;
+    for (int j = 0; j < support; ++j) ssum += weights[static_cast<std::size_t>(j)];
+    for (int j = 0; j < support; ++j) weights[static_cast<std::size_t>(j)] /= ssum;
+
+    ProbeColumnOracle out;
+    out.support = support;
+    for (int j = 0; j < support; ++j) {
+        const double p = weights[static_cast<std::size_t>(j)];
+        out.collision += p * p;
+        if (out.rank < 0 && order[static_cast<std::size_t>(j)] == draft) {
+            out.rank = j;
+            out.pd   = p;
+        }
+    }
+    return out;
+}
+
+// verify_exact cannot deduce a template parameter from a braced-init list, so the probe checks
+// name their element type explicitly.
+inline int verify_i32(const char* label, std::vector<std::int32_t> got,
+                      std::vector<std::int32_t> expected) {
+    return verify_exact<std::int32_t>(label, got, expected);
+}
+
+inline int verify_f32(const char* label, std::vector<float> got, std::vector<float> expected) {
+    return verify_exact<float>(label, got, expected);
+}
+
+// Drives one sampling-mode accept with and without the probe and checks three things the probe
+// contract promises: (1) the commit is bit-identical either way, (2) the probe's own acceptance
+// cells reproduce the committed accepted count, and (3) the collision probability and draft rank
+// match the FP64 oracle.
+int probe_matches_oracle_case(int token_domain, int k, const char* route_label) {
+    const int columns = k + 1;
+    // A deliberately sharp but not degenerate distribution: a few tokens dominate so the top-p
+    // truncation is exercised and the collision probability is far from 1.
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns, -20.0f);
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k));
+    for (int col = 0; col < columns; ++col) {
+        const std::size_t base = static_cast<std::size_t>(col) * token_domain;
+        logits[base + 0]       = 6.0f;
+        logits[base + 1]       = 5.0f;
+        logits[base + 2]       = 4.0f;
+        logits[base + 3]       = 3.0f;
+        if (col < k) {
+            // Alternate the draft between the leader and a rank-2 token so both the accept and the
+            // reject branches are represented across columns.
+            drafts[static_cast<std::size_t>(col)] = (col % 2 == 0) ? 0 : 2;
+        }
+    }
+    round_to_bf16(logits);
+
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 20;
+    config.top_p       = 0.95f;
+    config.seed        = 0x9e3779b97f4a7c15ull;
+    std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain), 0);
+
+    const std::string label =
+        std::string("probe ") + route_label + " V=" + std::to_string(token_domain) +
+        " K=" + std::to_string(k);
+
+    // Expected per-column oracle values, computed before any device work.
+    std::vector<ProbeColumnOracle> oracle(static_cast<std::size_t>(k));
+    ops::SamplingConfig oracle_cfg = config;
+    oracle_cfg.token_counts        = nullptr;
+    for (int col = 0; col < k; ++col) {
+        oracle[static_cast<std::size_t>(col)] = probe_column_oracle(
+            logits, static_cast<std::size_t>(col) * token_domain, token_domain, oracle_cfg,
+            drafts[static_cast<std::size_t>(col)]);
+    }
+
+    const auto run = [&](bool with_probe, std::vector<std::int32_t>* licensed_out,
+                         std::vector<std::int32_t>* accepted_out, std::vector<float>* probe_out,
+                         std::vector<std::int32_t>* counts_out) {
+        DeviceBuffer d_targets = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(columns), 0));
+        DeviceBuffer d_logits  = to_device_bf16(logits);
+        DeviceBuffer d_drafts  = to_device(drafts);
+        DeviceBuffer d_counts  = to_device(token_counts);
+        DeviceBuffer d_extent  = to_device<std::int32_t>({k});
+        DeviceBuffer d_length  = to_device<std::int32_t>({500});
+        DeviceBuffer d_anchor  = to_device<std::int32_t>({-1});
+        DeviceBuffer d_lic(static_cast<std::size_t>(columns) * sizeof(std::int32_t));
+        DeviceBuffer d_num(sizeof(std::int32_t));
+        DeviceBuffer d_acc(sizeof(std::int32_t));
+        ops::SamplingConfig cfg = config;
+        cfg.token_counts        = static_cast<std::int32_t*>(d_counts.p);
+        DeviceBuffer d_config   = device_config(cfg);
+
+        Tensor targets(d_targets.p, DType::I32, {columns});
+        Tensor logits_tensor(d_logits.p, DType::BF16, {token_domain, columns});
+        Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+        Tensor extent(d_extent.p, DType::I32, {1});
+        Tensor length(d_length.p, DType::I32, {1});
+        Tensor anchor(d_anchor.p, DType::I32, {1});
+        Tensor licensed(d_lic.p, DType::I32, {columns});
+        Tensor num_sampled(d_num.p, DType::I32, {1});
+        Tensor accepted(d_acc.p, DType::I32, {1});
+        const std::size_t workspace_bytes =
+            ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+        WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+        const auto* config_ptr = static_cast<const ops::SamplingConfig*>(d_config.p);
+
+        if (!with_probe) {
+            ops::speculative_accept_greedy_drafts(targets, logits_tensor, draft_tensor, extent,
+                                                  length, anchor, licensed, num_sampled, accepted,
+                                                  token_domain, config_ptr, workspace, nullptr);
+            cuda_synchronize();
+        } else {
+            DeviceBuffer d_probe(static_cast<std::size_t>(6 * k + 2) * sizeof(float));
+            Tensor probe(d_probe.p, DType::FP32, {6 * k + 2, 1});
+            ops::speculative_accept_greedy_drafts_with_probe(
+                targets, logits_tensor, draft_tensor, extent, length, anchor, licensed, num_sampled,
+                accepted, probe, token_domain, config_ptr, workspace, nullptr);
+            cuda_synchronize();
+            *probe_out = from_device<float>(d_probe, static_cast<std::size_t>(6 * k + 2));
+        }
+        *licensed_out = from_device<std::int32_t>(d_lic.p, static_cast<std::size_t>(columns));
+        *accepted_out = from_device<std::int32_t>(d_acc.p, 1);
+        *counts_out   = from_device<std::int32_t>(d_counts, static_cast<std::size_t>(token_domain));
+    };
+
+    std::vector<std::int32_t> plain_licensed, plain_accepted, plain_counts;
+    std::vector<std::int32_t> probed_licensed, probed_accepted, probed_counts;
+    std::vector<float> probe_values;
+    run(false, &plain_licensed, &plain_accepted, &probe_values, &plain_counts);
+    run(true, &probed_licensed, &probed_accepted, &probe_values, &probed_counts);
+
+    int failures = verify_exact((label + " licensed tokens unchanged by probe").c_str(),
+                                probed_licensed, plain_licensed);
+    failures += verify_exact((label + " accepted unchanged by probe").c_str(), probed_accepted,
+                             plain_accepted);
+    failures += verify_exact((label + " token counts unchanged by probe").c_str(), probed_counts,
+                             plain_counts);
+
+    const auto row = [&](int r) { return probe_values[static_cast<std::size_t>(r)]; };
+    const int accepted_total = probed_accepted[0];
+    failures += verify_i32((label + " row summary offered").c_str(),
+                           {static_cast<std::int32_t>(row(6 * k + 0))}, {k});
+    failures += verify_i32((label + " row summary accepted").c_str(),
+                           {static_cast<std::int32_t>(row(6 * k + 1))}, {accepted_total});
+
+    for (int col = 0; col < k; ++col) {
+        // Probe layout is [6*K+2, batch]; this case runs one row, so the flat cell for
+        // (column, statistic) is 6*column + statistic.
+        const auto cell = [&](int index) {
+            return probe_values[static_cast<std::size_t>(6 * col + index)];
+        };
+        const auto cell_i = [&](int index) {
+            return static_cast<std::int32_t>(cell(index));
+        };
+        const ProbeColumnOracle& want = oracle[static_cast<std::size_t>(col)];
+        const std::string at          = label + " col " + std::to_string(col);
+
+        // Reachability is derived independently here, from the committed acceptance count alone:
+        // the accept loop stops at the first rejection, so column i was verified exactly when every
+        // earlier draft accepted, i.e. when accepted_total >= i.
+        const bool reached = accepted_total >= col;
+        failures += verify_i32((at + " reached").c_str(), {cell_i(0)}, {reached ? 1 : 0});
+        failures += verify_i32((at + " drafted cell").c_str(), {cell_i(4)}, {reached ? 1 : 0});
+        failures += verify_i32((at + " accepted cell").c_str(), {cell_i(5)},
+                               {col < accepted_total ? 1 : 0});
+        if (!reached) { continue; }
+
+        const double got_collision = static_cast<double>(cell(1));
+        if (want.rank < 0) {
+            failures += verify_i32((at + " absent rank").c_str(), {cell_i(2), cell_i(3)}, {-1, 0});
+            continue;
+        }
+        // FP32 accumulation over a 20-element support against an FP64 oracle. The bound is stated
+        // in ulps of the FP64 value rather than as an absolute tolerance so it does not weaken as
+        // the support sharpens.
+        const double scale = std::max(want.collision, 1e-6);
+        if (std::abs(got_collision - want.collision) > 1e-5 * scale) {
+            std::cerr << at << ": collision " << got_collision << " vs oracle " << want.collision
+                      << '\n';
+            ++failures;
+        }
+        failures += verify_i32((at + " rank").c_str(), {cell_i(2)}, {want.rank});
+        if (std::abs(static_cast<double>(cell(3)) - want.pd) > 1e-5 * std::max(want.pd, 1e-6)) {
+            std::cerr << at << ": pd " << cell(3) << " vs oracle " << want.pd << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+// A draft outside the truncated support must report rank -1 and pd 0, which is the structural
+// rejection case the probe exists to expose.
+int probe_absent_draft_case() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 1;
+    const int columns          = k + 1;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns, -20.0f);
+    for (int col = 0; col < columns; ++col) {
+        const std::size_t base = static_cast<std::size_t>(col) * token_domain;
+        logits[base + 0]       = 6.0f;
+        logits[base + 1]       = 5.0f;
+    }
+    round_to_bf16(logits);
+    const std::vector<std::int32_t> drafts{40}; // far below the sharp head, outside top-p
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 20;
+    config.top_p       = 0.5f;
+    config.seed        = 12345;
+    std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain), 0);
+
+    DeviceBuffer d_targets = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(columns), 0));
+    DeviceBuffer d_logits  = to_device_bf16(logits);
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_counts  = to_device(token_counts);
+    DeviceBuffer d_extent  = to_device<std::int32_t>({k});
+    DeviceBuffer d_length  = to_device<std::int32_t>({10});
+    DeviceBuffer d_anchor  = to_device<std::int32_t>({-1});
+    DeviceBuffer d_lic(static_cast<std::size_t>(columns) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_acc(sizeof(std::int32_t));
+    DeviceBuffer d_probe(static_cast<std::size_t>(6 * k + 2) * sizeof(float));
+    config.token_counts  = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config = device_config(config);
+
+    Tensor targets(d_targets.p, DType::I32, {columns});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {token_domain, columns});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+    Tensor extent(d_extent.p, DType::I32, {1});
+    Tensor length(d_length.p, DType::I32, {1});
+    Tensor anchor(d_anchor.p, DType::I32, {1});
+    Tensor licensed(d_lic.p, DType::I32, {columns});
+    Tensor num_sampled(d_num.p, DType::I32, {1});
+    Tensor accepted(d_acc.p, DType::I32, {1});
+    Tensor probe(d_probe.p, DType::FP32, {6 * k + 2, 1});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ops::speculative_accept_greedy_drafts_with_probe(
+        targets, logits_tensor, draft_tensor, extent, length, anchor, licensed, num_sampled,
+        accepted, probe, token_domain, static_cast<const ops::SamplingConfig*>(d_config.p),
+        workspace, nullptr);
+    cuda_synchronize();
+
+    const std::vector<float> values = from_device<float>(d_probe, static_cast<std::size_t>(6 * k + 2));
+    const std::vector<std::int32_t> acc = from_device<std::int32_t>(d_acc.p, 1);
+    int failures = verify_i32("probe absent draft rejected", acc, {0});
+    failures += verify_i32("probe absent draft reached", {static_cast<std::int32_t>(values[0])}, {1});
+    failures += verify_i32("probe absent draft rank", {static_cast<std::int32_t>(values[2])}, {-1});
+    failures += verify_f32("probe absent draft pd", {values[3]}, {0.0f});
+    if (!(values[1] > 0.0f && values[1] <= 1.0f)) {
+        std::cerr << "probe absent draft collision out of range: " << values[1] << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
+// The probe is observational: it must reject a mismatched shape rather than write outside it.
+int probe_shape_validation_case() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 3;
+    const int columns          = k + 1;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns, 0.0f);
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), 0);
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain), 0);
+
+    DeviceBuffer d_targets = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(columns), 0));
+    DeviceBuffer d_logits  = to_device_bf16(logits);
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_counts  = to_device(token_counts);
+    DeviceBuffer d_extent  = to_device<std::int32_t>({k});
+    DeviceBuffer d_length  = to_device<std::int32_t>({0});
+    DeviceBuffer d_anchor  = to_device<std::int32_t>({-1});
+    DeviceBuffer d_lic(static_cast<std::size_t>(columns) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_acc(sizeof(std::int32_t));
+    config.token_counts  = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config = device_config(config);
+
+    Tensor targets(d_targets.p, DType::I32, {columns});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {token_domain, columns});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+    Tensor extent(d_extent.p, DType::I32, {1});
+    Tensor length(d_length.p, DType::I32, {1});
+    Tensor anchor(d_anchor.p, DType::I32, {1});
+    Tensor licensed(d_lic.p, DType::I32, {columns});
+    Tensor num_sampled(d_num.p, DType::I32, {1});
+    Tensor accepted(d_acc.p, DType::I32, {1});
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    const auto* config_ptr = static_cast<const ops::SamplingConfig*>(d_config.p);
+
+    int failures = 0;
+    // Wrong row count: one short of 6*K+2.
+    {
+        DeviceBuffer d_probe(static_cast<std::size_t>(6 * k + 1) * sizeof(float));
+        Tensor probe(d_probe.p, DType::FP32, {6 * k + 1, 1});
+        try {
+            ops::speculative_accept_greedy_drafts_with_probe(
+                targets, logits_tensor, draft_tensor, extent, length, anchor, licensed, num_sampled,
+                accepted, probe, token_domain, config_ptr, workspace, nullptr);
+            std::cerr << "probe accepted an undersized probe matrix\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
+    // Wrong dtype.
+    {
+        DeviceBuffer d_probe(static_cast<std::size_t>(6 * k + 2) * sizeof(std::int32_t));
+        Tensor probe(d_probe.p, DType::I32, {6 * k + 2, 1});
+        try {
+            ops::speculative_accept_greedy_drafts_with_probe(
+                targets, logits_tensor, draft_tensor, extent, length, anchor, licensed, num_sampled,
+                accepted, probe, token_domain, config_ptr, workspace, nullptr);
+            std::cerr << "probe accepted a non-FP32 probe matrix\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
+    return failures;
+}
+
 int remap_case(int token_count) {
-    constexpr int map_size = 131072;
-    std::vector<std::int32_t> id_map(map_size);
+    constexpr int map_size = 131072;    std::vector<std::int32_t> id_map(map_size);
     for (int i = 0; i < map_size; ++i) {
         const auto value                    = 65537u * static_cast<std::uint32_t>(i) + 17u;
         id_map[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(value & (map_size - 1u));
@@ -556,6 +934,14 @@ int main() {
     failures += grammar_mask_only_first_sampling_column_case(64);
     failures += grammar_mask_only_first_sampling_column_case(2048);
     failures += batched_sampling_workspace_stride_case();
+    // Probe: the single-block route (V <= 256) and the multiblock route (V > 256) both carry the
+    // same statistics, and a measurement run must agree with its oracle on both. The 248077 case
+    // is the production token domain.
+    failures += probe_matches_oracle_case(64, 5, "small");
+    failures += probe_matches_oracle_case(1024, 3, "multiblock");
+    failures += probe_matches_oracle_case(248077, 3, "production-domain");
+    failures += probe_absent_draft_case();
+    failures += probe_shape_validation_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);
     failures += select_hidden_case(2048, 16, 7);
