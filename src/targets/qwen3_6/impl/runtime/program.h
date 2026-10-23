@@ -14,6 +14,9 @@
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/prompt_edit.h"
+
+#include <cstdlib>
+#include <limits>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -189,6 +192,25 @@ struct SequenceState {
     TurnCheckpoint turn_checkpoint;
     std::uint32_t last_disk_snapshot_tokens = 0;
 };
+
+// Host bytes the acceptance probe needs for one round: the [6*K+2, batch] matrix at the largest
+// batch this engine can run. Sized once at construction from the configured draft window, because
+// the batch is bounded by kMaximumConcurrency and the probe tensor is allocated at full K.
+[[nodiscard]] inline std::size_t accept_probe_bytes(std::uint32_t draft_window) {
+    const auto positions = static_cast<std::size_t>(6 * draft_window + 2);
+    return positions * static_cast<std::size_t>(kMaximumConcurrency) * sizeof(float);
+}
+
+// Draft-acceptance probe. Off unless NINFER_SPEC_ACCEPTANCE_PROBE is set, matching how
+// NINFER_SCR_DIAG gates the relocation diagnostic. It costs one extra read of the verification
+// logits column per draft position and one host copy per round, so no production run enables it.
+inline bool acceptance_probe_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SPEC_ACCEPTANCE_PROBE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 
 // Diagnostic only, and only populated when NINFER_SCR_DIAG is set. One probe per relocated
 // destination page, fingerprinted after the re-rotation and re-checked once the prefill that consumes
@@ -456,6 +478,23 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+
+    // Acceptance probe, allocated only when NINFER_SPEC_ACCEPTANCE_PROBE is set. One host buffer
+    // per backend would be wasteful for a diagnostic that no production run enables, so a single
+    // buffer sized for the larger of the two is shared; each round uses its own prefix and only the
+    // active backend ever runs in one process.
+    std::optional<PinnedHostBuffer> accept_probe_host;
+    float* accept_probe_host_data     = nullptr;
+    std::size_t accept_probe_capacity = 0;
+
+    // Host landing area for one round's probe copy, or empty when the probe is off. Bounded by the
+    // configured draft window and this round's batch row count.
+    [[nodiscard]] std::span<float> accept_probe_span(std::uint32_t k, std::size_t batch) const {
+        if (accept_probe_host_data == nullptr) { return {}; }
+        const auto needed = static_cast<std::size_t>(6 * k + 2) * batch;
+        if (needed > accept_probe_capacity) { return {}; }
+        return std::span<float>(accept_probe_host_data, needed);
+    }
 
     std::size_t workspace_logical_peak_bytes = 0;
     DiskStateCache* disk_state_cache          = nullptr;

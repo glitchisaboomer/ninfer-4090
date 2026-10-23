@@ -227,7 +227,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       dflash_host(plan.speculative_backend == SpeculativeBackend::DFlash
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
-                      : std::nullopt) {
+                      : std::nullopt),
+      accept_probe_host(acceptance_probe_enabled() && plan.speculative_backend !=
+                                                            SpeculativeBackend::None
+                            ? std::make_optional<PinnedHostBuffer>(accept_probe_bytes(draft_window))
+                            : std::nullopt) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
@@ -300,6 +304,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
 
+    if (accept_probe_host) {
+        accept_probe_host_data = static_cast<float*>(accept_probe_host->data());
+        accept_probe_capacity  = accept_probe_bytes(draft_window) / sizeof(float);
+    }
     host_tokens = static_cast<TokenId*>(round_host.data());
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<qwen3_6::OrdinaryDecodeIngress*>(ordinary_host->data());
@@ -1465,8 +1473,81 @@ GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) c
     return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
 }
 
+namespace {
+
+// Folds one round's acceptance-probe matrix into a request's running probe statistics. The matrix is
+// [6*K+2, batch] as speculative_round.h documents, and `row` selects this request's column. An
+// unreached column carries zeros in every cell, so it contributes nothing and needs no separate
+// reachability test; the per-position means are therefore conditioned on reaching, which is what
+// makes them comparable against accepted_per_position.
+//
+// The sums live in `probe.collision` / `probe.draft_probability` and are divided by
+// `probe.reached_per_position` once, when the request finishes. Keeping the running numerator and
+// the count separate means a round can be folded in without knowing how many rounds will follow.
+void accumulate_accept_probe(SpeculativeStats& stats, std::span<const float> probe, int k, int row,
+                             int batch) {
+    if (probe.empty() || k <= 0 || row < 0 || row >= batch) { return; }
+    const auto positions = static_cast<std::size_t>(k);
+    auto& out            = stats.probe;
+    // Grow once, never reset: these are running sums across the request's rounds, so a later round
+    // must add to the earlier ones. `assign` here would silently keep only the last round.
+    if (out.collision.size() < positions) { out.collision.resize(positions, 0.0); }
+    if (out.draft_probability.size() < positions) {
+        out.draft_probability.resize(positions, 0.0);
+    }
+    if (out.rank_histogram.size() < positions * 21) {
+        out.rank_histogram.resize(positions * 21, 0);
+    }
+    if (out.reached_per_position.size() < positions) {
+        out.reached_per_position.resize(positions, 0);
+    }
+
+    const auto stride = static_cast<std::size_t>(batch);
+    for (int i = 0; i < k; ++i) {
+        const auto slot = static_cast<std::size_t>(i);
+        const auto base = slot * 6 * stride + static_cast<std::size_t>(row);
+        if (!(probe[base] > 0.0f)) { continue; }
+
+        const float collision = probe[base + 1 * stride];
+        const float pd_cell   = probe[base + 3 * stride];
+        const int rank        = static_cast<int>(probe[base + 2 * stride]);
+
+        // A negative value marks a column whose logits held a non-finite entry. The column was still
+        // reached and still has a rank, so it stays in the histogram, but it has no probability to
+        // average and must not be folded in as zero.
+        if (collision >= 0.0f) { out.collision[slot] += static_cast<double>(collision); }
+        if (pd_cell >= 0.0f) { out.draft_probability[slot] += static_cast<double>(pd_cell); }
+        const int bucket = (rank < 0 || rank > 19) ? 20 : rank;
+        out.rank_histogram[slot * 21 + static_cast<std::size_t>(bucket)] += 1;
+        out.reached_per_position[slot] += 1;
+    }
+}
+
+// Turns the accumulated sums into the means the published stats carry, then clears the scratch.
+void finalize_accept_probe(SpeculativeStats& stats) {
+    auto& out = stats.probe;
+    for (std::size_t i = 0; i < out.reached_per_position.size(); ++i) {
+        const auto n = static_cast<double>(out.reached_per_position[i]);
+        if (n <= 0.0) {
+            out.collision[i]         = std::numeric_limits<double>::quiet_NaN();
+            out.draft_probability[i] = std::numeric_limits<double>::quiet_NaN();
+            continue;
+        }
+        out.collision[i] /= n;
+        out.draft_probability[i] /= n;
+    }
+    out.reached_per_position.clear();
+}
+
+} // namespace
+
 SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
-    return lane < max_concurrency ? requests[lane].speculative_stats : SpeculativeStats{};
+    if (lane >= max_concurrency) { return SpeculativeStats{}; }
+    SpeculativeStats stats = requests[lane].speculative_stats;
+    // A lane can be published more than once on a streaming request, so this must not consume the
+    // accumulator: it copies, finishes the copy's means, and leaves the running sums alone.
+    finalize_accept_probe(stats);
+    return stats;
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
@@ -3119,7 +3200,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 tail_hidden_store};
+                                                 tail_hidden_store,
+                                                 acceptance_probe_enabled(),
+                                                 {},
+                                                 accept_probe_span(draft_window, lanes.size())};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -3159,6 +3243,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                accumulate_accept_probe(request.speculative_stats,
+                                        schedule_state.accept_probe_out,
+                                        static_cast<int>(draft_window), static_cast<int>(row),
+                                        static_cast<int>(lanes.size()));
             }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,
@@ -3283,7 +3371,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     *io.dflash_decode,
                                                     *dflash_host_ingress,
                                                     *dflash_host_egress,
-                                                    tail_hidden_store};
+                                                    tail_hidden_store,
+                                                    acceptance_probe_enabled(),
+                                                    {},
+                                                    accept_probe_span(draft_window, lanes.size())};
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -3321,6 +3412,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                accumulate_accept_probe(request.speculative_stats,
+                                        schedule_state.accept_probe_out,
+                                        static_cast<int>(draft_window), static_cast<int>(row),
+                                        static_cast<int>(lanes.size()));
             }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{

@@ -80,6 +80,11 @@ struct MtpBatchContext {
     // statistics into the frame's accept_probe tensor. Off by default, and the captured graph shape
     // does not depend on it because the probe tensor is always allocated at its full K.
     bool acceptance_probe_enabled = false;
+    // Filled by the accept step when `acceptance_probe_enabled` is set. Empty otherwise.
+    std::span<const float> accept_probe_out;
+    // Host landing buffer for the probe copy. Owned by the caller and sized for the largest batch
+    // and draft window it will run, so the copy can live inside the captured body.
+    std::span<float> host_accept_probe;
 };
 
 struct DFlashBatchContext {
@@ -92,6 +97,10 @@ struct DFlashBatchContext {
     Tensor& continuation_hidden_store;
     // See MtpBatchContext::acceptance_probe_enabled.
     bool acceptance_probe_enabled = false;
+    // See MtpBatchContext::accept_probe_out.
+    std::span<const float> accept_probe_out;
+    // See MtpBatchContext::host_accept_probe.
+    std::span<float> host_accept_probe;
 };
 
 struct DFlashAppendContext {

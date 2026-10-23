@@ -520,6 +520,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.speculative_fallback_steps  = result.speculative.fallback_steps;
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
+    outcome.metrics.speculative_probe.collision =
+        std::move(result.speculative.probe.collision);
+    outcome.metrics.speculative_probe.draft_probability =
+        std::move(result.speculative.probe.draft_probability);
+    outcome.metrics.speculative_probe.rank_histogram =
+        std::move(result.speculative.probe.rank_histogram);
 
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {

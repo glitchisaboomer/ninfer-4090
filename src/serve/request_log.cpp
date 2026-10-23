@@ -221,6 +221,23 @@ Json arena_json(const ninfer::ArenaMemorySummary& arena) {
                 {"peak_used_bytes", arena.peak_used_bytes}};
 }
 
+// Draft-quality probe, present only when NINFER_SPEC_ACCEPTANCE_PROBE was set for the run. The
+// object is omitted rather than emitted empty so a normal request log keeps its exact shape.
+Json probe_json(const SpeculativeProbeMetrics& probe) {
+    if (probe.collision.empty()) { return Json(); }
+    Json ranks = Json::array();
+    for (std::size_t i = 0; i < probe.collision.size(); ++i) {
+        Json row = Json::array();
+        for (std::size_t b = 0; b < 21; ++b) {
+            row.push_back(probe.rank_histogram[i * 21 + b]);
+        }
+        ranks.push_back(std::move(row));
+    }
+    return Json{{"collision", probe.collision},
+                {"draft_probability", probe.draft_probability},
+                {"rank_histogram", std::move(ranks)}};
+}
+
 Json speculative_json(const GenerationMetrics& metrics) {
     return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
                 {"draft_window", metrics.speculative_draft_window},
@@ -228,7 +245,8 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"acceptance_probe", probe_json(metrics.speculative_probe)}};
 }
 
 // Tokens/second with fixed precision, or "n/a" when the interval is degenerate.

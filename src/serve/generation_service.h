@@ -22,6 +22,14 @@ struct RequestLifetime;
 struct RequestCapacity;
 struct MediaInputCapacity;
 
+// Draft-quality probe, mirroring SpeculativeStats::probe. Empty unless the run enabled
+// NINFER_SPEC_ACCEPTANCE_PROBE; see that struct for what the numbers mean.
+struct SpeculativeProbeMetrics {
+    std::vector<double> collision{};
+    std::vector<double> draft_probability{};
+    std::vector<std::uint64_t> rank_histogram{};
+};
+
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
     double ttft_seconds    = 0.0;
@@ -37,6 +45,7 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
+    SpeculativeProbeMetrics speculative_probe;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     // Cache-hit tokens served by relocating a surviving run rather than by ordinary prefix reuse.
     // Disjoint from `prefix_cache_hit_tokens` and additive with it: reporting sums the two for the

@@ -393,6 +393,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        // See mtp_decode_batch_body for why this copy belongs inside the captured body.
+        if (probe_enabled) {
+            const auto width = static_cast<std::size_t>(6 * k + 2);
+            CUDA_CHECK(cudaMemcpyAsync(state.host_accept_probe.data(), frame.accept_probe.data,
+                                       width * batch_size * sizeof(float),
+                                       cudaMemcpyDeviceToHost, state.execution.device.stream));
+        }
+        state.accept_probe_out =
+            probe_enabled ? std::span<const float>(state.host_accept_probe.data(),
+                                                   width * batch_size)
+                          : std::span<const float>{};
     };
 }
 

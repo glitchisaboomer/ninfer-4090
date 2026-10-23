@@ -390,7 +390,37 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+
+    // Draft-quality probe, filled only when NINFER_SPEC_ACCEPTANCE_PROBE is set; empty otherwise.
+    //
+    // It answers a question `accepted_per_position` cannot: whether the accepted drafts are as many
+    // as the sampling configuration allows. Cutting the target distribution down to its top
+    // candidates makes two independent draws agree with probability equal to the sum of the squared
+    // candidate probabilities, so that sum is the highest acceptance any draft can reach, even one
+    // that always names the best token. Comparing the measured acceptance against it separates "the
+    // drafts are weak" from "the sampling setting has no room left".
+    //
+    // Every vector below is indexed by draft position and has `draft_window` entries. A position
+    // contributes only in rounds that reached it, so a mean is conditioned on reaching, exactly as
+    // `accepted_per_position` is. Both read from the same per-round matrix and describe the same
+    // rounds.
+    struct {
+        // Mean of sum_j p_j^2 over the columns that reached each position. NaN when no round did,
+        // or when that position's logits held a non-finite value.
+        std::vector<double> collision{};
+        // Mean p(draft) at each position. NaN on the same conditions as `collision`.
+        std::vector<double> draft_probability{};
+        // Histogram of the draft's rank in the candidate list, 20 buckets by rank then one bucket
+        // for "not in the list", so 21 per position. A draft that is absent cannot be accepted at
+        // any temperature: the accept test reads its probability as zero.
+        std::vector<std::uint64_t> rank_histogram{};
+        // Denominator behind the two means above: how many rounds reached each position. Cleared
+        // once the means are finalized, so a published probe carries the means and this stays
+        // internal bookkeeping rather than a second way to say the same thing.
+        std::vector<std::uint64_t> reached_per_position{};
+    } probe;
 };
+
 
 enum class PrefixReusePath : std::uint8_t {
     FullReset,

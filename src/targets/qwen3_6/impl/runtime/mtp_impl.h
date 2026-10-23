@@ -185,6 +185,20 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::MtpDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        // The probe rides the same round as the accept it describes. Pushing its copy into the
+        // captured body is what keeps the measurement inside one graph replay: a copy issued from
+        // the host after the replay would have to synchronize first, and would then describe the
+        // previous round.
+        if (probe_enabled) {
+            const auto width = static_cast<std::size_t>(6 * k + 2);
+            CUDA_CHECK(cudaMemcpyAsync(state.host_accept_probe.data(), frame.accept_probe.data,
+                                       width * batch_size * sizeof(float),
+                                       cudaMemcpyDeviceToHost, state.execution.device.stream));
+        }
+        state.accept_probe_out =
+            probe_enabled ? std::span<const float>(state.host_accept_probe.data(),
+                                                   width * batch_size)
+                          : std::span<const float>{};
     };
 }
 
