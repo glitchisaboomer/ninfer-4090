@@ -673,6 +673,18 @@ def parse_done_lines(text):
     return records
 
 
+def scr_source_shift_enabled():
+    """Whether the server will run with source shifting on, matching its own parse of the switch.
+
+    `prompt_edit.h`'s `scr_source_shift_enabled` treats the variable as on when it is set, non-empty
+    and its first character is not '0'. Reproducing that here rather than testing truthiness keeps one
+    answer to "was the copied route available", which is what decides whether a span that starts off
+    the page grid is legal or a finding.
+    """
+    value = os.environ.get("NINFER_SCR_SOURCE_SHIFT")
+    return value is not None and value != "" and value[0] != "0"
+
+
 def scr_flags(args):
     """Pass 1's flags: relocation on, in the mode under test, with the cap when one was asked for.
 
@@ -733,7 +745,8 @@ def _intervals(pairs):
     return " ".join(f"[{begin},{end})" for begin, end in pairs) or "(none)"
 
 
-def check_relocation_plan(plan, expected_spans, source_may_shift=False):
+def check_relocation_plan(plan, expected_spans, source_may_shift=False,
+                          off_grid_required=False):
     """Structural checks on one applied plan; returns a list of complaints.
 
     The planner's own contract is that the prefilled ranges and the relocated spans tile the suffix
@@ -743,11 +756,22 @@ def check_relocation_plan(plan, expected_spans, source_may_shift=False):
     sees the totals. `expected_spans` is the count the mode claims: two separated survivors for
     segmented on the interleaved fixture, one run everywhere else.
 
-    `source_may_shift` is what the off-grid fixture sets. There the span's source is deliberately
-    *not* on the page grid, which is the entire point of the run, so the whole-block rule would
-    reject the very plan under test. The check inverts instead: the plan has to contain a span whose
-    source misses the destination's page offset, because a plan that stayed on the grid is the
-    re-pointing shape and would mean this run measured nothing the aligned fixtures do not.
+    Two flags, because "an off-grid span is allowed" and "an off-grid span is required" are different
+    assertions and one boolean cannot carry both.
+
+    `source_may_shift` is what the server's `NINFER_SCR_SOURCE_SHIFT` enables: it permits a span that
+    does not start on a page boundary. When it is set the whole-block rule is not applied, but nothing
+    is demanded of the plan either -- an aligned edit under that switch legitimately produces aligned
+    spans.
+
+    `off_grid_required` is what the `off-grid` fixture needs on top: there the edit is deliberately
+    off-grid, so a plan whose spans all stay aligned means the fixture did not run as intended. Only
+    that flag inverts the rule into "some span must miss its destination's page offset".
+
+    Keeping these separate is not pedantry. `NINFER_SCR_SOURCE_SHIFT=1` exported from the shell reaches
+    the server, which is what actually decides the plan, but it did not reach this function, which read
+    `--shape` instead -- so a `scope-a` run under that switch was judged by the whole-block rule and
+    failed on a span the runtime had already reported as expressible and executed.
     """
     problems = []
     label = f"plan(prompt={plan['prompt']}, base={plan['base']})"
@@ -784,7 +808,7 @@ def check_relocation_plan(plan, expected_spans, source_may_shift=False):
         if span["dst"] + span["tok"] >= plan["prompt"]:
             problems.append(f"{label}: span dst={span['dst']} tok={span['tok']} reaches the "
                             f"final prompt token, which must always be prefilled")
-    if source_may_shift and plan["spans"] and not any(
+    if off_grid_required and plan["spans"] and not any(
             (span["src"] - span["dst"]) % BLOCK_TOKENS for span in plan["spans"]):
         # Only a span whose source misses the destination's page offset has to be copied. If every
         # span is on the grid then the plan is the re-pointing shape, and the off-grid case -- the
@@ -824,7 +848,9 @@ def run_config(args, extra_flags, label):
         # The off-grid fixture is only meaningful with the token-level detector and the copied route
         # enabled: without the switch the block detector finds nothing after an off-grid edit and the
         # run reports full_reset. Forcing it here keeps the run reproducible instead of depending on
-        # the caller's shell.
+        # the caller's shell. It is written into `environment` and not into `os.environ`, so the
+        # fixture does not leak the switch into whatever the caller runs next -- which is why the
+        # plan checker derives the flag from the environment it passes rather than from `--shape`.
         environment["NINFER_SCR_SOURCE_SHIFT"] = "1"
 
     # The server log is redirected to a file rather than a pipe: on Windows a pipe buffer fills up
@@ -1000,6 +1026,14 @@ def main():
     print(f"Fixture under test: --shape {args.shape}")
     if args.shape == "off-grid":
         print("Source shift under test: on (NINFER_SCR_SOURCE_SHIFT=1, forced by --shape off-grid)")
+    elif scr_source_shift_enabled():
+        # Not forced by the fixture, but inherited from the caller's shell and reaching the server,
+        # so the plan it produces is judged by the shifted rule. Printing it makes an otherwise
+        # invisible difference between two runs of the same command line legible.
+        print("Source shift under test: on (NINFER_SCR_SOURCE_SHIFT inherited from the environment, "
+              "so a run starting off the page grid is allowed)")
+    else:
+        print("Source shift under test: off (a plan starting off the page grid is a finding)")
     if args.scr_max_spans is not None:
         print(f"Span cap under test: --scr-max-spans {args.scr_max_spans}")
     print()
@@ -1057,9 +1091,13 @@ def main():
     # geometry is printed, so on the interleaved fixture the whole point of the run -- two
     # separated survivors, one prefilled range per gap -- is unobservable without it.
     expected_spans = 2 if (args.shape == "interleaved" and args.scr_mode == "segmented") else 1
-    # The off-grid fixture's span is off the page grid at the source by design, so its plan is
-    # checked for that shape rather than against the whole-block rule.
-    source_may_shift = args.shape == "off-grid"
+    # Whether the server was permitted to plan a span that starts off the page grid, and separately
+    # whether this fixture demands one. The first has to be read from the same place the server reads
+    # it -- the environment it inherits, after the `off-grid` fixture forces it on -- because a caller
+    # that exports NINFER_SCR_SOURCE_SHIFT against an aligned fixture is a legitimate run whose plan
+    # is legitimately off-grid. Reading `--shape` alone judged that run by the wrong rule.
+    source_may_shift = args.shape == "off-grid" or scr_source_shift_enabled()
+    off_grid_required = args.shape == "off-grid"
     plans = parse_relocation_plans(log_texts.get("scr", ""))
     if args.scr_diag:
         if not plans:
@@ -1075,7 +1113,8 @@ def main():
                       f"spans={len(plan['spans'])} ranges={len(plan['ranges'])}")
                 print(f"    relocated: {_intervals([(s['dst'], s['dst'] + s['tok']) for s in plan['spans']])}")
                 print(f"    prefilled: {_intervals(plan['ranges'])}")
-                problems.extend(check_relocation_plan(plan, expected_spans, source_may_shift))
+                problems.extend(check_relocation_plan(plan, expected_spans, source_may_shift,
+                                                      off_grid_required))
     elif args.shape in ("interleaved", "off-grid"):
         print("(pass --scr-diag to check the plan's shape: span count, range count, and the "
               "tiling between them)")

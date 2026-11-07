@@ -930,16 +930,77 @@ def test_the_off_grid_plan_check_wants_a_source_off_the_page_grid() -> None:
             "ranges_reported": 2,
         }
 
-    on_grid = scr_e2e_check.check_relocation_plan(plan(832), 1, source_may_shift=True)
-    assert any("off-grid" in problem for problem in on_grid), on_grid
+    # The off-grid fixture demands an off-grid span. It is a separate flag from "source shifting is
+    # permitted", because a shifted run on an aligned fixture is legitimate and must not be held to it.
+    on_grid = scr_e2e_check.check_relocation_plan(plan(832), 1, source_may_shift=True,
+                                                  off_grid_required=True)
+    assert any("re-pointing shape" in problem for problem in on_grid), on_grid
 
-    off_grid = scr_e2e_check.check_relocation_plan(plan(833), 1, source_may_shift=True)
+    off_grid = scr_e2e_check.check_relocation_plan(plan(833), 1, source_may_shift=True,
+                                                   off_grid_required=True)
     assert off_grid == [], off_grid
+
+    # With only permission granted, both are acceptable: the aligned one is the re-pointing shape and
+    # the off-grid one is the copied shape, and a run of either is a run that worked.
+    assert scr_e2e_check.check_relocation_plan(plan(832), 1, source_may_shift=True) == []
+    assert scr_e2e_check.check_relocation_plan(plan(833), 1, source_may_shift=True) == []
 
     # Without the relaxation the same span is the whole-block rule's business, which is what every
     # aligned fixture relies on.
     strict = scr_e2e_check.check_relocation_plan(plan(833), 1)
     assert any("64-token blocks" in problem for problem in strict), strict
+
+
+def test_a_shifted_run_on_an_aligned_fixture_is_judged_by_the_shifted_rule() -> None:
+    """`NINFER_SCR_SOURCE_SHIFT` inherited from the shell reaches the server, which is what decides the
+    plan, so the checker has to read the same switch rather than infer it from `--shape`.
+
+    The regression: a `--shape scope-a` run with the variable exported produced a span starting off the
+    page grid on both ends. The runtime reported it expressible and executed it, and the checker then
+    failed the run against the whole-block rule -- reporting a plan as broken that had already worked.
+    """
+    plan = {
+        "prompt": 734, "base": 448,
+        "spans": [{"src": 823, "dst": 501, "tok": 192}],
+        "ranges": [(448, 501), (693, 734)], "ranges_reported": 2,
+    }
+
+    # Aligned fixture, shift off: the whole-block rule applies and the span is a finding.
+    strict = scr_e2e_check.check_relocation_plan(plan, 1)
+    assert any("64-token blocks" in problem for problem in strict), strict
+
+    # Same fixture, shift on: the span is permitted, so the plan is not a finding.
+    permitted = scr_e2e_check.check_relocation_plan(plan, 1, source_may_shift=True)
+    assert permitted == [], permitted
+
+    # And an off-grid fixture still demands an off-grid span rather than merely permitting one.
+    aligned_plan = {
+        "prompt": 768, "base": 512,
+        "spans": [{"src": 896, "dst": 576, "tok": 128}],
+        "ranges": [(512, 576), (704, 768)], "ranges_reported": 2,
+    }
+    demanded = scr_e2e_check.check_relocation_plan(aligned_plan, 1, source_may_shift=True,
+                                                   off_grid_required=True)
+    assert any("pulling the re-pointing shape" in p or "re-pointing shape" in p
+               for p in demanded), demanded
+
+
+def test_the_switch_parser_matches_the_runtime() -> None:
+    """`prompt_edit.h` treats the variable as on when it is set, non-empty, and not starting with
+    '0'. The checker reproduces that exactly, so '0' and '' mean off rather than "set"."""
+    import os
+
+    previous = os.environ.pop("NINFER_SCR_SOURCE_SHIFT", None)
+    try:
+        assert not scr_e2e_check.scr_source_shift_enabled(), "unset means off"
+        for value, expected in (("", False), ("0", False), ("00", False), ("1", True),
+                                ("yes", True)):
+            os.environ["NINFER_SCR_SOURCE_SHIFT"] = value
+            assert scr_e2e_check.scr_source_shift_enabled() is expected, value
+    finally:
+        os.environ.pop("NINFER_SCR_SOURCE_SHIFT", None)
+        if previous is not None:
+            os.environ["NINFER_SCR_SOURCE_SHIFT"] = previous
 
 
 def test_an_off_grid_plan_from_the_port_passes_the_shape_check() -> None:
