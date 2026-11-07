@@ -475,8 +475,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
     if (request_plan.turn_checkpoint_action == TurnCheckpointAction::CaptureNew &&
         (!request_plan.turn_checkpoint_capture_frontier ||
-         *request_plan.turn_checkpoint_capture_frontier <= request_plan.reuse_base ||
-         *request_plan.turn_checkpoint_capture_frontier >= prompt_tokens)) {
+         !qwen3_6::detail::turn_checkpoint_capture_reachable(request_plan.reuse_base,
+                                                            *request_plan.turn_checkpoint_capture_frontier,
+                                                            prompt_tokens))) {
         throw std::logic_error("planned turn checkpoint capture frontier is invalid");
     }
 

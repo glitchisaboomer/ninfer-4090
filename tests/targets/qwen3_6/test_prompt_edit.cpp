@@ -23,6 +23,8 @@ using ninfer::TokenId;
 using ninfer::targets::qwen3_6::detail::diff_prompt_edit;
 using ninfer::targets::qwen3_6::detail::kPromptEditBlockTokens;
 using ninfer::targets::qwen3_6::detail::longest_shared_prefix_tokens;
+using ninfer::targets::qwen3_6::detail::prefix_reuse_stop;
+using ninfer::targets::qwen3_6::detail::turn_checkpoint_capture_reachable;
 using ninfer::targets::qwen3_6::detail::PromptEditDiff;
 using ninfer::targets::qwen3_6::detail::SurvivingSpan;
 
@@ -1241,6 +1243,64 @@ Tokens crossing_scenario(Tokens& previous, Tokens& current, std::uint32_t transc
     return prefix;
 }
 
+// The turn-checkpoint capture reads a hidden state from the token just before its frontier, so it is
+// only satisfiable when Text prefill actually writes that token. A prefill starts at the reuse base, so
+// the rule is that the base sits strictly below the frontier -- and that is the same rule the plan-time
+// decision uses to decide whether a rebuilt base is worth keeping, which is why it lives in one
+// predicate rather than being spelled out at both ends.
+//
+// The bug this closes: a plan that had already verified its prefix was wiped to a cold prefill purely
+// because its base was at or above the frontier. On the measured request that discarded 78,528
+// verified-identical tokens to avoid an unsatisfiable capture, when rebuilding the base below the
+// frontier would have kept 78,208 for the cost of one block of prefill.
+void test_turn_checkpoint_capture_reachable() {
+    const std::uint32_t prompt = block_tokens(16);
+
+    expect(turn_checkpoint_capture_reachable(block_tokens(4), block_tokens(8), prompt),
+           "a base below the frontier leaves the capture reachable");
+    expect(!turn_checkpoint_capture_reachable(block_tokens(8), block_tokens(8), prompt),
+           "a base level with the frontier does not: prefill starts at the frontier");
+    expect(!turn_checkpoint_capture_reachable(block_tokens(9), block_tokens(8), prompt),
+           "a base past the frontier does not either");
+    expect(!turn_checkpoint_capture_reachable(0, prompt, prompt),
+           "a frontier at the prompt end has no token to snapshot");
+    expect(!turn_checkpoint_capture_reachable(0, 0, prompt),
+           "a frontier at zero is not a frontier");
+    expect(turn_checkpoint_capture_reachable(0, 1, prompt),
+           "one token of prefill is enough to write the frontier's previous token");
+}
+
+// A rebuilt base always lands on the block grid, because `longest_shared_prefix_tokens` reports whole
+// blocks only and a base off the grid would retain a page that is only partly valid. Combined with a
+// search bounded at `frontier - 1`, that means the retained run is always whole blocks strictly below
+// the frontier it exists to make reachable.
+void test_a_rebuilt_base_stays_on_the_block_grid() {
+    const std::uint32_t block  = kPromptEditBlockTokens;
+    const std::uint32_t prompt = 80144;
+
+    // The measured request: boundary 78231, so the search stops one token below it and the aligned
+    // answer is 78208 -- the value the request reported for its boundary-aligned base.
+    const std::uint32_t reusable = prefix_reuse_stop(78231);
+    expect(reusable == 78230, "the search stops one token short of the frontier");
+    expect((reusable / block) * block == 78208,
+           "the aligned base under the measured boundary is 78208");
+    expect((reusable / block) * block < 78231,
+           "that base stays below the frontier, so the capture remains reachable");
+    expect(turn_checkpoint_capture_reachable((reusable / block) * block, 78231, prompt),
+           "so the rebuilt plan can execute its capture");
+
+    // The stopping limit itself, and its empty-prompt guard.
+    expect(prefix_reuse_stop(80144) == 80143, "the default stop is one short of the prompt");
+    expect(prefix_reuse_stop(0) == 0, "an empty prompt yields no reuse rather than wrapping");
+
+    // Whatever the frontier, a base derived this way is aligned and strictly below it.
+    for (std::uint32_t frontier = 2; frontier < 4096; ++frontier) {
+        const std::uint32_t base = (prefix_reuse_stop(frontier) / block) * block;
+        expect(base % block == 0, "a rebuilt base is always block aligned");
+        expect(base < frontier, "and always strictly below the frontier");
+    }
+}
+
 void test_a_greedy_walk_loses_the_shared_region_and_coverage_does_not() {
     using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
 
@@ -2202,6 +2262,8 @@ int main() {
     test_affordable_copied_spans_prices_the_route_the_runtime_takes();
     test_a_wide_copied_plan_is_trimmed_to_what_the_pool_can_afford();
     test_copied_price_covers_the_substitution_the_copier_performs();
+    test_turn_checkpoint_capture_reachable();
+    test_a_rebuilt_base_stays_on_the_block_grid();
     test_longest_shared_prefix_tokens();
     test_a_greedy_walk_loses_the_shared_region_and_coverage_does_not();
     test_coverage_spans_stay_disjoint_in_both_prompts();

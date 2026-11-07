@@ -57,6 +57,44 @@ std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
+// Adopt the longest leading run the resident sequence and this prompt still share, as ordinary prefix
+// reuse, when nothing better has claimed the lane.
+//
+// This is the fallback for a plan that would otherwise cold-prefill a prompt whose leading tokens are
+// demonstrably identical to KV the lane already holds. It exists because every other reuse path needs
+// the prompt to reach a frontier the lane kept whole -- the exact one it stopped at, a turn checkpoint,
+// or a disk snapshot -- so a prompt that diverges before that frontier matched none of them and took a
+// cold prefill, even where the leading run was identical, resident, and already at the positions the
+// prompt wants.
+//
+// Nothing downstream recovers that run. Both relocation selectors drop it: a leading span is "ordinary
+// prefix reuse", which they hold the reuse base responsible for. With a zero base it was therefore
+// neither reused nor relocated, and every token of it was re-prefilled -- on the e2e fixture, which
+// deletes a middle region, 576 of a 990-token prompt.
+//
+// `resident_kv` is the caller's, not read from the sequence: the two call sites run before and after the
+// turn-checkpoint decision, and the resident extent does not change between them, so reading it once
+// keeps the two answers identical for identical inputs.
+//
+// `reusable` bounds how far the claimed run may reach. The default is `prefix_reuse_stop`, one token
+// short of the prompt. A caller that has to leave a later region to be prefilled -- the turn-checkpoint
+// rebuild, which needs a token written at `frontier - 1` -- passes a tighter bound rather than relying
+// on a caller-side clamp, so the run is never claimed and then taken back.
+inline ReusePath adopt_shared_prefix(const SequenceState& sequence, const PreparedPromptData& prompt,
+                                     std::uint32_t resident_kv, ReusePath reuse,
+                                     std::uint32_t& reuse_base, std::uint32_t reusable) {
+    if (reuse != ReusePath::FullReset || !sequence.retained || !sequence.kv) { return reuse; }
+    const std::uint32_t shared = qwen3_6::detail::longest_shared_prefix_tokens(
+        sequence.ledger, prompt.token_ids, resident_kv, reusable);
+    if (shared < qwen3_6::detail::kPromptEditBlockTokens ||
+        !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+                                         shared)) {
+        return reuse;
+    }
+    reuse_base = shared;
+    return ReusePath::AppendAtSharedPrefix;
+}
+
 std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      std::uint32_t reuse_base, std::uint32_t prefill_chunk,
                                      std::size_t prefill_splits) noexcept {
@@ -234,12 +272,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // needs the prompt to reach a frontier the lane kept whole -- the exact one it stopped at, a
         // turn checkpoint, or a snapshot -- so a prompt that diverges before that frontier matched none
         // of them and took a cold prefill, even where the leading run was identical, resident, and
-        // already at the positions the prompt wants.
-        //
-        // Nothing downstream recovers that run. Both relocation selectors drop it: a leading span is
-        // "ordinary prefix reuse", which they hold the reuse base responsible for. With a zero base it
-        // was therefore neither reused nor relocated, and every token of it was re-prefilled -- on the
-        // e2e fixture, which deletes a middle region, 576 of a 990-token prompt.
+        // already at the positions the prompt wants. `adopt_shared_prefix` carries the rule.
         //
         // Deliberately after the paths above and before relocation: they reuse more whenever they
         // apply, and this one only ever claims less than the ledger holds, so it cannot displace a
@@ -249,34 +282,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         //
         // DFlash is excluded for the reason relocation already excludes it: its continuation is
         // carried on a frontier of its own and its cache is filled through `kv_cache_append_prefix`
-        // rather than the page table, so resuming below that frontier is a different problem. The
-        // identity check is what keeps a prompt whose token types, positions or Vision items changed
-        // inside the shared run off this path; a Vision item straddling its end declines here and keeps
-        // the cold prefill it would otherwise have had.
-        if (plan->reuse == ReusePath::FullReset && sequence.retained && sequence.kv &&
-            speculative_backend != SpeculativeBackend::DFlash) {
+        // rather than the page table, so resuming below that frontier is a different problem.
+        if (speculative_backend != SpeculativeBackend::DFlash) {
             const std::uint32_t resident_kv = static_cast<std::uint32_t>(
                 std::min(sequence.ledger.size(), static_cast<std::size_t>(sequence.text_kv_valid)));
-            // The final prompt token is always prefilled, because prompt logits can only come from a
-            // real forward pass. A base at the prompt end would instead sample from the hidden state of
-            // the last token the resident sequence generated, which is a different position entirely.
-            // `size() - 1` would wrap to 0xFFFFFFFF on an empty prompt and ask the detector for a
-            // reuse base past every page. An empty prompt cannot reach this path today -- the
-            // frontend rejects one before a plan exists -- but this is the only place that turns a
-            // `size_t` length into the `uint32_t` base the rest of the plan uses, so spell the zero
-            // case out rather than leave a wrap standing in for it.
-            const std::uint32_t reusable =
-                prompt.token_ids.empty()
-                    ? 0u
-                    : static_cast<std::uint32_t>(prompt.token_ids.size() - 1ULL);
-            const std::uint32_t shared = qwen3_6::detail::longest_shared_prefix_tokens(
-                sequence.ledger, prompt.token_ids, resident_kv, reusable);
-            if (shared >= qwen3_6::detail::kPromptEditBlockTokens &&
-                qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                                shared)) {
-                plan->reuse      = ReusePath::AppendAtSharedPrefix;
-                plan->reuse_base = shared;
-            }
+            plan->reuse = adopt_shared_prefix(sequence, prompt, resident_kv, plan->reuse,
+                                             plan->reuse_base,
+                                             qwen3_6::detail::prefix_reuse_stop(
+                                                 prompt.token_ids.size()));
         }
     }
 
@@ -572,12 +585,53 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         if (*desired <= plan->reuse_base) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
-            // The SCR block may have set relocation fields before this downgrade. A cold prefill
-            // executes none of them, so leaving them set would report reused tokens the request
-            // never reuses: `reusable_prompt_tokens` would count them, the service-work projection
-            // would under-state the prefill that follows, and the telemetry would report a
-            // relocation that never ran. Clear them here rather than trusting every consumer to
-            // read `reuse` before the accounting.
+            // A cold prefill executes none of the relocation fields the SCR block above may have set,
+            // so leaving them set would report reused tokens the request never reuses:
+            // `reusable_prompt_tokens` would count them, the service-work projection would under-state
+            // the prefill that follows, and the telemetry would report a relocation that never ran.
+            //
+            // The spans are cleared rather than the base clamped because a capture frontier at or
+            // below the base is unsatisfiable while the base stands: the capture snapshots the hidden
+            // state at `frontier - 1`, and `program_impl.h` requires `capture_frontier > reuse_base`
+            // for exactly that reason. But zero is the wrong answer too, and a far more expensive one
+            // than the relocation this block was worried about. The plan reached here from
+            // `AppendAtFrontier`, `RestoreTurnCheckpoint` or `AppendAtSharedPrefix`, all of which
+            // verified that the leading `reuse_base` tokens are byte-identical to the prompt. Wiping
+            // the lane re-prefills all of them: measured on a 80,144-token request with 89 messages,
+            // 78,528 verified-identical tokens were discarded because a boundary 297 tokens below the
+            // resident frontier tripped this condition. A single token rewritten earlier in the turn
+            // is enough, which makes this ordinary multi-turn traffic rather than an edge case.
+            //
+            // So rebuild the base from what is still demonstrably resident, below the frontier. What
+            // the capture needs is only that the frontier's own token is covered by the prefill,
+            // because that is what writes the hidden at `frontier - 1` the snapshot reads -- so any
+            // base strictly below the frontier will do, and the search is bounded there rather than at
+            // the prompt. Rounding stays with `longest_shared_prefix_tokens`, which reports whole
+            // blocks only: a base off the block grid would retain a page that is only partly valid,
+            // and on the measured request the aligned value (78208) was already below the frontier
+            // (78231), so the bound cost nothing. If the shared run does not reach a whole block below
+            // the frontier there is nothing worth keeping, and the lane stays cold.
+            const std::uint32_t resident_kv = static_cast<std::uint32_t>(
+                std::min(sequence.ledger.size(), static_cast<std::size_t>(sequence.text_kv_valid)));
+            const std::uint32_t reusable =
+                std::min(qwen3_6::detail::prefix_reuse_stop(prompt.token_ids.size()),
+                         *desired > 0 ? *desired - 1 : 0u);
+            if (base.allow_prefix_reuse && prompt.identity.reusable &&
+                speculative_backend != SpeculativeBackend::DFlash) {
+                plan->reuse = adopt_shared_prefix(sequence, prompt, resident_kv, plan->reuse,
+                                                 plan->reuse_base, reusable);
+                // A rebuild is only worth keeping if the frontier stays reachable. One too short to
+                // reach it would retain a run and still be refused by the runtime's own check below,
+                // so undo the whole thing rather than carry a base the plan cannot execute.
+                if (!qwen3_6::detail::turn_checkpoint_capture_reachable(
+                        plan->reuse_base, *desired, base.summary.prompt_tokens)) {
+                    plan->reuse      = ReusePath::FullReset;
+                    plan->reuse_base = 0;
+                }
+            }
+            // The relocation fields are cleared whatever the rebuild found: a plan resumed at a
+            // shorter base than the one the spans were selected against no longer describes the run
+            // they cover, and re-deriving them here would duplicate the selector.
             plan->relocated_prefill_ranges.clear();
             plan->relocated_spans.clear();
             plan->summary.relocated_prompt_tokens = 0;

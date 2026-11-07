@@ -92,6 +92,36 @@ inline constexpr std::uint32_t kMinimumForwardedTailTokens = 16;
     return base > 0 && base < prompt_tokens && !prompt_has_media;
 }
 
+// The stop limit ordinary prefix reuse claims: one token short of the prompt, because prompt logits can
+// only come from a real forward pass, and a base at the prompt end would sample from the hidden state of
+// the last token the resident sequence generated, which is a different position entirely.
+//
+// `size() - 1` would wrap on an empty prompt and ask the detector for a reuse base past every page. An
+// empty prompt cannot reach this path today -- the frontend rejects one before a plan exists -- but this
+// is the only place that turns a length into the base the rest of the plan uses, so the zero case is
+// spelled out rather than left as a wrap.
+[[nodiscard]] constexpr std::uint32_t prefix_reuse_stop(std::size_t prompt_tokens) noexcept {
+    return prompt_tokens == 0 ? 0u : static_cast<std::uint32_t>(prompt_tokens - 1ULL);
+}
+
+// Whether a turn-checkpoint capture at `capture_frontier` can be satisfied by a plan resuming at
+// `reuse_base`.
+//
+// The capture snapshots the hidden state at `frontier - 1`, so that token has to be written by this
+// request's own Text prefill. Prefill begins at the reuse base, so the rule is `reuse_base < frontier`.
+//
+// This is stated once, here, because it is the rule that once decided a plan was unsatisfiable and wiped
+// a lane to a cold prefill: on a long tool-loop prompt the rewrite boundary sat 297 tokens *below* the
+// frontier the lane had already verified, `boundary <= reuse_base` fired, and 78,528 byte-identical
+// tokens were re-prefilled to avoid a capture that a base one block lower would have kept. The plan-time
+// decision and the runtime's validation check now read the same predicate, so they cannot disagree about
+// which bases are legal.
+[[nodiscard]] constexpr bool turn_checkpoint_capture_reachable(std::uint32_t reuse_base,
+                                                              std::uint32_t capture_frontier,
+                                                              std::uint32_t prompt_tokens) noexcept {
+    return capture_frontier > reuse_base && capture_frontier < prompt_tokens;
+}
+
 // A contiguous run of tokens that is token-identical in both prompts, expressed in
 // whole blocks. Ranges are half-open: [begin, begin + tokens).
 struct SurvivingSpan {
