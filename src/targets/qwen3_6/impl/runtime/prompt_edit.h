@@ -109,7 +109,9 @@ struct SurvivingSpan {
 
 struct PromptEditDiff {
     // Surviving spans ordered by increasing new_begin. Spans are pairwise disjoint in
-    // both prompts, and both the old and the new begins are strictly increasing.
+    // both prompts. `diff_prompt_edit` also reports strictly increasing old_begin; the all-offset
+    // detector does not, because it can express a run that moved past another one -- see
+    // `diff_prompt_edit_shifted` for the invariant each one guarantees.
     std::vector<SurvivingSpan> spans;
     // Total tokens covered by `spans`. This is the token count that may skip re-prefill
     // if every span is relocated.
@@ -525,19 +527,35 @@ relocation_prefill_ranges(std::span<const RelocatedSpan> spans, std::uint32_t pr
 // page shifts every later block off its boundary and leaves it nothing to match. That is the shape
 // of nearly every edit a user types, and why the aligned path relocates nothing on them.
 //
-// This anchors on a short n-gram taken at every offset instead, grows each hit to the run's true
+// This anchors on a short n-gram taken at every offset instead, grows each hit right to the run's true
 // boundaries, and confirms it by exact token comparison, so a hash collision can only lose a match.
-// The walk is monotone and never reuses a previous token, which keeps the runs disjoint in both
-// prompts; a cap on how many candidate offsets one anchor may probe bounds the cost on prompts that
+// A cap on how many candidate offsets one anchor may probe bounds the seeding cost on prompts that
 // repeat a phrase many times. Because only runs of at least `anchor` tokens can be anchored at all,
 // runs shorter than that are not reported -- another cost of the finer granularity, and bounded by
 // the anchor size rather than by the page.
+//
+// Selection is by coverage rather than by earliest match, which is the property this exists for. A
+// single monotone left-to-right walk optimises the position of its first match, so a short block near
+// the head of the current prompt whose only copy sits near the tail of the previous one -- a context
+// ledger that the previous turn already echoed, in practice -- makes it skip the entire shared region
+// in between. Instead the candidates are chained: one pass emits the maximum-weight set that is
+// monotone in both prompts, the spans it chose and everything conflicting with them on either axis are
+// removed, and the next pass chains the remainder. A crossing therefore costs one extra pass instead of
+// the whole reuse, and the union stays disjoint in both prompts.
+//
+// Spans of the result are ordered by `new_begin` and pairwise disjoint in both prompts, but `old_begin`
+// is *not* required to increase with `new_begin`: expressing a reordering is the point of the extra
+// passes. Every consumer sorts by destination and checks destination pages only, so the invariant they
+// need is the disjointness, which is enforced here. It has to be: `plan_page_remap` refuses a plan that
+// names one physical page twice, and the runtime treats that refusal as a failed request rather than a
+// smaller plan.
 //
 // Same contract as `diff_prompt_edit` otherwise: token types, positions and vision metadata are the
 // caller's concern, and a run touching the end of the prompt is reported as the tokens it holds.
 [[nodiscard]] PromptEditDiff diff_prompt_edit_shifted(std::span<const TokenId> previous,
                                                       std::span<const TokenId> current,
-                                                      std::uint32_t anchor_tokens = 16);
+                                                      std::uint32_t anchor_tokens =
+                                                          kPromptEditBlockTokens);
 
 // The longest prefix `resident_tokens` and `prompt_tokens` agree on, in whole prompt-edit blocks.
 //

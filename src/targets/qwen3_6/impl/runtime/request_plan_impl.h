@@ -363,12 +363,26 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // intent: those tokens are already reused, and a span over them would count them again and
         // re-point pages that are already where the prompt wants them.
         const bool source_may_shift = qwen3_6::detail::scr_source_shift_enabled();
+        // The detector indexes the previous prompt, and the selector below bounds every span by
+        // `text_kv_valid`. Passing the whole ledger to the detector and the KV extent to the selector
+        // made those two disagree by exactly the one last sampled token: the ledger holds it, the KV
+        // does not, so a run whose source reached the ledger's end was dropped whole as
+        // "source beyond the resident KV" -- losing every token before it in the same run. The ledger
+        // is a prefix of the KV extent simply by construction (a token is sampled only after its KV
+        // exists), so slicing here is the same claim the selectors already make, checked once and in
+        // the one place that can see both.
+        const std::size_t detector_tokens =
+            std::min(sequence.ledger.size(), static_cast<std::size_t>(sequence.text_kv_valid));
+        const std::span<const ninfer::TokenId> detector_previous(sequence.ledger.data(),
+                                                                detector_tokens);
         const qwen3_6::detail::PromptEditDiff diff =
             source_may_shift
                 ? qwen3_6::detail::diff_prompt_edit_shifted(
-                      sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens)
+                      detector_previous, prompt.token_ids,
+                      qwen3_6::detail::kPromptEditBlockTokens)
                 : qwen3_6::detail::diff_prompt_edit(
-                      sequence.ledger, prompt.token_ids, qwen3_6::detail::kPromptEditBlockTokens);
+                      detector_previous, prompt.token_ids,
+                      qwen3_6::detail::kPromptEditBlockTokens);
         const std::uint32_t prompt_tokens_count =
             static_cast<std::uint32_t>(prompt.token_ids.size());
 

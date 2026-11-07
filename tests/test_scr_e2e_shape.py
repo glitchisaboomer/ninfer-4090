@@ -19,7 +19,10 @@ stand-in that counts words, and the planner arithmetic against token sequences b
 
 from __future__ import annotations
 
+import bisect
 import contextlib
+
+import bisect
 
 import pytest
 
@@ -493,60 +496,127 @@ def test_scr_flags_append_the_cap_after_the_mode() -> None:
 # selector that quantizes only the destination. Everything in this section is a port, held beside
 # the shipped ports above so the difference between the two is one screen apart.
 # ---------------------------------------------------------------------------------------------
-ANCHOR_TOKENS = 16
-PROBE_CAP = 8  # detail::kMaxCandidateProbes
+ANCHOR_TOKENS = BLOCK          # detail::kPromptEditBlockTokens, the anchor production passes
+PROBE_CAP = 8                  # detail::kMaxCandidateProbes
+MIN_CHAIN_TOKENS = 2 * BLOCK   # detail::kMinimumChainTokens
+MAX_CHAINS = 8                 # detail::kMaxDetectedSpans
 
 
-def survivor_runs(previous_tokens, current_tokens, anchor=ANCHOR_TOKENS, probes=PROBE_CAP):
-    """Find maximal identical runs at *any* offset, not only on the 64-token grid.
+def max_weight_chain(candidates):
+    """One maximum-weight set of candidates monotone in both prompts (detail's single chaining pass).
 
-    A whole-block index can only match content that sits on the same grid in both prompts, which is
-    why a shift that is not a multiple of the block size leaves nothing to match. Anchoring on a
-    short n-gram taken at every offset removes that requirement; each run is then grown to its true
-    boundaries and confirmed by exact comparison, so a hash collision can only lose a match, never
-    invent one. Monotone and disjoint in both prompts, like the shipped walk.
+    `candidates` are `(old_begin, new_begin, tokens)`. The chain is chosen by destination order while a
+    source-order pointer admits only candidates whose source range ends at or before the current one
+    begins, so both coordinates increase along it and no two of its spans can overlap on either axis.
     """
-    if anchor <= 0 or len(previous_tokens) < anchor:
+    if not candidates:
         return []
-    index = {}
-    for offset in range(len(previous_tokens) - anchor + 1):
-        index.setdefault(tuple(previous_tokens[offset:offset + anchor]), []).append(offset)
+    order = sorted(candidates, key=lambda c: (c[1], c[0], -c[2]))
+    weight = [0] * len(order)
+    parent = [None] * len(order)
+    source_keys = sorted({c[0] for c in order} | {c[0] + c[2] for c in order})
 
-    runs = []
-    old_cursor = 0  # no run reuses an earlier token, which keeps the runs disjoint
-    new_cursor = 0
-    index_new = 0
-    while index_new <= len(current_tokens) - anchor:
-        found = index.get(tuple(current_tokens[index_new:index_new + anchor]))
-        if found is None:
-            index_new += 1
+    def key_of(token):
+        return bisect.bisect_left(source_keys, token) + 1
+
+    tree_w = [0] * (len(source_keys) + 1)
+    tree_from = [None] * (len(source_keys) + 1)
+    best_w, best_at, cursor = 0, None, 0
+    for pos, cand in enumerate(order):
+        old_begin, _new_begin, tokens = cand
+        while cursor < len(order) and order[cursor][0] + order[cursor][2] <= old_begin:
+            node = key_of(order[cursor][0] + order[cursor][2])
+            while node <= len(source_keys):
+                if weight[cursor] > tree_w[node]:
+                    tree_w[node], tree_from[node] = weight[cursor], cursor
+                node += node & (~node + 1)
+            cursor += 1
+        inherited, inherited_from = 0, None
+        if old_begin != 0:
+            node = key_of(old_begin) - 1
+            while node != 0:
+                if tree_w[node] > inherited:
+                    inherited, inherited_from = tree_w[node], tree_from[node]
+                node -= node & (~node + 1)
+        weight[pos] = inherited + tokens
+        parent[pos] = inherited_from
+        if weight[pos] > best_w:
+            best_w, best_at = weight[pos], pos
+    chain = []
+    pos = best_at
+    while pos is not None:
+        chain.append(order[pos])
+        pos = parent[pos]
+    return list(reversed(chain))
+
+
+def channel_spans(o, n):
+    """The port of detail::diff_prompt_edit_shifted: claim-based seeding, then chained residual passes.
+
+    Pass 1 finds the longest chain; everything it chose, and everything conflicting with it on either
+    axis, leaves the pool; the next pass chains what is left. That is what recovers a crossing -- a run
+    that sits above another in one prompt and below it in the other -- which no single monotone walk can
+    represent. The union is disjoint in both prompts by construction, which is the invariant the
+    selectors and `plan_page_remap` rely on.
+    """
+    anchor, probes = ANCHOR_TOKENS, PROBE_CAP
+    if anchor <= 0 or len(o) < anchor or len(n) < anchor:
+        return []
+
+    index = {}
+    for offset in range(len(o) - anchor + 1):
+        index.setdefault(tuple(o[offset:offset + anchor]), []).append(offset)
+
+    candidates = []
+    claimed_to, at = 0, 0
+    while at <= len(n) - anchor:
+        if at < claimed_to:
+            at = claimed_to
             continue
-        matched = False
-        for probed, old_begin in enumerate(found):
-            if probed == probes:
+        found = index.get(tuple(n[at:at + anchor]))
+        seeded = False
+        if found is not None:
+            for old_begin in found[:probes]:
+                if o[old_begin:old_begin + anchor] != n[at:at + anchor]:
+                    continue
+                right = anchor
+                while (old_begin + right < len(o) and at + right < len(n) and
+                       o[old_begin + right] == n[at + right]):
+                    right += 1
+                candidates.append((old_begin, at, right))
+                claimed_to = at + right
+                seeded = True
                 break
-            if old_begin < old_cursor:
-                continue
-            right = anchor
-            while (old_begin + right < len(previous_tokens) and
-                   index_new + right < len(current_tokens) and
-                   previous_tokens[old_begin + right] == current_tokens[index_new + right]):
-                right += 1
-            left = 0
-            while (index_new - left - 1 >= new_cursor and old_begin - left - 1 >= old_cursor and
-                   previous_tokens[old_begin - left - 1] == current_tokens[index_new - left - 1]):
-                left += 1
-            begin_old, begin_new = old_begin - left, index_new - left
-            length = left + right
-            runs.append((begin_old, begin_new, length))
-            old_cursor = begin_old + length
-            new_cursor = begin_new + length
-            index_new = new_cursor
-            matched = True
+        if not seeded:
+            at += 1
+
+    chosen, pooled = [], list(candidates)
+    for _pass in range(MAX_CHAINS):
+        chain = max_weight_chain(pooled)
+        if not chain or sum(c[2] for c in chain) < MIN_CHAIN_TOKENS:
             break
-        if not matched:
-            index_new += 1
-    return runs
+        chosen.extend(chain)
+        pooled = [c for c in pooled if all(
+            c[1] + c[2] <= k[1] or k[1] + k[2] <= c[1] or c[0] + c[2] <= k[0] or k[0] + k[2] <= c[0]
+            for k in chain)]
+
+    # Merge runs that touch on both axes. Per chain in the C++ (a fusion across chains would rebuild the
+    # crossing they exist to express), which is the same thing here because a fused pair is always
+    # adjacent in the sorted order.
+    chosen.sort(key=lambda c: (c[1], c[0]))
+    merged = []
+    for span in chosen:
+        if merged and merged[-1][1] + merged[-1][2] == span[1] and \
+                merged[-1][0] + merged[-1][2] == span[0]:
+            merged[-1] = (merged[-1][0], merged[-1][1], merged[-1][2] + span[2])
+        else:
+            merged.append(span)
+    return merged
+
+
+def survivor_runs(previous_tokens, current_tokens):
+    """The shipped all-offset detector, under the name the rest of this file already uses."""
+    return channel_spans(previous_tokens, current_tokens)
 
 
 def relocate_whole_pages(runs, resident_tokens, limit, page=BLOCK):
@@ -586,6 +656,102 @@ def shift_scenario(delta, head=200, run_tokens=320, tail=64):
 
 def relocated_tokens(selected):
     return sum(span[-1] for span in selected)
+
+
+# ---------------------------------------------------------------------------------------------
+# The crossing fixture: the shape every turn of a context-editing client produces
+#
+# `shift_scenario` builds its survivors from a single run of distinct ascending integers, so the first
+# anchor probe always succeeds, nothing competes for a source, and no run is ever disconnected from the
+# prefix. Every possible detector agrees on it, which is why it could not distinguish a 16-token anchor
+# from a 64-token one, or a greedy walk from a coverage one. This fixture is the opposite: the previous
+# prompt carries an *echo* of the block the client rewrote, placed after the transcript, so the rewritten
+# block has a real copy whose source sits above the transcript's while its destination sits below it.
+# ---------------------------------------------------------------------------------------------
+def crossing_scenario(transcript=2048, ledger=256, prefix=640, tail=128):
+    """`previous` = prefix, old ledger, transcript, echo of the new ledger, tail.
+
+    `current` = prefix, new ledger, the same transcript. That is request 131 of the field trace with the
+    token counts scaled down; the ordering, which is what the failure is about, is unchanged.
+    """
+    def block(label, count):
+        return [label * 1000000 + i for i in range(count)]
+
+    shared_prefix = block(1, prefix)
+    ledger_old = block(2, ledger)
+    ledger_new = block(3, ledger)
+    shared = block(4, transcript)
+    previous = shared_prefix + ledger_old + shared + ledger_new + block(5, tail)
+    current = shared_prefix + ledger_new + shared
+    return previous, current
+
+
+def test_the_crossing_fixture_is_the_shape_the_bug_needs() -> None:
+    """Guard the fixture itself: a prefix, a moved block whose source sits above the transcript, and a
+    transcript below it in the destination."""
+    previous, current = crossing_scenario()
+    transcript_at = 640 + 256
+
+    assert previous[:640] == current[:640], "the prompts share a prefix"
+    assert previous[640:896] != current[640:896], "the ledger differs at the same position"
+    echo_at = 640 + 256 + 2048
+    assert previous[echo_at:echo_at + 256] == current[640:896], \
+        "the new ledger is echoed in the previous prompt, which is what makes the match cross"
+    assert 640 + 256 < echo_at, "the echo sits above the transcript, not below it"
+    assert transcript_at == 896, "the shared transcript starts where the old ledger ended"
+
+
+def test_a_coverage_detector_keeps_the_transcript_a_greedy_walk_loses() -> None:
+    """The measurement the rewrite is for, over the shape above.
+
+    A monotone walk commits to the echoed ledger on its first match and then cannot reach the transcript
+    behind it: 896 of 2944 tokens. Coverage chaining sees both, because the transcript survives as a
+    second chain rather than being unreachable.
+    """
+    previous, current = crossing_scenario()
+
+    greedy = [(0, 0, 640), (640 + 256 + 2048, 640, 256)]
+    assert sum(t for _o, _n, t in greedy) == 896, "the walk's own answer, for the record"
+
+    spans = survivor_runs(previous, current)
+    covered = sum(t for _o, _n, t in spans)
+    assert covered == 640 + 256 + 2048, f"coverage keeps the transcript too: {spans}"
+    assert (896, 896, 2048) in spans, f"the transcript is reported at its true offsets: {spans}"
+    assert 2048 > 256 * 3, "the run the walk loses is the largest one available"
+
+
+def test_every_reported_span_is_disjoint_in_both_prompts() -> None:
+    """Now that monotonicity is gone, disjointness in both prompts is the whole contract.
+
+    `plan_page_remap` refuses a plan that names one physical page twice and the runtime reports that
+    refusal as a failed request, so a detector that emitted two spans sharing a source page would turn a
+    degraded plan into an error.
+    """
+    for previous, current in (crossing_scenario(),
+                              crossing_scenario(transcript=320, ledger=192, prefix=192, tail=64)):
+        spans = survivor_runs(previous, current)
+        for i, (o, n, t) in enumerate(spans):
+            assert t > 0
+            for o2, n2, t2 in spans[i + 1:]:
+                assert n + t <= n2 or n2 + t2 <= n, f"destination overlap: {spans}"
+                assert o + t <= o2 or o2 + t2 <= o, f"source overlap: {spans}"
+        assert sum(t for _o, _n, t in spans) > 0
+
+
+def test_a_reordering_is_covered_rather_than_half_prefilled() -> None:
+    """A swap is the case no single monotone chain can hold: the source order and the destination order
+    disagree. It has to cost a second chain, not half the prompt."""
+    head = [1000000 + i for i in range(64)]
+    a = [2000000 + i for i in range(192)]
+    b = [3000000 + i for i in range(192)]
+    tail = [4000000 + i for i in range(64)]
+    previous = head + a + b + tail
+    current = head + b + a + tail
+
+    spans = survivor_runs(previous, current)
+    assert sum(t for _o, _n, t in spans) == len(previous), \
+        f"every token survives a swap: {spans}"
+    assert len(spans) == 4, f"reported as the two moved halves, not one run: {spans}"
 
 
 def test_a_three_token_edit_leaves_the_shipped_detector_nothing_to_match() -> None:

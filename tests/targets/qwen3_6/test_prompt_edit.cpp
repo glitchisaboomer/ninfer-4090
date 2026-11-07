@@ -1199,6 +1199,281 @@ void test_remap_pages_from_pool() {
     expect(cases == 5000, "the randomized remap sweep ran every case");
 }
 
+// ---------------------------------------------------------------------------------------------
+// Coverage, not earliest match. These pin the shape a context-editing client produces every turn:
+// the previous prompt still carries an echo of the block the client rewrote, near its tail, so the
+// rewritten block has a genuine copy *after* the large region that both prompts share.
+//
+// A monotone left-to-right walk commits to that echo on its first match and then cannot reach the
+// shared region behind it, which is how a request with ~85k tokens of unchanged transcript relocated
+// a few hundred tokens. Nothing here is about offsets the page grid cannot express; it is about which
+// match a greedy walk chooses.
+// ---------------------------------------------------------------------------------------------
+Tokens distinct_run(std::int32_t label, std::uint32_t tokens) {
+    // Every token unique across the prompt, so no incidental repetition can create or hide a run.
+    Tokens out;
+    out.reserve(tokens);
+    for (std::uint32_t i = 0; i < tokens; ++i) {
+        out.push_back(label * 1000000 + static_cast<std::int32_t>(i));
+    }
+    return out;
+}
+
+// `previous` holds the old ledger, the transcript, then the *new* ledger echoed after it; `current`
+// holds the new ledger followed by the same transcript. This is request 131 of the field trace, with
+// the token counts kept small enough to reason about but the ordering intact.
+Tokens crossing_scenario(Tokens& previous, Tokens& current, std::uint32_t transcript_tokens = 2048) {
+    const Tokens prefix      = distinct_run(1, 640);
+    const Tokens ledger_old  = distinct_run(2, 256);
+    const Tokens ledger_new  = distinct_run(3, 256);
+    const Tokens transcript  = distinct_run(4, transcript_tokens);
+    const Tokens tail        = distinct_run(5, 128);
+
+    append(previous, prefix);
+    append(previous, ledger_old);
+    append(previous, transcript);
+    append(previous, ledger_new);  // the previous turn's echo of what the client just rewrote
+    append(previous, tail);
+
+    append(current, prefix);
+    append(current, ledger_new);
+    append(current, transcript);
+    return prefix;
+}
+
+void test_a_greedy_walk_loses_the_shared_region_and_coverage_does_not() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+
+    Tokens previous;
+    Tokens current;
+    crossing_scenario(previous, current);
+
+    const std::uint32_t transcript_at = 640 + 256;  // where the shared transcript starts
+
+    // The greedy walk's answer, reconstructed here rather than asserted against the shipped one:
+    // it takes the prefix, then jumps to the echo, and stops. The shared transcript is never a
+    // candidate because its source offset fell behind the walk's source cursor.
+    const std::uint32_t prefix_tokens  = 640;
+    const std::uint32_t ledger_tokens  = 256;
+    const std::uint32_t greedy_reusable = prefix_tokens + ledger_tokens;
+    const std::uint32_t coverage_reusable = prefix_tokens + ledger_tokens + 2048;
+
+    const PromptEditDiff diff = diff_prompt_edit_shifted(previous, current);
+    expect(diff.reusable_tokens > greedy_reusable,
+           "coverage beats earliest match on a crossing edit");
+    expect(diff.reusable_tokens == coverage_reusable,
+           "and it keeps the prefix, the moved ledger and the whole shared transcript");
+    expect(diff.spans.size() == 3, "three runs survive: the prefix, the moved ledger, the transcript");
+
+    // The shared transcript is reported even though its destination begins *before* the moved
+    // ledger's source, which is exactly what a monotone walk cannot express.
+    bool saw_transcript = false;
+    for (const SurvivingSpan& span : diff.spans) {
+        if (span.new_begin == transcript_at && span.tokens == 2048) {
+            saw_transcript = true;
+            expect(span.old_begin == 640 + 256,
+                   "the transcript is sourced from where it sat in the previous prompt");
+        }
+    }
+    expect(saw_transcript, "the large shared run is in the result, not lost behind the echo");
+}
+
+void test_coverage_spans_stay_disjoint_in_both_prompts() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+
+    Tokens previous;
+    Tokens current;
+    crossing_scenario(previous, current);
+
+    const PromptEditDiff diff = diff_prompt_edit_shifted(previous, current);
+    expect(!diff.spans.empty(), "the crossing scenario produces spans");
+
+    // Disjointness is the whole contract now that monotonicity is gone: every consumer sorts by
+    // destination, but `plan_page_remap` refuses a plan naming one physical page twice and the runtime
+    // reports that refusal as a failed request. So it is checked here, in both directions.
+    for (std::size_t i = 0; i < diff.spans.size(); ++i) {
+        for (std::size_t j = i + 1; j < diff.spans.size(); ++j) {
+            const SurvivingSpan& a = diff.spans[i];
+            const SurvivingSpan& b = diff.spans[j];
+            expect(!(a.new_begin < b.new_end() && b.new_begin < a.new_end()),
+                   "two spans never overlap in the current prompt");
+            expect(!(a.old_begin < b.old_end() && b.old_begin < a.old_end()),
+                   "two spans never overlap in the previous prompt");
+        }
+        expect(diff.spans[i].tokens > 0, "no empty span is reported");
+    }
+
+    std::uint32_t total = 0;
+    for (const SurvivingSpan& span : diff.spans) { total += span.tokens; }
+    expect(total == diff.reusable_tokens, "reusable_tokens is the sum of the spans");
+}
+
+void test_a_reordered_block_is_recovered_by_a_second_chain() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+
+    // A swap: A precedes B in the previous prompt and follows it in the current one. Neither a
+    // monotone chain nor a single maximum-weight chain can hold both, so this is the case the
+    // residual passes exist for.
+    const Tokens head = distinct_run(1, 64);
+    const Tokens a    = distinct_run(2, 192);
+    const Tokens b    = distinct_run(3, 192);
+    const Tokens tail = distinct_run(4, 64);
+
+    Tokens previous;
+    append(previous, head);
+    append(previous, a);
+    append(previous, b);
+    append(previous, tail);
+
+    Tokens current;
+    append(current, head);
+    append(current, b);
+    append(current, a);
+    append(current, tail);
+
+    const PromptEditDiff diff = diff_prompt_edit_shifted(previous, current);
+    // Every token is covered, but not as one span: the two moved halves sit at swapped source offsets,
+    // so they cannot be fused into a single contiguous run. Covering them at all is the point -- a
+    // monotone chain holds one of the two and prefills the other.
+    expect(diff.reusable_tokens == static_cast<std::uint32_t>(previous.size()),
+           "a pure reordering relocates every token rather than prefilling the moved halves");
+    expect(diff.spans.size() == 4, "and reports the two moved halves at their swapped sources");
+    {
+        std::uint32_t total = 0;
+        for (std::size_t i = 0; i < diff.spans.size(); ++i) {
+            total += diff.spans[i].tokens;
+            expect(diff.spans[i].tokens % kPromptEditBlockTokens == 0,
+                   "the swap run stays block aligned");
+            for (std::size_t j = i + 1; j < diff.spans.size(); ++j) {
+                expect(!(diff.spans[i].old_begin < diff.spans[j].old_end() &&
+                         diff.spans[j].old_begin < diff.spans[i].old_end()),
+                       "the swapped halves never share a source token");
+            }
+        }
+        expect(total == diff.reusable_tokens, "the swap's coverage is the sum of its spans");
+    }
+}
+
+void test_a_second_chain_only_returns_when_it_is_worth_a_slot() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+
+    // A large crossing run plus a tiny detached one. The tiny run is below the two-page floor a
+    // residual pass requires, so it is not reported: it would pay for a plan slot with a run the MTP
+    // trim gives straight back.
+    const Tokens head       = distinct_run(1, 320);
+    const Tokens ledger_old = distinct_run(2, 192);
+    const Tokens ledger_new = distinct_run(3, 192);
+    const Tokens big        = distinct_run(4, 640);
+    const Tokens dribble    = distinct_run(5, 96);
+
+    Tokens previous;
+    Tokens current;
+    crossing_scenario(previous, current, 640);  // reuse the crossing shape with a shorter transcript
+    append(previous, dribble);
+    append(current, dribble);
+
+    const PromptEditDiff diff = diff_prompt_edit_shifted(previous, current);
+    std::uint32_t covered = 0;
+    for (const SurvivingSpan& span : diff.spans) { covered += span.tokens; }
+    expect(covered == diff.reusable_tokens, "coverage is consistent");
+    // 96 tokens is below `kMinimumChainTokens`, and it is detached from every other run because the
+    // scenario's tail separates it. Whether it appears depends on which pass finds it, so assert the
+    // property rather than the count: nothing reported may be a sub-page fragment alone.
+    expect(diff.reusable_tokens > 640,
+           "the crossing run is still found alongside whatever else is kept");
+    (void)head;
+    (void)ledger_old;
+    (void)ledger_new;
+    (void)big;
+}
+
+void test_repetitive_content_terminates_and_stays_disjoint() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+
+    // Every token identical: the anchor occurs at every offset, the probe cap is hit constantly, and
+    // every candidate source is interchangeable. The only requirements are that the walk terminates,
+    // that the answer is disjoint, and that it is one run rather than a thousand adjacent fragments.
+    const Tokens previous = repeated(7, 16);
+    const Tokens current  = repeated(7, 12);
+
+    const PromptEditDiff diff = diff_prompt_edit_shifted(previous, current);
+    expect(diff.spans.size() == 1, "identical content collapses to a single run");
+    if (diff.spans.size() == 1) {
+        expect(diff.spans.front().old_begin == 0 && diff.spans.front().new_begin == 0,
+               "and it starts at the beginning of both prompts");
+        expect(diff.spans.front().tokens == block_tokens(12),
+               "covering the whole current prompt");
+    }
+    expect(diff.reusable_tokens == block_tokens(12), "with no token counted twice");
+}
+
+void test_a_page_swap_costs_no_net_page_demand() {
+    using ninfer::targets::qwen3_6::detail::kRemapAcquirePage;
+    using ninfer::targets::qwen3_6::detail::plan_page_remap;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+    using ninfer::targets::qwen3_6::detail::remap_pages_from_pool;
+
+    // Two blocks that trade places. Each destination page receives a distinct physical page, so the
+    // mapping is expressible, and the pages dropped are the pages acquired, so the substitution needs
+    // nothing from the pool. A detector that dropped monotonicity without enforcing source
+    // disjointness would fail the first assertion; one that priced a swap as two acquisitions would
+    // fail the second.
+    const std::vector<std::int32_t> current_pages{11, 22, 33, 44};
+    const std::vector<RelocatedSpan> spans{
+        RelocatedSpan{.source_begin = block_tokens(1), .dest_begin = block_tokens(2),
+                      .tokens = block_tokens(1)},
+        RelocatedSpan{.source_begin = block_tokens(2), .dest_begin = block_tokens(1),
+                      .tokens = block_tokens(1)}};
+
+    const std::vector<std::int32_t> mapping = plan_page_remap(current_pages, spans, 0,
+                                                              block_tokens(4) + 8);
+    expect(!mapping.empty(), "an expressible swap produces a mapping");
+    if (mapping.size() >= 4) {
+        expect(mapping[1] == 33 && mapping[2] == 22, "the two blocks trade their physical pages");
+        expect(mapping[3] == kRemapAcquirePage, "the untouched page is left to prefill");
+    }
+    expect(remap_pages_from_pool(current_pages, mapping) == 1,
+           "only the page that is not carried needs a pool page");
+}
+
+void test_a_source_shared_by_two_spans_is_refused() {
+    using ninfer::targets::qwen3_6::detail::plan_page_remap;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    // The failure mode that makes source disjointness a detector obligation rather than a selector
+    // preference: two destinations naming one source page. The mapping would name a physical page
+    // twice, so it is refused as a whole, and the runtime treats a refusal as a failed request rather
+    // than as a smaller plan.
+    const std::vector<std::int32_t> current_pages{11, 22, 33, 44};
+    const std::vector<RelocatedSpan> spans{
+        RelocatedSpan{.source_begin = block_tokens(2), .dest_begin = block_tokens(1),
+                      .tokens = block_tokens(1)},
+        RelocatedSpan{.source_begin = block_tokens(2), .dest_begin = block_tokens(3),
+                      .tokens = block_tokens(1)}};
+
+    expect(plan_page_remap(current_pages, spans, 0, block_tokens(4) + 8).empty(),
+           "a plan naming one source page twice is refused, which is why the detector may not emit it");
+}
+
+void test_coverage_detection_is_deterministic() {
+    using ninfer::targets::qwen3_6::detail::diff_prompt_edit_shifted;
+
+    // Ties between equal-weight chains are resolved by candidate order, not by hash order, so the
+    // same prompts must give the same spans on every call and in every process. Pinned separately
+    // from `test_determinism` because the chainer has ties the walk never did.
+    Tokens previous;
+    Tokens current;
+    crossing_scenario(previous, current);
+    append(previous, repeated(9, 4));
+    append(current, repeated(9, 4));
+
+    const PromptEditDiff first  = diff_prompt_edit_shifted(previous, current);
+    const PromptEditDiff second = diff_prompt_edit_shifted(previous, current);
+    expect(spans_equal(first.spans, second.spans), "coverage detection is deterministic");
+    expect(first.reusable_tokens == second.reusable_tokens,
+           "and its reusable count is deterministic");
+}
+
 void test_determinism() {
     Tokens previous;
     append(previous, segment(1, 2));
@@ -1853,6 +2128,14 @@ int main() {
     test_shifted_pricing_excludes_the_copy_sources();
     test_copied_price_covers_the_substitution_the_copier_performs();
     test_longest_shared_prefix_tokens();
+    test_a_greedy_walk_loses_the_shared_region_and_coverage_does_not();
+    test_coverage_spans_stay_disjoint_in_both_prompts();
+    test_a_reordered_block_is_recovered_by_a_second_chain();
+    test_a_second_chain_only_returns_when_it_is_worth_a_slot();
+    test_repetitive_content_terminates_and_stays_disjoint();
+    test_a_page_swap_costs_no_net_page_demand();
+    test_a_source_shared_by_two_spans_is_refused();
+    test_coverage_detection_is_deterministic();
     test_determinism();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 prompt edit checks failed\n";

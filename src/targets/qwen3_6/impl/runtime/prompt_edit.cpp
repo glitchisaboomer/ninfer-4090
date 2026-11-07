@@ -21,6 +21,23 @@ constexpr std::uint64_t kHashPrime  = 0x100000001b3ULL;
 // for a hard O(N) walk.
 constexpr std::size_t kMaxCandidateProbes = 8;
 
+// How many chains the all-offset detector may emit. Each chain is one destination-disjoint,
+// source-disjoint pass over the candidates, and a crossing is what needs more than one. The selectors
+// cap themselves at `max_spans`, which is 6 or less on every configured path, so a detector that
+// stopped well below that would be handing over fewer spans than the plan can hold even after the
+// destination-page rule and the tail trim have eaten their share.
+constexpr std::size_t kMaxDetectedSpans = 8;
+
+// The smallest chain worth a second pass. A chain is reported if it is at least this long, because
+// anything shorter cannot pay for the plan slot it takes: `trim_relocated_run_tails` gives a block back
+// from every run, and one destination page holds a single span, so a short run is dropped or trimmed to
+// nothing downstream. Kept at two pages so the threshold and the page grid agree.
+constexpr std::uint32_t kMinimumChainTokens = 128;
+
+// Marks "no predecessor" in the chainer's parent pointers. `std::size_t` rather than an index so a
+// sentinel cannot accidentally name candidate zero.
+constexpr std::size_t kNilChain = std::numeric_limits<std::size_t>::max();
+
 [[nodiscard]] std::uint64_t hash_block(std::span<const TokenId> tokens, std::uint32_t first_block,
                                        std::uint32_t block_tokens) noexcept {
     std::uint64_t hash = kHashOffset;
@@ -34,16 +51,42 @@ constexpr std::size_t kMaxCandidateProbes = 8;
     return hash;
 }
 
-// The same fold over an arbitrary window, for the shifted detector: anchoring on a short n-gram
-// taken at every offset is what lets it match a run that is not on the block grid.
-[[nodiscard]] std::uint64_t hash_tokens(std::span<const TokenId> tokens, std::uint32_t offset,
-                                       std::uint32_t count) noexcept {
-    std::uint64_t hash = kHashOffset;
+// Anchor hashing for the all-offset detector, as a *rolling* polynomial.
+//
+// The block fold above is FNV-1a, which is deliberately not rollable: its `xor` before each multiply
+// makes the contribution of the leading token unrecoverable, so hashing a window at every offset costs
+// O(anchor) per offset -- O(N * anchor) for a pass, which measured as the dominant cost of the whole
+// detector on a field-sized prompt. A pure polynomial `h = h * prime + token` can be slid instead: drop
+// the term the leaving token contributed, which is `token * prime^(anchor - 1)`, then append.
+//
+// Two distinct hash functions in one file is fine because both are only ever compared against
+// themselves, and both are confirmed by exact token comparison before a run is reported. All arithmetic
+// wraps in `std::uint64_t`, which is the ring the slide relies on.
+constexpr std::uint64_t kAnchorHashPrime = 0x9e3779b97f4a7c15ULL;  // odd, so it is invertible mod 2^64
+
+[[nodiscard]] std::vector<std::uint64_t> rolling_anchor_hashes(std::span<const TokenId> tokens,
+                                                              std::uint32_t count) {
+    std::vector<std::uint64_t> hashes;
+    if (count == 0 || tokens.size() < count) { return hashes; }
+
+    std::uint64_t leaving_weight = 1;  // kAnchorHashPrime ^ (count - 1)
+    for (std::uint32_t i = 1; i < count; ++i) { leaving_weight *= kAnchorHashPrime; }
+
+    hashes.resize(tokens.size() - count + 1);
+    std::uint64_t hash = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
-        hash ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(tokens[offset + i]));
-        hash *= kHashPrime;
+        hash = hash * kAnchorHashPrime +
+               static_cast<std::uint64_t>(static_cast<std::uint32_t>(tokens[i]));
     }
-    return hash;
+    hashes[0] = hash;
+    for (std::size_t offset = 1; offset < hashes.size(); ++offset) {
+        hash -= static_cast<std::uint64_t>(static_cast<std::uint32_t>(tokens[offset - 1])) *
+                leaving_weight;
+        hash = hash * kAnchorHashPrime +
+               static_cast<std::uint64_t>(static_cast<std::uint32_t>(tokens[offset + count - 1]));
+        hashes[offset] = hash;
+    }
+    return hashes;
 }
 
 [[nodiscard]] bool tokens_equal(std::span<const TokenId> left, std::uint32_t left_begin,
@@ -743,32 +786,57 @@ PromptEditDiff diff_prompt_edit_shifted(std::span<const TokenId> previous,
     if (previous.size() < anchor_tokens || current.size() < anchor_tokens) { return diff; }
 
     // Every offset, not every block: the whole point is to match content that moved by a count the
-    // page grid cannot express.
-    const std::uint32_t previous_anchors =
-        static_cast<std::uint32_t>(previous.size()) - anchor_tokens + 1;
-    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> index;
-    index.reserve(previous_anchors);
-    for (std::uint32_t offset = 0; offset < previous_anchors; ++offset) {
-        index[hash_tokens(previous, offset, anchor_tokens)].push_back(offset);
-    }
+    // page grid cannot express. Both sides are hashed by the rolling pass, so seeding is O(N) rather
+    // than O(N * anchor); the current-prompt hashes are kept as an array because the sweep below reads
+    // each one exactly once.
+    const std::vector<std::uint64_t> previous_hashes = rolling_anchor_hashes(previous, anchor_tokens);
+    const std::vector<std::uint64_t> current_hashes  = rolling_anchor_hashes(current, anchor_tokens);
 
-    std::uint64_t reusable   = 0;
-    std::uint32_t old_cursor = 0;  // no run reuses a token of the previous prompt twice
-    std::uint32_t new_cursor = 0;
-    std::uint32_t at         = 0;
+    // A flat index rather than a hash map of vectors. Anchors are near-unique on real prompt text, so a
+    // map spends one heap allocation per offset to store one entry per bucket -- measured as the largest
+    // remaining cost after the hash itself became rolling. Sorting `(hash, offset)` pairs keeps the
+    // candidates for one hash contiguous *and* in ascending offset order, which is the order the probe
+    // loop wants, for one allocation and one sort.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> index;
+    index.reserve(previous_hashes.size());
+    for (std::uint32_t offset = 0; offset < previous_hashes.size(); ++offset) {
+        index.emplace_back(previous_hashes[offset], offset);
+    }
+    std::sort(index.begin(), index.end());  // by hash, then by offset: candidates come out ascending
+
+    // Stage 1: seed every offset of the current prompt and grow a maximal run right from each seed
+    // that is not already inside a claimed destination.
+    //
+    // Claim-based seeding is what bounds the growth work. A cursor walk has to grow left as well as
+    // right, and left growth has to stop at a boundary owned by an earlier run, which makes the total
+    // work depend on the shape of the content. Claiming the destination extent and skipping forward
+    // past it makes the new-side claims disjoint by construction and the sweep strictly linear, at the
+    // cost of the head of a run whose first anchor fails to probe -- the sweep visits every offset, so
+    // the first offset inside the run that probes successfully starts it anyway.
     const std::uint32_t current_anchors =
         static_cast<std::uint32_t>(current.size()) - anchor_tokens + 1;
+    std::vector<SurvivingSpan> candidates;
+    std::uint32_t claimed_to = 0;  // the destination side is swept, so one cursor is enough
+    std::uint32_t at         = 0;
     while (at < current_anchors) {
-        const auto found = index.find(hash_tokens(current, at, anchor_tokens));
-        if (found == index.end()) {
+        if (at < claimed_to) {
+            at = claimed_to;
+            continue;
+        }
+        const std::uint64_t hash = current_hashes[at];
+        const auto first = std::lower_bound(index.begin(), index.end(), hash,
+                                            [](const auto& entry, std::uint64_t key) {
+                                                return entry.first < key;
+                                            });
+        if (first == index.end() || first->first != hash) {
             ++at;
             continue;
         }
 
-        bool matched    = false;
+        bool seeded        = false;
         std::size_t probes = 0;
-        for (const std::uint32_t old_begin : found->second) {
-            if (old_begin < old_cursor) { continue; }
+        for (auto entry = first; entry != index.end() && entry->first == hash; ++entry) {
+            const std::uint32_t old_begin = entry->second;
             if (probes == kMaxCandidateProbes) { break; }
             ++probes;
             if (!tokens_equal(previous, old_begin, current, at, anchor_tokens)) { continue; }
@@ -778,33 +846,175 @@ PromptEditDiff diff_prompt_edit_shifted(std::span<const TokenId> previous,
                    previous[old_begin + right] == current[at + right]) {
                 ++right;
             }
-            // Grown left over the run's head, but never into the previous run or past the start of
-            // either prompt: that is what keeps the runs disjoint and the walk monotone.
-            std::uint32_t left = 0;
-            while (old_begin > left && at > left && at - left - 1 >= new_cursor &&
-                   old_begin - left - 1 >= old_cursor &&
-                   previous[old_begin - left - 1] == current[at - left - 1]) {
-                ++left;
-            }
-
-            const std::uint32_t begin_old = old_begin - left;
-            const std::uint32_t begin_new = at - left;
-            const std::uint32_t length    = left + right;
-            diff.spans.push_back(
-                SurvivingSpan{.old_begin = begin_old, .new_begin = begin_new, .tokens = length});
-            reusable += length;
-            old_cursor = begin_old + length;
-            new_cursor = begin_new + length;
-            at         = new_cursor;
-            matched    = true;
+            candidates.push_back(SurvivingSpan{.old_begin = old_begin, .new_begin = at, .tokens = right});
+            claimed_to = at + right;
+            seeded     = true;
             break;
         }
-        if (!matched) { ++at; }
+        if (!seeded) { ++at; }
     }
 
+    // Stage 2: iterated maximum-weight chaining.
+    //
+    // A single chain is the standard two-axis weighted interval schedule: walk the candidates in
+    // destination order, keep a source-order pointer, and ask a Fenwick tree for the best chain whose
+    // last source range ends at or before the current one begins. That is O(K log K), and it requires
+    // both coordinates to be monotone along the chain -- which forbids crossings.
+    //
+    // Crossings cannot be solved optimally in that framework. Selecting a maximum-weight set that is
+    // disjoint on two axes at once is maximum-weight independent set on two interval graphs, which is
+    // NP-hard, and a 2D DP over a single ordering cannot represent a swap at all: the source order says
+    // A precedes B while the destination order says B precedes A.
+    //
+    // So chain the residual instead. Each pass emits one valid chain, and everything conflicting with
+    // it on either axis is removed, so the union stays disjoint in both prompts while a crossing is
+    // recovered by a later pass. The result is not guaranteed maximum, and need not be: the selector
+    // that consumes it values tokens non-linearly (one span per destination page, a block back per run
+    // under MTP, and a hard `max_spans` cap), so a strictly larger set is not a strictly better plan.
+    //
+    // Both axes are held disjoint *here*, in the chaining, rather than left to the selector. The
+    // selectors separate destination pages only, so a source page named twice would survive selection
+    // and reach `plan_page_remap`, which refuses the whole plan: a failed request rather than a smaller
+    // one. The candidate pool may be dirty; the output must not be.
+    std::vector<SurvivingSpan> chosen;
+    std::vector<std::uint8_t> alive(candidates.size(), 1);
+    for (std::size_t pass = 0; pass < kMaxDetectedSpans; ++pass) {
+        std::vector<std::size_t> order;
+        order.reserve(candidates.size());
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (alive[i] != 0) { order.push_back(i); }
+        }
+        if (order.empty()) { break; }
+        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+            const SurvivingSpan& left  = candidates[a];
+            const SurvivingSpan& right = candidates[b];
+            if (left.new_begin != right.new_begin) { return left.new_begin < right.new_begin; }
+            if (left.old_begin != right.old_begin) { return left.old_begin < right.old_begin; }
+            return left.tokens > right.tokens;
+        });
+
+        // Source coordinates, compressed, keyed by the end of a chained candidate's source range.
+        std::vector<std::uint32_t> source_keys;
+        source_keys.reserve(order.size());
+        for (const std::size_t i : order) { source_keys.push_back(candidates[i].old_begin); }
+        for (const std::size_t i : order) { source_keys.push_back(candidates[i].old_end()); }
+        std::sort(source_keys.begin(), source_keys.end());
+        source_keys.erase(std::unique(source_keys.begin(), source_keys.end()), source_keys.end());
+        const auto key_of = [&](std::uint32_t token) {
+            return static_cast<std::size_t>(
+                       std::lower_bound(source_keys.begin(), source_keys.end(), token) -
+                       source_keys.begin()) +
+                   1;  // Fenwick is one-based
+        };
+
+        // Fenwick prefix maximum over chained weight, carrying the candidate it came from so the chain
+        // reconstructs by walking parents instead of being re-derived.
+        std::vector<std::uint32_t> tree_weight(source_keys.size() + 1, 0);
+        std::vector<std::size_t> tree_from(source_keys.size() + 1, kNilChain);
+        std::vector<std::uint32_t> weight(order.size(), 0);
+        std::vector<std::size_t> parent(order.size(), kNilChain);
+        std::uint32_t best_weight = 0;
+        std::size_t best_at       = kNilChain;
+
+        // `cursor` walks the same list in source order, so everything inserted so far has
+        // `old_end <= candidates[order[pos]].old_begin`. A candidate whose source range the cursor has
+        // already passed cannot be chained from at all: that is the two-axis monotonicity, enforced by
+        // the sweep rather than by a predicate.
+        std::size_t cursor = 0;
+        for (std::size_t pos = 0; pos < order.size(); ++pos) {
+            const SurvivingSpan& span = candidates[order[pos]];
+            while (cursor < order.size() &&
+                   candidates[order[cursor]].old_end() <= span.old_begin) {
+                const std::size_t key = key_of(candidates[order[cursor]].old_end());
+                for (std::size_t node = key; node <= source_keys.size(); node += node & (~node + 1)) {
+                    if (weight[cursor] > tree_weight[node]) {
+                        tree_weight[node] = weight[cursor];
+                        tree_from[node]   = cursor;
+                    }
+                }
+                ++cursor;
+            }
+            std::uint32_t inherited    = 0;
+            std::size_t inherited_from = kNilChain;
+            if (span.old_begin != 0) {
+                for (std::size_t node = key_of(span.old_begin) - 1; node != 0;
+                     node -= node & (~node + 1)) {
+                    if (tree_weight[node] > inherited) {
+                        inherited      = tree_weight[node];
+                        inherited_from = tree_from[node];
+                    }
+                }
+            }
+            weight[pos] = inherited + span.tokens;
+            parent[pos] = inherited_from;
+            if (weight[pos] > best_weight) {
+                best_weight = weight[pos];
+                best_at     = pos;
+            }
+        }
+        if (best_at == kNilChain || best_weight == 0) { break; }
+
+        std::vector<std::size_t> chain;
+        for (std::size_t pos = best_at; pos != kNilChain; pos = parent[pos]) {
+            chain.push_back(order[pos]);
+        }
+
+        // A residual chain below `kMinimumChainTokens` buys a plan slot it cannot keep: the MTP tail
+        // trim gives a block back from every run, and one destination page holds one span. Stop rather
+        // than hand the selector candidates whose only future is a rejection.
+        if (chain.empty() || best_weight < kMinimumChainTokens) { break; }
+        for (const std::size_t i : chain) {
+            chosen.push_back(candidates[i]);
+            alive[i] = 0;
+        }
+        // Everything conflicting with an emitted chain on either axis leaves the pool, so the next pass
+        // can only add spans the union does not already cover.
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (alive[i] == 0) { continue; }
+            for (const std::size_t kept : chain) {
+                const SurvivingSpan& self  = candidates[i];
+                const SurvivingSpan& other = candidates[kept];
+                const bool overlaps_destination =
+                    self.new_begin < other.new_end() && other.new_begin < self.new_end();
+                const bool overlaps_source =
+                    self.old_begin < other.old_end() && other.old_begin < self.old_end();
+                if (overlaps_destination || overlaps_source) {
+                    alive[i] = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (chosen.empty()) { return diff; }
+
+    // Stage 3: merge runs that touch on both axes. Within one chain the spans are monotone, so
+    // adjacency is well defined; fusing across chains would reintroduce the crossing they exist to
+    // express. One span per run is cheaper everywhere downstream: `max_spans` is a hard cap, an MTP
+    // trim costs a block per run, and the runtime sorts spans by destination anyway.
+    std::vector<SurvivingSpan> sorted = std::move(chosen);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const SurvivingSpan& a, const SurvivingSpan& b) {
+                  if (a.new_begin != b.new_begin) { return a.new_begin < b.new_begin; }
+                  return a.old_begin < b.old_begin;
+              });
+    std::vector<SurvivingSpan> merged;
+    merged.reserve(sorted.size());
+    for (const SurvivingSpan& span : sorted) {
+        if (!merged.empty() && merged.back().new_end() == span.new_begin &&
+            merged.back().old_end() == span.old_begin) {
+            merged.back().tokens += span.tokens;
+            continue;
+        }
+        merged.push_back(span);
+    }
+
+    std::uint64_t reusable = 0;
+    for (const SurvivingSpan& span : merged) { reusable += span.tokens; }
     if (reusable > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("prompt edit reusable token count does not fit uint32");
     }
+    diff.spans           = std::move(merged);
     diff.reusable_tokens = static_cast<std::uint32_t>(reusable);
     return diff;
 }
