@@ -947,6 +947,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                     copying ? qwen3_6::detail::shifted_relocation_pages_from_pool(
                                   sequence.kv->text.page_ids(), remap, relocation_source_pages)
                             : qwen3_6::detail::remap_pages_from_pool(sequence.kv->text.page_ids(), remap);
+                // The planner already priced this (`affordable_copied_spans`) and trimmed the plan to
+                // what the pool could afford, so reaching this means the pool shrank between planning
+                // and dispatch. Kept as an error rather than a silent partial publish because the
+                // mapping is already built: dropping spans here would leave `remap` describing a plan
+                // nothing else knows about. A relocation is an optimisation, so the honest fix if this
+                // ever fires is to trim earlier, not to half-apply it here.
                 if (text_from_pool > decoder->text_kv.pool().free_pages()) {
                     throw std::logic_error(
                         "suffix relocation cannot afford the pages its Text mapping acquires");

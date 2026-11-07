@@ -1715,6 +1715,79 @@ void test_shifted_pricing_excludes_the_copy_sources() {
 // the pages the mapping drops in different relations to each other. The price is allowed to be
 // larger -- a source the mapping still names blocks budget it never could have spent -- but never
 // smaller, and where every source is a dropped page the two have to agree exactly.
+// A relocated plan is only worth planning if the pool can pay for it. The re-pointing route edits the
+// page table and needs nothing spare; the copied route gives every destination page a page of its own,
+// because the page holding that content is still being read as the copy's source. On a prompt whose
+// length barely changes there are almost no dropped pages to pay with, which is how a wide copied plan
+// came to ask for a second copy of the whole cache and fail the request outright.
+void test_affordable_copied_spans_prices_the_route_the_runtime_takes() {
+    using ninfer::targets::qwen3_6::detail::affordable_copied_spans;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    const auto span = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = source, .dest_begin = dest, .tokens = tokens};
+    };
+
+    std::vector<std::int32_t> current;
+    for (std::uint32_t page = 0; page < 8; ++page) {
+        current.push_back(static_cast<std::int32_t>(100 + page));
+    }
+    // The prompt and the resident mapping have to be the same length here: a longer prompt asks for a
+    // page the mapping does not hold, which is a different refusal (the mapping has nowhere to put it).
+    const auto prompt = block_tokens(8);
+
+    // An empty plan costs nothing, whatever the pool holds.
+    expect(affordable_copied_spans(current, {}, 0, prompt, 0) == 0,
+           "an empty plan is affordable at zero cost");
+
+    // A whole-block move: both ends are page aligned, so the re-pointing route applies and the pool is
+    // never touched, even with nothing free.
+    const std::vector<RelocatedSpan> aligned{span(block_tokens(5), block_tokens(2), block_tokens(1))};
+    expect(affordable_copied_spans(current, aligned, 0, prompt, 0) == 1,
+           "a page-aligned plan re-points, so it needs no free pages at all");
+
+    // The same span moved off the page grid cannot be re-pointed, so it becomes a copy and needs a
+    // page of its own -- two of them, because it straddles a page boundary at each end.
+    const std::vector<RelocatedSpan> off_grid{
+        span(block_tokens(5) + 3, block_tokens(2) + 3, block_tokens(1))};
+    expect(affordable_copied_spans(current, off_grid, 0, prompt, 0) == 0,
+           "an off-grid plan copies, so with no free pages it keeps nothing");
+    expect(affordable_copied_spans(current, off_grid, 0, prompt, 8) == 1,
+           "and with room it keeps the span");
+}
+
+void test_a_wide_copied_plan_is_trimmed_to_what_the_pool_can_afford() {
+    using ninfer::targets::qwen3_6::detail::affordable_copied_spans;
+    using ninfer::targets::qwen3_6::detail::RelocatedSpan;
+
+    const auto span = [](std::uint32_t source, std::uint32_t dest, std::uint32_t tokens) {
+        return RelocatedSpan{.source_begin = source, .dest_begin = dest, .tokens = tokens};
+    };
+    std::vector<std::int32_t> current;
+    for (std::uint32_t page = 0; page < 16; ++page) {
+        current.push_back(static_cast<std::int32_t>(100 + page));
+    }
+    const auto prompt = block_tokens(16);
+
+    // Four off-grid spans, in destination order, each starting partway through a page so all four have
+    // to copy. The caller keeps a prefix of this list, so what survives is the front of the plan.
+    std::vector<RelocatedSpan> wide;
+    for (std::uint32_t i = 1; i <= 4; ++i) {
+        wide.push_back(span(block_tokens(i + 8) + 5, block_tokens(i) + 5, block_tokens(1)));
+    }
+
+    // Each off-grid span straddles two destination pages, so the plan's price is one more than the
+    // number of spans it holds: 2, 3, 4, 5 pages for 1, 2, 3, 4 spans.
+    expect(affordable_copied_spans(current, wide, 0, prompt, 5) == 4,
+           "enough free pages keeps the whole plan");
+    expect(affordable_copied_spans(current, wide, 0, prompt, 4) == 3,
+           "one page short drops the last span and keeps the rest");
+    expect(affordable_copied_spans(current, wide, 0, prompt, 2) == 1,
+           "a short pool keeps only what fits, and prefills the rest");
+    expect(affordable_copied_spans(current, wide, 0, prompt, 0) == 0,
+           "and an empty pool keeps nothing");
+}
+
 void test_copied_price_covers_the_substitution_the_copier_performs() {
     using ninfer::kPagedKVAquirePage;
     using ninfer::plan_relocated_page_moves;
@@ -2126,6 +2199,8 @@ int main() {
     test_shifted_selector_quantizes_only_the_destination();
     test_plan_copied_page_remap_acquires_every_relocated_page();
     test_shifted_pricing_excludes_the_copy_sources();
+    test_affordable_copied_spans_prices_the_route_the_runtime_takes();
+    test_a_wide_copied_plan_is_trimmed_to_what_the_pool_can_afford();
     test_copied_price_covers_the_substitution_the_copier_performs();
     test_longest_shared_prefix_tokens();
     test_a_greedy_walk_loses_the_shared_region_and_coverage_does_not();

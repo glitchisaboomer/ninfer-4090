@@ -421,6 +421,40 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
         const std::size_t fallback_spans = plan_spans.size();
 
+        // A copied plan needs a page of its own for every destination page it covers, because the page
+        // holding the content is still being read as the copy's source. It pays for them out of the
+        // pages the edit drops, and an edit that leaves the prompt the same length drops almost none --
+        // so a plan with wide coverage can ask for roughly one spare page per relocated page. At 120k
+        // tokens that is a second copy of the cache, and the runtime used to answer it with
+        // `std::logic_error("suffix relocation cannot afford the pages its Text mapping acquires")`,
+        // after the plan had already been reported and with no way back from a refusal that had already
+        // been decided.
+        //
+        // Trimming here is the honest answer: a request that cannot afford an optimisation prefills the
+        // tokens it cannot move, which is what it did before the optimisation existed. The spans are in
+        // destination order, so what is dropped is the tail of the plan -- the part a relocation saves
+        // least on once the plan stops, and the part whose loss keeps the prefix contiguous.
+        //
+        // Most plans are free: the re-pointing route moves the page table rather than the payload, so
+        // it needs no spare pages at all, and every page-aligned plan takes it. A plan that cannot be
+        // afforded is trimmed rather than converted to the other route, because the spans that make it
+        // expensive here are the off-grid ones the re-pointing route cannot express.
+        //
+        // Applied whether or not source shifting is on. The re-pointing route is not always free -- a
+        // prompt that grows asks the pool for the pages it outgrew -- so the same refusal is reachable
+        // on the default path, just far less often.
+        if (!plan_spans.empty() && sequence.kv) {
+            const std::uint32_t free_pages = decoder->text_kv.pool().free_pages();
+            const std::size_t affordable = qwen3_6::detail::affordable_copied_spans(
+                sequence.kv->text.page_ids(), plan_spans, plan->reuse_base, prompt_tokens_count,
+                free_pages);
+            if (affordable < plan_spans.size()) {
+                // The spans the plan gives up are prefilled instead, so the ranges derived from the
+                // shortened list below still tile the prompt.
+                plan_spans.resize(affordable);
+            }
+        }
+
         // The layer that predicts more than one token reads the same moved cache with a stem that
         // pairs row p with token p + 1, so a run ending where the prompts diverge leaves its last
         // row paired with a token the edit replaced. Forwarding each run's last block moves that

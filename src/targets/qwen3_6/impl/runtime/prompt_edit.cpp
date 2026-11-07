@@ -1,5 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/prompt_edit.h"
 
+#include "core/paged_kv_delta_layout.h"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -605,6 +607,68 @@ std::uint32_t shifted_relocation_pages_from_pool(std::span<const std::int32_t> c
     }
     const std::uint64_t reused = std::min<std::uint64_t>(acquires, usable);
     return acquires - static_cast<std::uint32_t>(reused);
+}
+
+std::size_t affordable_copied_spans(std::span<const std::int32_t> current_pages,
+                                    std::span<const RelocatedSpan> spans,
+                                    std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens,
+                                    std::uint32_t free_pages) {
+    if (spans.empty()) { return 0; }
+
+    // Walks the prefix of the list rather than searching, because the price rises with coverage and a
+    // longer prefix is the part a caller most wants to keep. Bounded by `max_spans`.
+    std::size_t kept = 0;
+    for (std::size_t count = 1; count <= spans.size(); ++count) {
+        const std::span<const RelocatedSpan> chosen = spans.first(count);
+
+        // The runtime takes the re-pointing route whenever the spans allow it, and that route keeps the
+        // content where it is and edits the page table instead, so it does not need a page per
+        // destination. Pricing it as a copy would trim plans that were never going to be copied.
+        const std::vector<std::int32_t> repointed =
+            plan_page_remap(current_pages, chosen, prefix_reuse_tokens, prompt_tokens);
+        if (!repointed.empty()) {
+            if (remap_pages_from_pool(current_pages, repointed) > free_pages) { break; }
+            kept = count;
+            continue;
+        }
+
+        // Otherwise the payload has to move, and every destination page needs a page of its own
+        // because the page holding that content is still being read as the copy's source.
+        const std::vector<std::int32_t> mapping =
+            plan_copied_page_remap(current_pages, chosen, prefix_reuse_tokens, prompt_tokens);
+        if (mapping.empty()) { break; }  // inexpressible, so no longer prefix of the list will be
+
+        // The source pages are the logical pages of the current mapping the copies read. Derived the
+        // way the runtime derives them, from the moves the copier will issue, because a span ending
+        // off a page boundary touches a page that stepping from its first page would miss -- and a
+        // price one page short is exactly what the runtime's own check then refuses.
+        std::vector<std::uint32_t> source_pages;
+        {
+            std::vector<RelocatedCopySpan> copies;
+            copies.reserve(chosen.size());
+            for (const RelocatedSpan& span : chosen) {
+                copies.push_back(RelocatedCopySpan{.source_begin = span.source_begin,
+                                                   .dest_begin   = span.dest_begin,
+                                                   .tokens       = span.tokens});
+            }
+            const std::vector<RelocatedPageMove> moves = plan_relocated_page_moves(
+                copies, RelocatedPageCounts{.source      = current_pages.size(),
+                                            .destination = mapping.size()});
+            source_pages.reserve(moves.size());
+            for (const RelocatedPageMove& move : moves) {
+                source_pages.push_back(static_cast<std::uint32_t>(move.source_page));
+            }
+            std::sort(source_pages.begin(), source_pages.end());
+            source_pages.erase(std::unique(source_pages.begin(), source_pages.end()),
+                               source_pages.end());
+        }
+
+        if (shifted_relocation_pages_from_pool(current_pages, mapping, source_pages) > free_pages) {
+            break;
+        }
+        kept = count;
+    }
+    return kept;
 }
 
 std::vector<PrefillRange> relocation_prefill_ranges(std::span<const RelocatedSpan> spans,

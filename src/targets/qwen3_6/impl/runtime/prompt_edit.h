@@ -447,6 +447,34 @@ inline constexpr std::int32_t kRemapAcquirePage = -1;
     std::span<const std::int32_t> current_pages, std::span<const std::int32_t> mapping,
     std::span<const std::uint32_t> source_pages);
 
+// How many shared-prefix moves a copied plan can keep with `free_pages` pages available.
+//
+// The copying route gives every destination page a page of its own, because the page that holds the
+// content is still being read as the copy's source. It pays for them from the pages the mapping
+// drops, and on an edit that barely changes the prompt's length there are almost none of those -- so
+// a plan with high coverage can need roughly one spare page per relocated page, which at 120k tokens
+// is a second copy of the whole cache.
+//
+// That is a real bound and not a defect, but it used to surface as `std::logic_error("suffix
+// relocation cannot afford the pages its Text mapping acquires")` from inside the runtime, after the
+// plan had already been reported. A request that cannot afford an optimisation should prefill the
+// tokens it cannot move, which is what it did before the optimisation existed; refusing the request
+// is the wrong answer to "there is not enough room".
+//
+// So the number is computed here, before anything is published, and the caller trims the plan to it.
+// Spans arrive in destination order and are dropped from the end: the tail of the prompt is the part
+// a relocation saves least on (it is prefilled anyway once the plan stops) and dropping from the end
+// keeps the surviving prefix contiguous.
+//
+// Each prefix of the list is priced the way the runtime will actually execute it -- the re-pointing
+// route when the spans allow it, which needs no spare pages, and the copied route otherwise, which is
+// priced by `shifted_relocation_pages_from_pool`. Returns the number of spans to keep; the caller
+// prefills whatever the returned prefix does not cover, which is what it did before the optimisation
+// existed.
+[[nodiscard]] std::size_t affordable_copied_spans(
+    std::span<const std::int32_t> current_pages, std::span<const RelocatedSpan> spans,
+    std::uint32_t prefix_reuse_tokens, std::uint32_t prompt_tokens, std::uint32_t free_pages);
+
 // The ranges of the prompt the runtime must prefill for `spans`, in prompt order: every token of
 // `[prefix_reuse_tokens, prompt_tokens)` that no relocated span covers. With one contiguous run this
 // is the head and the tail around it, which is exactly what `plan_tail_relocation` reports; with
