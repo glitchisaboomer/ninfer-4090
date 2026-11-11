@@ -574,21 +574,33 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
 
-    // Probe: one group, the column's own last group, writes cells 0..3. cand_idx/prob are the same
-    // normalized support the commit loop below reads back from workspace, and this launch's group
-    // ordering guarantees the writer is the one whose support is final.
-    if (probe != nullptr && is_last_group == 1 && tid == 0) {
+    // The probe reads the same normalized `prob` support the acceptance test consumes, so the
+    // collision probability it reports describes the distribution that was actually sampled.
+    // It is evaluated before the accept decision and writes only the probe matrix, so the
+    // decision and every sampled token stay bit-identical to the probe-free path.
+    if (probe != nullptr) {
+        // Cooperative, for the same reason as the block route: a per-thread local would only ever
+        // see that thread's own strided slice. Scanning the whole domain from one thread instead
+        // would read every logit serially -- 248,077 loads per column per round at the packed
+        // vocabulary. Each thread of the column's groups reaches this point -- `col` is
+        // block-uniform and the early exits above are too -- so the barrier is safe.
         const __nv_bfloat16* col_logits =
             row_logits + static_cast<std::int64_t>(col) * physical_rows;
         int nonfinite = 0;
-        for (int v = 0; v < token_domain; ++v) {
+        for (int v = tid; v < token_domain; v += blockDim.x) {
             if (!isfinite(__bfloat162float(col_logits[v]))) {
                 nonfinite = 1;
                 break;
             }
         }
-        speculative_probe_write_column(probe, row, k, batch_stride, col, cand_idx, prob, n_support,
-                                        col < extent ? row_drafts[col] : -1, nonfinite == 0);
+        const int any_nonfinite = __syncthreads_or(nonfinite);
+        // Only the column's own last group holds the final support, which is orthogonal to the scan
+        // above -- that one reads the raw logits rather than the truncated support.
+        if (is_last_group == 1 && tid == 0) {
+            speculative_probe_write_column(probe, row, k, batch_stride, col, cand_idx, prob,
+                                            n_support, col < extent ? row_drafts[col] : -1,
+                                            any_nonfinite == 0);
+        }
     }
 
     if (tid == 0) {
