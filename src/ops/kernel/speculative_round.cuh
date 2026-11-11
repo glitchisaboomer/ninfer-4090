@@ -314,13 +314,16 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                     break;
                 }
             }
-            __syncthreads();
+            // Every thread scans a strided slice, so the flag has to be reduced across the block:
+            // reading this thread's own local reports the column finite whenever the non-finite
+            // element happens to fall outside thread 0's slice.
+            const int any_nonfinite = __syncthreads_or(nonfinite);
             if (tid == 0 && i < extent) {
                 speculative_probe_write_column(probe, row, k, batch_stride, i, cand_idx, prob,
-                                                n_support, row_drafts[i], nonfinite == 0);
+                                                n_support, row_drafts[i], any_nonfinite == 0);
             } else if (tid == 0) {
                 speculative_probe_write_column(probe, row, k, batch_stride, i, cand_idx, prob,
-                                                n_support, -1, nonfinite == 0);
+                                                n_support, -1, any_nonfinite == 0);
             }
             __syncthreads();
         }
