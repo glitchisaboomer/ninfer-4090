@@ -832,6 +832,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         } else {
             const int loader_tid = tid - ProducerThreads;
+            // A tile is Bc-aligned and Bc divides the page size, so no tile straddles a page
+            // boundary and every key below belongs to `physical_page`. That variable is only
+            // advanced after this loader runs (in the has_next block), so it still names this
+            // tile's page -- resolving it from block_table per chunk would re-read the same entry.
+            const int vpage = physical_page;
 #pragma unroll 1
             for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
                 const int key_l    = chunk / (D / 8);
@@ -842,9 +847,6 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 if (key >= split_start && key < split_end) {
                     const int grp  = d >> 6;
                     const float vs = __half2float(v_scale_s[key_l * Groups + grp]);
-                    // `physical_page` already points at the NEXT tile by the time this runs, so the
-                    // page holding this key is resolved here rather than reused.
-                    const int vpage = block_table[key >> kPagedKVPageShift];
                     const int voff_key = key & kPagedKVPageMask;
                     if constexpr (PackedV) {
                         const std::int64_t voff =
