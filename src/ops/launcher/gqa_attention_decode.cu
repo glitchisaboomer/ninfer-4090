@@ -179,7 +179,10 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         } else if (implementation_window <= 2054) {
             launch.template operator()<6, 2, 32, false>();
         } else if (implementation_window <= 8198) {
-            launch.template operator()<6, 2, 64, true>();
+            // Bc=64 still needs 72,848 B of dynamic arena against a 99,328 B per-SM ceiling, so a
+            // second block cannot be resident no matter what is requested. Asking for 2 here would
+            // only halve the register budget ptxas may use for a block that stays alone.
+            launch.template operator()<6, 1, 64, true>();
         } else {
             launch.template operator()<6, 2, 32, false>();
         }
