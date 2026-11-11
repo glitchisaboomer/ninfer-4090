@@ -62,6 +62,11 @@ std::string named(const std::string& what, const Variant& variant, const char* s
 // width, which resolves to GqaAttentionRoute::Prompt.
 constexpr std::int32_t kDecodeTokens  = 8;
 constexpr std::int32_t kPrefillTokens = 128;
+// MTP verification at draft width 5 launches the TokenTile == 6 specialization, which is a distinct
+// kernel instantiation from the width-8 one above and has its own V read path: it widens V straight
+// out of the KV cache instead of staging the codes in shared memory first. The packed and E8 codecs
+// are only reachable through this constant, so without it a regression in that path would go unseen.
+constexpr std::int32_t kVerifyTokens = 6;
 
 // Part 2b's end-to-end packed-plane check, run on rk8v4's V plane: packed int4, Hadamard-rotated,
 // scale = amax / 7, no clamp, so the encoder's per-element error is bounded by half an int4 step.
@@ -234,14 +239,15 @@ void check_packed_plane_decode(const Scenario& scenario, const Variant& variant,
 // A3: read-only attention over an already populated cache, per variant.
 
 void check_decode_attention_with_delta(const Scenario& scenario, const Variant& variant,
-                                       const char* scenario_name, const FreqTable& freq) {
+                                       const char* scenario_name, const FreqTable& freq,
+                                       std::int32_t tokens = kDecodeTokens) {
     if (scenario.table[kDestPage] == kDestPage) {
         fail("block table must be non-identity at kDestPage for the negative control to be valid");
         return;
     }
 
-    const std::int32_t base      = scenario.dst + scenario.run - kDecodeTokens;
-    const std::uint32_t visible  = static_cast<std::uint32_t>(base + kDecodeTokens);
+    const std::int32_t base      = scenario.dst + scenario.run - tokens;
+    const std::uint32_t visible  = static_cast<std::uint32_t>(base + tokens);
     const DeltaMetadata metadata = make_delta_metadata(scenario);
     const std::int32_t pages     = scenario.logical_pages;
 
@@ -259,8 +265,8 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
     view.rope_delta_ranges = Tensor(range_buf.p, DType::I32, {pages});
     view.rope_inv_freq     = freq;
 
-    auto got_relocated = run_cached_attention_view_i8(cache, scenario.q, base, kDecodeTokens,
-                                                      visible, view);
+    auto got_relocated =
+        run_cached_attention_view_i8(cache, scenario.q, base, tokens, visible, view);
 
     // The FP64 reference for the relocated path itself: the same cache, with every relocated key
     // rotated back by its page's delta (the key-side form of the kernel's Q counter-rotation).
@@ -270,7 +276,7 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
     // cache-against-cache equivalence below. It reads the interval plane too, because on a partial
     // page only the keys inside the interval are the ones that moved.
     const std::vector<double> delta_reference = ideal_attention_with_delta(
-        scenario.q, cache, base, kDecodeTokens, metadata.deltas, metadata.ranges, freq);
+        scenario.q, cache, base, tokens, metadata.deltas, metadata.ranges, freq);
 
     // kConformanceRotatedI8 goes to BOTH calls -- measure() uses it for the gross thresholds and
     // expect_conformant for relative L2 -- so the delta path is judged against the rotated profile
@@ -287,14 +293,14 @@ void check_decode_attention_with_delta(const Scenario& scenario, const Variant& 
                         variant.rotate_v, variant.packed_k, variant.e8_lattice, variant.e8_root);
     append_chunk(reference, scenario.k_dst, scenario.v, scenario.dst, scenario.run);
     PagedKVLayerView ref_view = reference.view();
-    auto got_reference = run_cached_attention_view_i8(reference, scenario.q, base, kDecodeTokens,
-                                                      visible, ref_view);
+    auto got_reference =
+        run_cached_attention_view_i8(reference, scenario.q, base, tokens, visible, ref_view);
 
     // FP64 anchor of the directly prefilled page, under the same rotated profile. This is the check
     // that validates the host Hadamard and the packed-plane decode: a wrong parity, extent or DC gain
     // fails here and nowhere else.
     if (!expect_conformant(measure(got_reference.out,
-                                   ideal_attention(scenario.q, reference, base, kDecodeTokens),
+                                   ideal_attention(scenario.q, reference, base, tokens),
                                    kConformanceRotatedI8),
                            named("A3 over a directly prefilled int8 page", variant,
                                  scenario_name),
@@ -554,6 +560,12 @@ int main() {
         check_prefill_attention_with_delta(scenario, variant, "aligned", freq);
         check_decode_attention_with_delta(unaligned, variant, "off-grid", freq);
         check_prefill_attention_with_delta(unaligned, variant, "off-grid", freq);
+        // The same two shapes at MTP verification width, which is a separate kernel instantiation
+        // with its own V read path for every one of these codecs.
+        check_decode_attention_with_delta(scenario, variant, "aligned verify-width", freq,
+                                          kVerifyTokens);
+        check_decode_attention_with_delta(unaligned, variant, "off-grid verify-width", freq,
+                                          kVerifyTokens);
     }
 
     // Deltas in the thousands, which is the range production published (2026-10-17 session: -3021
