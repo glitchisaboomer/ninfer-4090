@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,6 +29,12 @@ std::vector<T> read(const GuardedDeviceBuffer& buffer, std::size_t count) {
 
 DeviceBuffer device_config(const ops::SamplingConfig& config) {
     return to_device(std::vector<ops::SamplingConfig>{config});
+}
+
+// The kernels index configs by batch row, so a batch > 1 needs one entry per row. A short array
+// reads past the end and yields a garbage temperature, which silently selects the greedy branch.
+DeviceBuffer device_config_batch(const ops::SamplingConfig& config, int batch) {
+    return to_device(std::vector<ops::SamplingConfig>(static_cast<std::size_t>(batch), config));
 }
 
 struct VerifyInputsExpected {
@@ -622,6 +629,225 @@ int probe_matches_oracle_case(int token_domain, int k, const char* route_label) 
     return failures;
 }
 
+// Drives the probe on a column whose logits contain a non-finite value and checks that the
+// contract's -1 is reported. The scan is strided across the block, so the sentinel is placed
+// deliberately off thread 0's slice: a per-thread flag or a serial scan from one thread would
+// otherwise pass by accident. Also covers the greedy branch and the batch stride.
+int probe_nonfinite_and_batch_case() {
+    constexpr int token_domain = 64; // <= kSamplerTileItems, so this is the single-block route
+    constexpr int k            = 2;
+    constexpr int batch        = 2;
+    const int columns          = k + 1;
+    int failures               = 0;
+
+    // The kernel addresses logits[row*cols*physical_rows + col*physical_rows + v], so the host
+    // vector is laid out row-major with the batch row outermost and the token fastest.
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns * batch, -20.0f);
+    for (int row = 0; row < batch; ++row) {
+        for (int col = 0; col < columns; ++col) {
+            const std::size_t base =
+                (static_cast<std::size_t>(row) * columns + static_cast<std::size_t>(col)) * token_domain;
+            logits[base + 0] = 6.0f;
+            logits[base + 1] = 5.0f;
+            logits[base + 2] = 4.0f;
+        }
+    }
+    // Row 0 / column 0 carries the non-finite sentinel at an index that is not a multiple of the
+    // block width, so only a genuinely cooperative reduction finds it.
+    logits[0 * token_domain + 37] = std::numeric_limits<float>::infinity();
+    round_to_bf16(logits);
+    // drafts is [K, batch], so the batch row is the fast axis.
+    const std::vector<std::int32_t> drafts{0, 1, 0, 1};
+
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 20;
+    // Below the leader's mass, so the truncated support is one token at p == 1 and acceptance is
+    // deterministic rather than seed-dependent.
+    config.top_p       = 0.5f;
+    config.seed        = 0x5eed1234;
+    std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain) * batch, 0);
+
+    DeviceBuffer d_targets = to_device(std::vector<std::int32_t>(
+        static_cast<std::size_t>(columns) * batch, 0));
+    DeviceBuffer d_logits  = to_device_bf16(logits);
+    DeviceBuffer d_drafts  = to_device(std::vector<std::int32_t>(drafts));
+    DeviceBuffer d_counts  = to_device(token_counts);
+    DeviceBuffer d_extent  = to_device(std::vector<std::int32_t>(batch, k));
+    DeviceBuffer d_length  = to_device(std::vector<std::int32_t>(batch, 500));
+    DeviceBuffer d_anchor  = to_device(std::vector<std::int32_t>(batch, -1));
+    DeviceBuffer d_lic(static_cast<std::size_t>(columns) * batch * sizeof(std::int32_t));
+    DeviceBuffer d_num(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    DeviceBuffer d_acc(static_cast<std::size_t>(batch) * sizeof(std::int32_t));
+    config.token_counts = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config = device_config_batch(config, batch);
+
+    Tensor targets(d_targets.p, DType::I32, {columns, batch});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {token_domain, columns, batch});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor extent(d_extent.p, DType::I32, {batch});
+    Tensor length(d_length.p, DType::I32, {batch});
+    Tensor anchor(d_anchor.p, DType::I32, {batch});
+    Tensor licensed(d_lic.p, DType::I32, {columns, batch});
+    Tensor num_sampled(d_num.p, DType::I32, {batch});
+    Tensor accepted(d_acc.p, DType::I32, {batch});
+    DeviceBuffer d_probe(static_cast<std::size_t>(6 * k + 2) * batch * sizeof(float));
+    Tensor probe(d_probe.p, DType::FP32, {6 * k + 2, batch});
+
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, batch);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ops::speculative_accept_greedy_drafts_with_probe(
+        targets, logits_tensor, draft_tensor, extent, length, anchor, licensed, num_sampled,
+        accepted, probe, token_domain, static_cast<const ops::SamplingConfig*>(d_config.p),
+        workspace, nullptr);
+    cuda_synchronize();
+
+    const std::vector<float> values =
+        from_device<float>(d_probe, static_cast<std::size_t>(6 * k + 2) * batch);
+    const std::vector<std::int32_t> acc = from_device<std::int32_t>(d_acc.p, batch);
+    // Probe layout is [6*K+2, batch]: cell (column, stat, row) -> (6*column + stat) * batch + row.
+    const auto cell = [&](int col, int stat, int row) {
+        return values[static_cast<std::size_t>(6 * col + stat) * batch + static_cast<std::size_t>(row)];
+    };
+
+    // Row 0, column 0 is the non-finite column: the contract reports -1 for both statistics, and it
+    // must do so whether or not the column reached its accept decision.
+    if (cell(0, 0, 0) == 1.0f) {
+        failures += verify_f32("probe nonfinite collision row 0", {cell(0, 1, 0)}, {-1.0f});
+        failures += verify_f32("probe nonfinite rank row 0", {cell(0, 2, 0)}, {-1.0f});
+        failures += verify_f32("probe nonfinite pd row 0", {cell(0, 3, 0)}, {0.0f});
+    } else {
+        std::cerr << "probe nonfinite: column 0 row 0 was never reached\n";
+        ++failures;
+    }
+    // Row 1 is all-finite, so its own column 0 must report a real collision probability. A writer
+    // that confused the row axis with the cell axis would overwrite one of these with the other.
+    if (cell(0, 0, 1) == 1.0f) {
+        const float collision = cell(0, 1, 1);
+        if (!(collision > 0.0f && collision <= 1.0f)) {
+            std::cerr << "probe batch stride: row 1 collision out of range: " << collision << '\n';
+            ++failures;
+        }
+    } else {
+        std::cerr << "probe batch stride: column 0 row 1 was never reached\n";
+        ++failures;
+    }
+    for (int row = 0; row < batch; ++row) {
+        failures += verify_i32(("probe batch row summary offered row " + std::to_string(row)).c_str(),
+                               {static_cast<std::int32_t>(cell(k, 0, row))}, {k});
+    }
+
+    // Greedy row: cells 1..3 collapse to -1 because no truncated support is built.
+    {
+        ops::SamplingConfig greedy = config;
+        greedy.temperature         = 0.0f;
+        greedy.token_counts        = static_cast<std::int32_t*>(d_counts.p);
+        DeviceBuffer d_greedy_cfg  = device_config_batch(greedy, batch);
+        DeviceBuffer d_g_extent    = to_device(std::vector<std::int32_t>(batch, k));
+        Tensor g_extent(d_g_extent.p, DType::I32, {batch});
+        ops::speculative_accept_greedy_drafts_with_probe(
+            targets, logits_tensor, draft_tensor, g_extent, length, anchor, licensed, num_sampled,
+            accepted, probe, token_domain, static_cast<const ops::SamplingConfig*>(d_greedy_cfg.p),
+            workspace, nullptr);
+        cuda_synchronize();
+        const std::vector<float> g =
+            from_device<float>(d_probe, static_cast<std::size_t>(6 * k + 2) * batch);
+        const auto gcell = [&](int col, int stat, int row) {
+            return g[static_cast<std::size_t>(6 * col + stat) * batch +
+                     static_cast<std::size_t>(row)];
+        };
+        for (int col = 0; col < k; ++col) {
+            if (gcell(col, 0, 1) != 1.0f) { continue; } // row 1 is finite; row 0 keeps its sentinel
+            failures += verify_f32(("probe greedy collision col " + std::to_string(col)).c_str(),
+                                   {gcell(col, 1, 1)}, {-1.0f});
+            failures += verify_f32(("probe greedy pd col " + std::to_string(col)).c_str(),
+                                   {gcell(col, 3, 1)}, {-1.0f});
+        }
+    }
+    return failures;
+}
+
+// The bonus column. When every draft accepts, the loop runs one final column (i == extent) to sample
+// the bonus token. That column is not a draft, and it has no cell slot of its own: the k column slots
+// occupy rows 0..6K-1 and the row summary occupies 6K and 6K+1, so statistics for column K would
+// land on the summary and then run four floats past the end of a [6*K+2, batch] matrix. The probe
+// buffer is guarded so that out-of-bounds store is observable rather than silently adjacent.
+int probe_bonus_column_case() {
+    constexpr int token_domain = 64;
+    constexpr int k            = 2;
+    const int columns          = k + 1;
+    std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns, -20.0f);
+    for (int col = 0; col < columns; ++col) {
+        const std::size_t base = static_cast<std::size_t>(col) * token_domain;
+        logits[base + 0]       = 6.0f;
+        logits[base + 1]       = 5.0f;
+        logits[base + 2]       = 4.0f;
+    }
+    round_to_bf16(logits);
+    // Both drafts are the leader, and top_p below the leader's mass leaves a one-token support at
+    // p == 1, so every draft accepts and the loop reaches i == extent for the bonus token.
+    const std::vector<std::int32_t> drafts{0, 0};
+    ops::SamplingConfig config{};
+    config.temperature = 1.0f;
+    config.top_k       = 20;
+    config.top_p       = 0.5f;
+    config.seed        = 777;
+    std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain), 0);
+
+    DeviceBuffer d_targets = to_device(std::vector<std::int32_t>(columns, 0));
+    DeviceBuffer d_logits  = to_device_bf16(logits);
+    DeviceBuffer d_drafts  = to_device(std::vector<std::int32_t>(drafts));
+    DeviceBuffer d_counts  = to_device(token_counts);
+    DeviceBuffer d_extent  = to_device<std::int32_t>({k});
+    DeviceBuffer d_length  = to_device<std::int32_t>({1});
+    DeviceBuffer d_anchor  = to_device<std::int32_t>({-1});
+    DeviceBuffer d_lic(static_cast<std::size_t>(columns) * sizeof(std::int32_t));
+    DeviceBuffer d_num(sizeof(std::int32_t));
+    DeviceBuffer d_acc(sizeof(std::int32_t));
+    config.token_counts = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config = device_config(config);
+
+    Tensor targets(d_targets.p, DType::I32, {columns});
+    Tensor logits_tensor(d_logits.p, DType::BF16, {token_domain, columns});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+    Tensor extent(d_extent.p, DType::I32, {1});
+    Tensor length(d_length.p, DType::I32, {1});
+    Tensor anchor(d_anchor.p, DType::I32, {1});
+    Tensor licensed(d_lic.p, DType::I32, {columns});
+    Tensor num_sampled(d_num.p, DType::I32, {1});
+    Tensor accepted(d_acc.p, DType::I32, {1});
+    GuardedDeviceBuffer d_probe(static_cast<std::size_t>(6 * k + 2) * sizeof(float));
+    Tensor probe(d_probe.data(), DType::FP32, {6 * k + 2, 1});
+
+    const std::size_t workspace_bytes =
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ops::speculative_accept_greedy_drafts_with_probe(
+        targets, logits_tensor, draft_tensor, extent, length, anchor, licensed, num_sampled,
+        accepted, probe, token_domain, static_cast<const ops::SamplingConfig*>(d_config.p),
+        workspace, nullptr);
+    cuda_synchronize();
+
+    const std::vector<float> values =
+        from_device<float>(d_probe.data(), static_cast<std::size_t>(6 * k + 2));
+    int failures = d_probe.verify_guards("probe bonus column: matrix not written past its end");
+    // Every draft accepted, so column K was reached and the round's counters must still be exact.
+    failures += verify_i32("probe bonus column accepted count", from_device<std::int32_t>(d_acc.p, 1),
+                           {k});
+    failures += verify_i32("probe bonus column leaves the row summary intact",
+                           {static_cast<std::int32_t>(values[6 * k + 0]),
+                            static_cast<std::int32_t>(values[6 * k + 1])},
+                           {k, k});
+    // Column K-1 must stay a real, reached, accepted draft: the suppressed column is K, not K-1.
+    failures += verify_i32("probe bonus column: last draft still reached",
+                           {static_cast<std::int32_t>(values[6 * (k - 1) + 0]),
+                            static_cast<std::int32_t>(values[6 * (k - 1) + 4]),
+                            static_cast<std::int32_t>(values[6 * (k - 1) + 5])},
+                           {1, 1, 1});
+    return failures;
+}
+
 // A draft outside the truncated support must report rank -1 and pd 0, which is the structural
 // rejection case the probe exists to expose.
 int probe_absent_draft_case() {
@@ -942,6 +1168,8 @@ int main() {
     failures += probe_matches_oracle_case(248077, 3, "production-domain");
     failures += probe_absent_draft_case();
     failures += probe_shape_validation_case();
+    failures += probe_nonfinite_and_batch_case();
+    failures += probe_bonus_column_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);
     failures += select_hidden_case(2048, 16, 7);

@@ -135,7 +135,14 @@ __device__ __forceinline__ void speculative_probe_write_column(float* probe,
     // Cell 0 (the reached marker) is written by speculative_probe_commit_columns, not here: the
     // multiblock route builds every offered column's support, so a writer that marked reachability
     // would claim columns the accept loop never verified.
-    float* cell = speculative_probe_column(probe, row, stride, column);
+    //
+    // The accept loop runs columns 0..extent, so column `extent` is offered whether or not it is a
+    // draft. It has no draft identity -- rank and p(draft) are meaningless -- and no cell slot
+    // either: the k column slots occupy rows 0..6K-1 while the row summary sits at rows 6K and
+    // 6K+1, and the column's remaining cells would run past the end of a [6*K+2, batch] matrix.
+    // Return before forming the cell pointer so nothing at all is written for it.
+    if (column >= k) { return; }
+    float* cell       = speculative_probe_column(probe, row, stride, column);
     if (support_idx == nullptr) {
         cell[1 * stride] = -1.0f;
         cell[2 * stride] = -1.0f;

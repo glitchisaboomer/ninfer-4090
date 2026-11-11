@@ -119,8 +119,12 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *                                              carries the outside-the-support signal
  *     probe[6*i+4,b] = drafted_i               1
  *     probe[6*i+5,b] = accepted_i              1 when this column accepted its draft
- *   Trailing columns -- and the one column the accept loop offered but never verified -- carry
- *   zeros in all six cells, so a reader must gate any column aggregate on cell 0.
+ *
+ *   Column `extent` -- the position the round may sample instead of a draft -- is not a draft, so it
+ *   has no rank or p(drafts). Its cells are published as -1 in cells 1..3 (0 when the row is greedy)
+ *   and 0 in cells 0, 4 and 5, exactly like an unreached column. There is no cell slot beyond it:
+ *   the k column slots occupy rows 0..(6*K)-1 and the row summary occupies rows 6*K and 6*K+1, so a
+ *   reader must iterate columns 0..K-1 and not derive the column count from the row count.
  *
  *   On a greedy row cells 1, 2 and 3 are all -1 rather than the p/r/pd values above, because that
  *   branch never builds a truncated support. Cell 3 is therefore the one cell whose meaning depends
