@@ -114,10 +114,17 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *                                              logits of column i contain a non-finite value
  *     probe[6*i+2,b] = rank_i                  index j of drafts[i] in the descending support
  *                                              cand_idx[j], or -1 when drafts[i] is outside it
- *     probe[6*i+3,b] = pd_i                    p(drafts[i]), or 0 when drafts[i] is outside it
+ *     probe[6*i+3,b] = pd_i                    p(drafts[i]) as a probability, so 0 when drafts[i]
+ *                                              is outside the support. Never -1: rank_i already
+ *                                              carries the outside-the-support signal
  *     probe[6*i+4,b] = drafted_i               1
  *     probe[6*i+5,b] = accepted_i              1 when this column accepted its draft
- *   Trailing columns carry zeros.
+ *   Trailing columns -- and the one column the accept loop offered but never verified -- carry
+ *   zeros in all six cells, so a reader must gate any column aggregate on cell 0.
+ *
+ *   On a greedy row cells 1, 2 and 3 are all -1 rather than the p/r/pd values above, because that
+ *   branch never builds a truncated support. Cell 3 is therefore the one cell whose meaning depends
+ *   on the row's temperature, and -1 is what distinguishes it from a real p(drafts[i]).
  *
  *   probe[6*K+0,b] = extent_b    drafts offered this round (== the round's `drafted_tokens`)
  *   probe[6*K+1,b] = A_b         drafts accepted this round (== the round's `accepted_tokens`)
