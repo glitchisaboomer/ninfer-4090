@@ -482,7 +482,8 @@ feat(targets): add SenseNova one-visit layer execution
 
 ### E4. Implement eager full prefill
 
-**Status:** not started.
+**Status:** complete in the eager greedy path. Fixed-prompt Hugging Face numerical fixtures and MTP
+are outside this stage.
 
 **Files**
 
@@ -494,19 +495,19 @@ feat(targets): add SenseNova one-visit layer execution
 
 **Work**
 
-- [ ] Embed prompt tokens with W8 `D=4096` embedding.
-- [ ] Execute exactly the 56 visits in `LoopPlan` order for every prefill chunk.
-- [ ] Apply final RMSNorm, Q6 LM head over 248320 rows, and sample/argmax within token domain
+- [x] Embed prompt tokens with W8 `D=4096` embedding.
+- [x] Execute exactly the 56 visits in `LoopPlan` order for every prefill chunk.
+- [x] Apply final RMSNorm, Q6 LM head over 248320 rows, and sample/argmax within token domain
       `248077`.
-- [ ] Handle EOS ids `(248044, 248046)` through the existing output session contract.
-- [ ] Replace `start_prefill_lane` placeholder token `0` with the sampled first token.
+- [x] Handle EOS ids `(248044, 248046)` through the existing output session contract.
+- [x] Replace `start_prefill_lane` placeholder token `0` with the sampled first token.
 - [ ] Support INT8 and BF16 KV modes according to the selected execution plan.
 
 **Tests**
 
-- [ ] Fixed prompt prefill output stable across reruns.
+- [x] Fixed prompt prefill output stable across reruns.
 - [ ] First-token logits compare against a Hugging Face reference fixture.
-- [ ] Prompt positions and per-visit state advance exactly once per prompt token.
+- [x] Prompt positions and per-visit state advance exactly once per prompt token.
 
 **Proposed commit**
 
@@ -516,7 +517,7 @@ feat(targets): add SenseNova eager prefill execution
 
 ### E5. Implement eager ordinary decode
 
-**Status:** not started.
+**Status:** complete in the eager greedy path. CUDA Graph replay and prefix reuse remain in E6.
 
 **Files**
 
@@ -527,17 +528,19 @@ feat(targets): add SenseNova eager prefill execution
 
 **Work**
 
-- [ ] Decode one token by executing all 56 visits once from the committed frontier.
-- [ ] Advance KV/GDN/mHC state only after sampling and acceptance.
-- [ ] Remove all placeholder `token 0` generation paths from `decode_batch`.
-- [ ] Wire generation timings and logprobs from real sampled logits.
-- [ ] Preserve batch lane identity and pending/active/retained lifecycle behavior.
+- [x] Decode one token by executing all 56 visits once from the committed frontier.
+- [x] Advance KV/GDN/mHC state only after sampling and acceptance.
+- [x] Remove all placeholder `token 0` generation paths from `decode_batch`.
+- [x] Wire generation timings and logprobs from real sampled logits.
+- [x] Preserve batch lane identity and pending/active/retained lifecycle behavior.
 
 **Tests**
 
 - [ ] Ordinary decode of a fixed prefix matches Hugging Face generated ids for greedy settings.
-- [ ] Decode advances positions and all 56 visit states once per token.
-- [ ] EOS handling for `(248044, 248046)`.
+- [x] Decode advances positions and all 56 visit states once per token.
+- [x] EOS handling for `(248044, 248046)`.
+
+**Evidence:** `./build-sandbox.sh --ctest '^ninfer_sensenova_loop_9b_.*_test$'` passed 7/7.
 
 **Proposed commit**
 
@@ -696,14 +699,14 @@ perf(targets): tune SenseNova prefill and MTP paths
 
 Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
-E0-E3 are complete. The next action is **Stage E4**:
+E0-E5 are complete for the eager greedy text path. The next action is **Stage E6**:
 
-1. Wire W8 embedding `D=4096`, 56-visit eager prefill paths, final RMSNorm, Q6 LM head `248320`,
-   and sampling within token domain `248077`.
-2. Remove the placeholder first-token path from `start_prefill_lane`.
-3. Add full-prefill output tests with fixed prompts before enabling E5 decode.
+1. Capture decode CUDA Graphs only after all state pointers are stable.
+2. Implement graph replay equality tests against eager decode.
+3. Implement prefix reuse with looped visit identities and all state domains included.
 
-Do not begin E5 until E4 produces a real first token.
+Before Stage E7, add fixed-prompt Hugging Face reference fixtures for first-token logits and greedy
+generated ids.
 
 ### Stage E prerequisite committed during implementation
 
