@@ -201,6 +201,11 @@ struct Program::Impl {
     std::array<LaneIo, kMaximumConcurrency> lane_io{};
     std::array<DecodeGraphRunner, kMaximumConcurrency> decode_graphs;
 
+    // Device-resident uniform 0.5 mix for the mHC leave reduction at T=1. Preparing it once
+    // keeps a capturable decode pass free of the pageable host fill the staged merge needs.
+    DeviceBuffer mhc_half_mix;
+    Tensor mhc_half_mix_tensor;
+
     // Per-lane host-side execution results. Spans handed to the engine point at these arrays, which
     // are stable for the Program lifetime.
     struct LaneExecution {
@@ -337,6 +342,14 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
             io.logprob   = Tensor(slot + 12, DType::FP32, {1});
             io.margin    = Tensor(slot + 16, DType::FP32, {1});
         }
+
+        impl->mhc_half_mix =
+            DeviceBuffer(static_cast<std::size_t>(MhcConfig::streams) * MhcConfig::streams *
+                         sizeof(float));
+        const float half_mix[4] = {0.5F, 0.5F, 0.5F, 0.5F};
+        impl->mhc_half_mix.copy_from_host(half_mix, sizeof(half_mix));
+        impl->mhc_half_mix_tensor = Tensor(impl->mhc_half_mix.p, DType::FP32,
+                                          {MhcConfig::streams, MhcConfig::streams, 1});
     }
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
@@ -512,7 +525,8 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
                                    impl_->stream));
 
         const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
-                                             impl_->gdn_conv, impl_->mhc_router};
+                                             impl_->gdn_conv, impl_->mhc_router,
+                                             impl_->mhc_half_mix_tensor};
         TextExecutionContext context(*impl_->model, impl_->stream,
                                      static_cast<std::byte*>(impl_->state_images.p),
                                      impl_->kv_capacity, workspace, bindings);
@@ -593,7 +607,8 @@ void Program::decode_one(std::uint32_t lane) {
                                cudaMemcpyHostToDevice, impl_->stream));
 
     const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
-                                         impl_->gdn_conv, impl_->mhc_router};
+                                         impl_->gdn_conv, impl_->mhc_router,
+                                         impl_->mhc_half_mix_tensor};
     // The captured body must be valid at every later frontier, so it runs with the envelope of the
     // declared KV capacity instead of this step's frontier. The causal mask itself is still read
     // from the uploaded position, and the decode workspace is sized for exactly this envelope.

@@ -367,6 +367,7 @@ void TextExecutionContext::forward_visits(Tensor& hidden, const Tensor& position
             request.mhc_attn_bias       = &weights.mhc_attn.bias;
             request.mhc_ffn_weight      = &bindings_.mhc_router_weight[2 * profile.physical_layer + 1];
             request.mhc_ffn_bias        = &weights.mhc_ffn.bias;
+            request.mhc_half_mix = tokens == 1 ? &bindings_.mhc_half_mix : nullptr;
         }
 
         executor_(request);

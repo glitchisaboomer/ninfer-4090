@@ -56,23 +56,4 @@ void mhc_route(const Tensor& residual, const Tensor& weight, const Tensor& bias,
 void mhc_merge(const Tensor& residual, const Tensor& branch, const Tensor& post,
                const Tensor& mix, int streams, Tensor& out, cudaStream_t stream);
 
-/**
- * Reduces two mHC residual streams into one by their arithmetic mean.
- *
- * residual is BF16 [D,2,T] with unit feature stride; nb[1] may include padding between streams
- * and nb[2] may include padding between tokens. out is contiguous BF16 [D,T]. Inputs and out must
- * not overlap.
- *
- * The oracle represents the BF16 inputs exactly and computes, in FP64:
- *
- *   out[d,t] = BF16((x[0,d,t] + x[1,d,t]) / 2)
- *
- * The kernel evaluates `0.5f * x0 + 0.5f * x1` in FP32 with a single round-to-nearest-even BF16
- * conversion. That is the same expression the mHC leave boundary previously obtained from an
- * identity merge (zero branch, zero post, uniform 0.5 mix), so this Op is bit-identical to it
- * while removing a pageable host-to-device fill from the visit loop. A host round-trip there
- * makes the whole 56-visit pass illegal to capture as a CUDA Graph.
- */
-void mhc_reduce(const Tensor& residual, int streams, Tensor& out, cudaStream_t stream);
-
 } // namespace ninfer::ops

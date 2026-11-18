@@ -185,6 +185,11 @@ struct LayerVisitRequest {
     const Tensor* mhc_ffn_weight  = nullptr;
     const Tensor* mhc_ffn_bias    = nullptr;
 
+    // Device-resident uniform 0.5 mix for the leave reduction, contiguous FP32 [2,2,T]. When
+    // bound it replaces the executor's host fill, keeping the visit loop free of host copies so
+    // a one-token pass is stream-capture legal. Null means the executor stages the mix itself.
+    const Tensor* mhc_half_mix = nullptr;
+
     // mHC state slot: stable BF16 [8192] region (StateLayout::mhc_state_bytes_per_slot()).
     // After an mHC visit it is published with the flattened two-stream state of the final
     // token of this visit (after the last router merge, before the leave reduction).
@@ -233,8 +238,8 @@ void mhc_enter_streams(const Tensor& hidden, Tensor& out, cudaStream_t stream);
 // dtype, computed by mhc_merge with the exact half-identity mix and zero post/branch (0.0 and
 // 0.5 are exact in BF16, so the result is bit-identical to the reference mean). This is the
 // `leave` reduction at the last mHC layer.
-[[nodiscard]] Tensor mhc_reduce_streams(const Tensor& merged, WorkspaceArena& workspace,
-                                        cudaStream_t stream);
+[[nodiscard]] Tensor mhc_reduce_streams(const Tensor& merged, const Tensor* device_mix,
+                                        WorkspaceArena& workspace, cudaStream_t stream);
 
 // mhc_publish_state: copies the flattened [8192] stream state of the final token of
 // `merged_streams` ([4096,2,T] contiguous) into the visit's mHC state slot.

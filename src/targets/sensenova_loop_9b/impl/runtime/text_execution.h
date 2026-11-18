@@ -54,6 +54,11 @@ struct TextExecutionBindings {
     Tensor kv_table_rows;
     std::span<const Tensor> gdn_convolution;
     std::span<const Tensor> mhc_router_weight;
+
+    // Device-resident uniform 0.5 mix [2,2,1] for the mHC leave reduction. Binding it removes
+    // the executor's host fill from a one-token visit, which is what makes the decode pass stream
+    // capture legal. Prefill (wider than one token) stages the mix in the executor instead.
+    Tensor mhc_half_mix;
 };
 
 // One-visit executor. The real path is execute_layer_visit; tests inject a

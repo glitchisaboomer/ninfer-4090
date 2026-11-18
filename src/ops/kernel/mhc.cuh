@@ -131,28 +131,6 @@ __launch_bounds__(Block) __global__
     }
 }
 
-// Mean of the two residual streams. The FP32 expression is deliberately `0.5f * x0 + 0.5f * x1`
-// followed by one BF16 rounding: that is exactly what the former identity merge evaluated, so the
-// dedicated reduction is bit-identical to it while keeping the visit loop free of host copies.
-template <int Block>
-__launch_bounds__(Block) __global__
-    void mhc_reduce_kernel(const char* residual, std::int64_t residual_stream_stride,
-                           std::int64_t residual_token_stride, int d, __nv_bfloat16* out) {
-    const int token = static_cast<int>(blockIdx.x);
-    const int tid   = static_cast<int>(threadIdx.x);
-    const std::int64_t token_offset = static_cast<std::int64_t>(token);
-    const char* base = residual + token_offset * residual_token_stride;
-    for (int column = tid; column < d; column += Block) {
-        const auto* x0 = reinterpret_cast<const __nv_bfloat16*>(
-            base + static_cast<std::int64_t>(column) * sizeof(__nv_bfloat16));
-        const auto* x1 = reinterpret_cast<const __nv_bfloat16*>(
-            base + residual_stream_stride +
-            static_cast<std::int64_t>(column) * sizeof(__nv_bfloat16));
-        const float value = 0.5f * __bfloat162float(*x0) + 0.5f * __bfloat162float(*x1);
-        out[token_offset * d + column] = __float2bfloat16_rn(value);
-    }
-}
-
 template <int Block>
 __launch_bounds__(Block) __global__
     void mhc_merge_kernel(const char* residual, std::int64_t residual_stream_stride,

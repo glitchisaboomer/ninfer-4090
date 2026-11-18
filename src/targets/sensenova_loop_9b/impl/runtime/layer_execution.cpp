@@ -685,7 +685,8 @@ void execute_layer_visit(const LayerVisitRequest& request) {
 
     if (profile.is_mhc) {
         if (profile.mhc_boundary == MhcBoundary::Leave) {
-            Tensor reduced = mhc_reduce_streams(final_streams, arena, stream);
+            Tensor reduced =
+                mhc_reduce_streams(final_streams, request.mhc_half_mix, arena, stream);
             const cudaError_t status =
                 cudaMemcpyAsync(request.hidden_out->data, reduced.data, reduced.bytes(),
                                 cudaMemcpyDeviceToDevice, stream);
@@ -744,7 +745,8 @@ Tensor mhc_flatten_streams(const Tensor& merged) {
     return merged.view({MhcConfig::input_width, merged.ne[2]});
 }
 
-Tensor mhc_reduce_streams(const Tensor& merged, WorkspaceArena& workspace, cudaStream_t stream) {
+Tensor mhc_reduce_streams(const Tensor& merged, const Tensor* device_mix,
+                          WorkspaceArena& workspace, cudaStream_t stream) {
     require(merged.dtype == DType::BF16 && merged.data != nullptr,
             "mhc reduce input must be BF16");
     require(merged.ne[0] == TextConfig::hidden && merged.ne[1] == MhcConfig::streams &&
@@ -752,12 +754,43 @@ Tensor mhc_reduce_streams(const Tensor& merged, WorkspaceArena& workspace, cudaS
             "mhc reduce input must be [4096,2,T]");
     const std::int32_t T = merged.ne[2];
 
-    // A dedicated device reduction replaces the former identity merge (zero branch, zero post,
-    // uniform 0.5 mix). Besides deleting the fake merge, this removes the pageable host-to-device
-    // fill from the 56-visit loop: a host copy there makes the whole pass illegal to capture as a
-    // CUDA Graph. The Op is bit-identical to the merge it replaces (same FP32 expression).
+    // The leave reduction is an identity merge: zero branch, zero post, and a uniform 0.5 mix.
+    // When the caller binds a device-resident mix this stays free of host copies, which is what
+    // makes a one-token pass capturable; prefill (not captured) keeps the staged fill.
+    Tensor branch = workspace.alloc(DType::BF16, {TextConfig::hidden, T});
+    Tensor post   = workspace.alloc(DType::FP32, {MhcConfig::streams, T});
+    Tensor mix    = workspace.alloc(DType::FP32, {MhcConfig::streams, MhcConfig::streams, T});
+    Tensor out    = workspace.alloc(DType::BF16, {TextConfig::hidden, MhcConfig::streams, T});
     Tensor reduced = workspace.alloc(DType::BF16, {TextConfig::hidden, T});
-    ops::mhc_reduce(merged, MhcConfig::streams, reduced, stream);
+    const cudaError_t zero = cudaMemsetAsync(branch.data, 0, branch.bytes(), stream);
+    require(zero == cudaSuccess, "mhc reduce zero-fill failed");
+    const cudaError_t zero_post = cudaMemsetAsync(post.data, 0, post.bytes(), stream);
+    require(zero_post == cudaSuccess, "mhc reduce zero-fill failed");
+
+    const bool device_mix_bound =
+        device_mix != nullptr && device_mix->data != nullptr &&
+        device_mix->dtype == DType::FP32 && device_mix->is_contiguous() &&
+        device_mix->ne[0] == MhcConfig::streams && device_mix->ne[1] == MhcConfig::streams &&
+        device_mix->ne[2] == T;
+    if (device_mix_bound) {
+        mix = *device_mix;
+    } else {
+        std::vector<float> half(static_cast<std::size_t>(MhcConfig::streams) *
+                                    MhcConfig::streams * static_cast<std::size_t>(T),
+                                0.5F);
+        const cudaError_t fill = cudaMemcpyAsync(mix.data, half.data(),
+                                                 half.size() * sizeof(float),
+                                                 cudaMemcpyHostToDevice, stream);
+        require(fill == cudaSuccess, "mhc reduce mix fill failed");
+    }
+
+    ops::mhc_merge(merged, branch, post, mix, MhcConfig::streams, out, stream);
+    const std::size_t stream_bytes = static_cast<std::size_t>(TextConfig::hidden) *
+                                     static_cast<std::size_t>(T) * dtype_size(DType::BF16);
+    const cudaError_t status =
+        cudaMemcpyAsync(reduced.data, static_cast<const std::uint8_t*>(out.data) + stream_bytes,
+                        stream_bytes, cudaMemcpyDeviceToDevice, stream);
+    require(status == cudaSuccess, "mhc reduce copy failed");
     return reduced;
 }
 

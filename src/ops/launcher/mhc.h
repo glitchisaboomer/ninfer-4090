@@ -15,6 +15,4 @@ void mhc_route_launch(const Tensor& residual, const Tensor& weight, const Tensor
 void mhc_merge_launch(const Tensor& residual, const Tensor& branch, const Tensor& post,
                       const Tensor& mix, int streams, Tensor& out, cudaStream_t stream);
 
-void mhc_reduce_launch(const Tensor& residual, int streams, Tensor& out, cudaStream_t stream);
-
 } // namespace ninfer::ops::detail
