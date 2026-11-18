@@ -8,6 +8,15 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("q6 linear: unsupported shape or T"); }
 
     switch (k) {
+    case 4096:
+        if (n == 248320) {
+            if (t <= 8) { return launch_q6_simt_r8_c4; }
+            if (t <= 16) { return launch_q6_mma_r64_c16_k128; }
+            if (t <= 32) { return launch_q6_mma_r64_c32_k128; }
+            if (t <= 64) { return launch_q6_mma_r64_c64_k128; }
+            return launch_q6_mma_r64_c128;
+        }
+        break;
     case 5120:
         if (n == 248320) {
             if (t <= 4) { return launch_q6_simt_r8_c4; }

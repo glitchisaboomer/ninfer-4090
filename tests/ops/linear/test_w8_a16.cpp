@@ -15,6 +15,23 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int w8_a16_conformance() {
     int failures = 0;
 
+    constexpr std::array kSenseNovaProfile{
+        a16(1), a16(7), a16(64), a16(65),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {10240, 4096, 401U, Comparison::Sampled, false, kSenseNovaProfile});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {8192, 4096, 403U, Comparison::Sampled, false, kSenseNovaProfile});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {4096, 4096, 407U, Comparison::Sampled, false, kSenseNovaProfile});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {1024, 4096, 409U, Comparison::Sampled, false, kSenseNovaProfile});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {24576, 4096, 419U, Comparison::Sampled, false, kSenseNovaProfile});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {12288, 4096, 421U, Comparison::Sampled, false, kSenseNovaProfile});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {4096, 12288, 431U, Comparison::Sampled, false, kSenseNovaProfile});
     constexpr std::array kN248320K5120{
         a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
         a16(34), a16(48), a16(49), a16(64), a16(65),

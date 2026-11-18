@@ -15,6 +15,9 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int q6_a16_conformance() {
     int failures = 0;
 
+    constexpr std::array kSenseNovaHead{a16(1), a16(7), a16(65)};
+    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6g64_f16s_weight,
+                          {248320, 4096, 197U, Comparison::Sampled, false, kSenseNovaHead});
     constexpr std::array kN248320K5120{
         a16(1),  a16(4),  a16(5),  a16(6),  a16(7),  a16(8),  a16(9),  a16(16), a16(17), a16(18),
         a16(24), a16(25), a16(26), a16(32), a16(33), a16(34), a16(48), a16(49), a16(50), a16(128),

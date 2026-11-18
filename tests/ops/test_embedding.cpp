@@ -24,6 +24,7 @@ constexpr std::int32_t kMaskToken         = 248077;
 constexpr std::int32_t kQ6D               = 5120;
 constexpr std::int32_t kW8VisionD         = 2048;
 constexpr std::int32_t kW8TextD           = 5120;
+constexpr std::int32_t kW8SenseNovaD      = 4096;
 constexpr std::int32_t kDenseRows         = 2304;
 constexpr std::int32_t kDenseD            = 1152;
 constexpr std::int32_t kQ6Group           = 64;
@@ -425,7 +426,7 @@ int test_q6() {
 
 int test_w8() {
     int failures = 0;
-    for (const std::int32_t d : {kW8VisionD, kW8TextD}) {
+    for (const std::int32_t d : {kW8VisionD, kW8TextD, kW8SenseNovaD}) {
         W8Table table(d);
         for (const std::size_t t : {1u, 6u, 16u, 1024u}) {
             const std::string label = "embedding W8 [248320," + std::to_string(d) +
