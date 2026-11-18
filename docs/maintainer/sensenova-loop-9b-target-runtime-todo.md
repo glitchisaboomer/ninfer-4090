@@ -321,7 +321,7 @@ text path and must never be mistaken for one.
 
 ### E0. Correct the execution-state contract before allocating anything
 
-**Status:** not started.
+**Status:** complete.
 
 The current `StateLayout` byte formula undercounts GDN state. The recurrent state is
 `FP32 [128,128,value_heads]` per logical visit, not `4 * value_dim` floats. For SenseNova
@@ -338,16 +338,19 @@ reservation must be corrected before device buffers are created.
 
 **Work**
 
-- [ ] Correct GDN recurrent bytes to `128 * 128 * value_heads * sizeof(float)`.
-- [ ] Correct GDN convolution bytes to `conv_channels * (kernel - 1) * sizeof(uint16_t)`.
-- [ ] Keep the 42 GDN visit identities and 14 full-attention KV visit identities explicit.
-- [ ] Assert reservation changes against all supported KV modes and max concurrency.
-- [ ] Do not allocate device state until this accounting test passes.
+- [x] Correct GDN recurrent bytes to `128 * 128 * value_heads * sizeof(float)`.
+- [x] Correct GDN convolution bytes to `conv_channels * (kernel - 1) * sizeof(uint16_t)`.
+- [x] Keep the 42 GDN visit identities and 14 full-attention KV visit identities explicit.
+- [x] Assert reservation changes against all supported KV modes and max concurrency.
+- [x] Do not allocate device state until this accounting test passes.
 
 **Tests**
 
-- [ ] State-layout unit test checks exact per-slot bytes and total fixed state bytes.
-- [ ] Sequence-plan test checks reservation includes corrected GDN state.
+- [x] State-layout unit test checks exact per-slot bytes and total fixed state bytes.
+- [x] Sequence-plan test checks reservation includes corrected GDN state.
+
+**Evidence:** `./build-sandbox.sh --ctest '^ninfer_sensenova_loop_9b_(loop_plan|sequence_plan)_test$'`
+passed 2/2.
 
 **Proposed commit**
 
@@ -677,14 +680,16 @@ perf(targets): tune SenseNova prefill and MTP paths
 
 Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
-1. Correct the GDN recurrent/convolution state byte accounting in `state_layout.h`.
-2. Update sequence reservation tests for the corrected state size.
-3. Build only the affected SenseNova tests with `./build-sandbox.sh`.
-4. Commit as `fix(targets): correct SenseNova GDN state accounting`.
-5. Mirror the commit on the GitHub lineage with the required author identity.
+E0 is complete. The next action is **Stage E1**:
 
-Do not allocate device-backed state images until E0 passes. Do not begin E2 until E1's exact-shape
-op profiles have numerical oracle tests.
+1. Add the SenseNova W8 GDN input-projection profile `[12288,4096] -> qkv[8192,T], z[4096,T]`.
+2. Add its projection/conv/snapshot form against an independent FP64 oracle.
+3. Add SenseNova W8 SwiGLU `[24576,4096] -> [12288,T]`.
+4. Keep the Qwen `[12288,2048]` profiles unchanged.
+5. Build and run the affected op CTests with `./build-sandbox.sh`.
+6. Commit each verified profile separately and mirror on the GitHub lineage.
+
+Do not begin E2 until E1's exact-shape op profiles have numerical oracle tests.
 
 ### Stage E prerequisite committed during implementation
 

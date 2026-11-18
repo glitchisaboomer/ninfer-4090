@@ -124,10 +124,19 @@ void test_state_layout() {
            "text KV uses 14 logical visits");
     expect(sn::StateLayout::total_kv_bytes_per_token(false, false, true) == 15 * bf16_kv,
            "MTP adds one KV domain");
+    constexpr std::size_t gdn_recurrent =
+        128 * 128 * 32 * sizeof(float);
+    constexpr std::size_t gdn_conv = 8192 * 3 * sizeof(std::uint16_t);
+    static_assert(sn::StateLayout::gdn_recurrent_bytes_per_slot() == gdn_recurrent);
+    static_assert(sn::StateLayout::gdn_conv_bytes_per_slot() == gdn_conv);
+    static_assert(sn::StateLayout::gdn_state_bytes_per_slot() == gdn_recurrent + gdn_conv);
     expect(sn::StateLayout::total_fixed_state_bytes() ==
                42 * sn::StateLayout::gdn_state_bytes_per_slot() +
                    48 * sn::StateLayout::mhc_state_bytes_per_slot(),
            "fixed GDN/mHC state accounting");
+    expect(sn::StateLayout::total_fixed_state_bytes() ==
+               42 * (gdn_recurrent + gdn_conv) + 48 * 8192 * sizeof(std::uint16_t),
+           "GDN recurrent state is a full [128,128,32] FP32 image per visit");
 }
 
 } // namespace

@@ -19,9 +19,14 @@ struct StateLayout {
     static constexpr std::size_t kv_heads       = TextConfig::kv_heads;
     static constexpr std::size_t head_dim       = TextConfig::head_dim;
     static constexpr std::size_t qk_dim         = kv_heads * head_dim;
-    static constexpr std::size_t gdn_key_dim    = TextConfig::key_dim;
-    static constexpr std::size_t gdn_value_dim  = TextConfig::value_dim;
-    static constexpr std::size_t gdn_conv_width = TextConfig::convolution_dim;
+    static constexpr std::size_t gdn_qk_head_dim     = TextConfig::gdn_key_head_dim;
+    static constexpr std::size_t gdn_key_heads      = TextConfig::gdn_key_heads;
+    static constexpr std::size_t gdn_value_heads    = TextConfig::gdn_value_heads;
+    static constexpr std::size_t gdn_value_head_dim = TextConfig::gdn_value_head_dim;
+    static constexpr std::size_t gdn_key_dim        = TextConfig::key_dim;
+    static constexpr std::size_t gdn_value_dim      = TextConfig::value_dim;
+    static constexpr std::size_t gdn_conv_channels  = TextConfig::convolution_dim;
+    static constexpr std::size_t gdn_conv_state_width = TextConfig::gdn_conv_state_width;
     static constexpr std::size_t kv_quant_group       = 64;
     static constexpr std::size_t kv_scale_element_size = sizeof(float);
 
@@ -33,10 +38,16 @@ struct StateLayout {
         return 2 * qk_dim * element_bytes + scale_bytes;
     }
 
+    [[nodiscard]] static constexpr std::size_t gdn_recurrent_bytes_per_slot() noexcept {
+        return gdn_qk_head_dim * gdn_qk_head_dim * gdn_value_heads * sizeof(float);
+    }
+
+    [[nodiscard]] static constexpr std::size_t gdn_conv_bytes_per_slot() noexcept {
+        return gdn_conv_channels * gdn_conv_state_width * sizeof(std::uint16_t);
+    }
+
     [[nodiscard]] static constexpr std::size_t gdn_state_bytes_per_slot() noexcept {
-        constexpr std::size_t recurrent_f32 = 4 * gdn_value_dim * sizeof(float);
-        constexpr std::size_t conv_bf16     = gdn_conv_width * sizeof(std::uint16_t);
-        return recurrent_f32 + conv_bf16;
+        return gdn_recurrent_bytes_per_slot() + gdn_conv_bytes_per_slot();
     }
 
     [[nodiscard]] static constexpr std::size_t mhc_state_bytes_per_slot() noexcept {

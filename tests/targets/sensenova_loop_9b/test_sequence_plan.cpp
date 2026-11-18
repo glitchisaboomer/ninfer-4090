@@ -31,6 +31,19 @@ sn::SequencePlanningInputs inputs() {
     };
 }
 
+void test_state_accounting() {
+    // The recurrent image is [head_dim,head_dim,value_heads] FP32, not one vector per head.
+    constexpr std::size_t recurrent = 128 * 128 * 32 * sizeof(float);
+    constexpr std::size_t conv      = 8192 * 3 * sizeof(std::uint16_t);
+    expect(sn::StateLayout::gdn_recurrent_bytes_per_slot() == recurrent,
+           "GDN recurrent bytes per logical visit");
+    expect(sn::StateLayout::gdn_conv_bytes_per_slot() == conv, "GDN conv bytes per logical visit");
+    expect(sn::StateLayout::gdn_state_bytes_per_slot() == recurrent + conv,
+           "GDN bytes per logical visit");
+    expect(sn::StateLayout::total_fixed_state_bytes() >= 90'000'000,
+           "fixed state reservation must include 42 full GDN state images");
+}
+
 void test_curve() {
     const auto in = inputs();
     const auto curve = sn::make_sequence_capacity_curve(in);
@@ -104,6 +117,7 @@ void test_rejection() {
 } // namespace
 
 int main() {
+    test_state_accounting();
     test_curve();
     test_layout();
     test_rejection();
