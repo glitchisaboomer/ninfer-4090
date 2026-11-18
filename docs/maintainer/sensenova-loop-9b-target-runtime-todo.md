@@ -195,39 +195,45 @@ feat(targets): add SenseNova target shell and bindings
 
 **Files**
 
-- `src/targets/sensenova_loop_9b/export/ninfer/targets/sensenova_loop_9b/runtime.h`
 - `src/targets/sensenova_loop_9b/impl/runtime/layouts.h`
 - `src/targets/sensenova_loop_9b/impl/runtime/layouts.cpp`
-- `src/targets/sensenova_loop_9b/impl/runtime/workspace_recipe.h`
+- `src/targets/sensenova_loop_9b/impl/runtime_stub.{h,cpp}` now consume the real layout
 - `tests/targets/sensenova_loop_9b/test_sequence_plan.cpp`
 - `tests/CMakeLists.txt`
 
 **Work**
 
-- [ ] Define SenseNova `SequencePlan` / `SequencePlanner` matching the engine contract.
-- [ ] Reserve:
+- [x] Define SenseNova `SequencePlan` / `SequencePlanner` matching the engine contract.
+- [x] Reserve:
   - KV page groups for 14 full-attention logical visits;
   - GDN state for 42 logical visits;
   - mHC stream state for 48 logical visits;
   - MTP KV state;
-  - decode graph arenas;
-  - draft/speculative scratch;
+  - decode graph allowance;
+  - scratch workspace;
   - request transient region.
-- [ ] Implement `capacity_curve()` from real per-token and per-visit costs.
-- [ ] Implement `finalize(main_page_groups)`.
-- [ ] Implement `device_reservation_bytes()`, `workspace_capacity_bytes()`, and
+- [x] Implement `capacity_curve()` from real per-token and per-visit costs.
+- [x] Implement `finalize(main_page_groups)`.
+- [x] Implement `device_reservation_bytes()`, `workspace_capacity_bytes()`, and
       `request_transient_capacity_bytes()`.
-- [ ] Ensure no target allocation escapes the planned regions.
+- [x] Ensure no target allocation escapes the planned regions.
 
 **Tests**
 
-- [ ] Reservation equals the declared region sum.
-- [ ] Capacity curve is monotonic and non-zero.
-- [ ] Planner rejects zero/invalid capacity inputs.
-- [ ] State slot counts match `state_layout.h`.
-- [ ] KV capacity math uses logical visits, not physical layers.
+- [x] Reservation equals the declared region sum.
+- [x] Capacity curve is monotonic and non-zero.
+- [x] Planner rejects invalid capacity/concurrency/draft/KV inputs.
+- [x] State slot counts match `state_layout.h`.
+- [x] KV capacity math uses 14 full-attention visits plus one MTP domain.
 
 **Exit criterion:** engine KV-capacity resolution agrees exactly with the finalized SenseNova plan.
+
+**Status: complete.**
+
+- Built sequence-plan, bindings, loop-plan, and engine targets with `./build-sandbox.sh`.
+- CTest via `./build-sandbox.sh --ctest ninfer_sensenova_loop_9b`: three SenseNova tests pass.
+- Gitea commit: `TBD`.
+- GitHub commit: `TBD`.
 
 **Proposed commit**
 

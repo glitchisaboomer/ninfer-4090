@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
+#include "targets/sensenova_loop_9b/impl/runtime/layouts.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -13,31 +14,25 @@
 namespace ninfer::targets::sensenova_loop_9b::detail {
 namespace {
 
-constexpr std::uint32_t kPageTokens = 128;
-constexpr std::size_t kWorkspaceBytes = 64ULL * 1024ULL * 1024ULL;
-
-std::size_t align_up(std::size_t value, std::size_t alignment) {
-    return ((value + alignment - 1) / alignment) * alignment;
-}
-
-runtime::SequenceCapacityCurve make_curve_impl(const EngineOptions& options) {
-    const std::size_t kv_per_page =
-        StateLayout::total_kv_bytes_per_token(false, false, true) * kPageTokens;
-    return runtime::SequenceCapacityCurve{
-        .main_page_tokens                   = kPageTokens,
-        .minimum_main_page_groups           = 1,
-        .maximum_main_page_groups           = std::max<std::uint32_t>(
-            1, (options.max_context + kPageTokens - 1) / kPageTokens),
-        .minimum_device_reservation_bytes   = kWorkspaceBytes +
-                                               StateLayout::total_fixed_state_bytes(),
-        .bytes_per_additional_main_page_group = kv_per_page,
+SequencePlanningInputs planning_inputs(const EngineOptions& options,
+                                       WeightsProfile weights_profile) {
+    return SequencePlanningInputs{
+        .weights_profile = weights_profile,
+        .capacity = options.max_context,
+        .max_concurrency = options.max_concurrency,
+        .prefill_chunk = std::min(options.prefill_chunk, options.max_context),
+        .draft_window = options.speculative.draft_tokens,
+        .kv_cache = options.kv_cache,
+        .use_cuda_graph = options.use_cuda_graph,
+        .enable_prompt_cache = options.enable_prompt_cache,
+        .device = options.device,
     };
 }
 
 } // namespace
 
 runtime::SequenceCapacityCurve make_curve(const EngineOptions& options) {
-    return make_curve_impl(options);
+    return make_sequence_capacity_curve(planning_inputs(options, WeightsProfile::GroupwiseInt));
 }
 
 struct RequestBasePlan::Impl {
@@ -111,15 +106,14 @@ SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
         main_page_groups > impl_->curve.maximum_main_page_groups) {
         throw std::invalid_argument("sensenova_loop_9b: invalid main page groups");
     }
+    const SequenceLayout layout = finalize_sequence_layout(planning_inputs(impl_->options, impl_->weights_profile), main_page_groups);
     auto impl             = std::make_unique<SequencePlan::Impl>();
-    impl->capacity        = impl_->options.max_context;
-    impl->kv_capacity     = impl_->curve.resolved_tokens(main_page_groups);
-    impl->max_concurrency = impl_->options.max_concurrency;
-    impl->workspace_bytes = kWorkspaceBytes;
-    impl->request_transient_bytes =
-        align_up(static_cast<std::size_t>(impl_->options.max_concurrency) * 4096, 256);
-    impl->device_reservation_bytes =
-        impl_->curve.reservation_bytes(main_page_groups) + impl->request_transient_bytes;
+    impl->capacity        = layout.capacity;
+    impl->kv_capacity     = layout.kv_capacity;
+    impl->max_concurrency = layout.inputs.max_concurrency;
+    impl->workspace_bytes = layout.workspace_bytes;
+    impl->request_transient_bytes = layout.request_transient_bytes;
+    impl->device_reservation_bytes = layout.device_reservation_bytes;
     return SequencePlan(std::move(impl));
 }
 
