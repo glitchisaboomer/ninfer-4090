@@ -64,8 +64,8 @@ BF16 while router math stays FP32.
 ### 0. Branch and scope
 
 - [x] Rename this branch to `feat/sensenova-loop-9b`.
-- [ ] Create matching branches on Gitea and GitHub when the first implementation commit is ready.
-- [ ] Keep v1 scope fixed:
+- [x] Create matching branches on Gitea and GitHub for the implementation.
+- [x] Keep v1 scope fixed:
   - text only;
   - fixed 32 physical / 56 logical layer plan;
   - mHC two-stream routing;
@@ -101,14 +101,13 @@ the only supported plan is:
 ### 2. Converter
 
 - [x] Add `tools/convert/sensenova_loop_9b/` with strict config validation.
-- [ ] Normalize `model.language_model.*` source prefixes.
-- [ ] Ignore vision tensors only through an explicit whitelist; reject unknown tensors.
-- [ ] Hard-fail on unexpected shapes or config fields instead of adapting silently.
-- [ ] Stream shards one at a time and avoid copying the 19 GB source tree.
-- [ ] Bind physical text weights once. Use the loop plan to alias repeated visits where the artifact
-      format permits it. Follow the fork's aliasing idea at
-      `conversion/sensenova.py:141` and `src/models/sensenova-loop.cpp:182`.
-- [ ] Convert mHC routers as FP32:
+- [x] Normalize `model.language_model.*` source prefixes.
+- [x] Ignore vision tensors only through an explicit whitelist; reject unknown tensors.
+- [x] Hard-fail on unexpected shapes or config fields instead of adapting silently.
+- [x] Stream shards one at a time and avoid copying the 19 GB source tree.
+- [x] Bind physical text weights once. The artifact stores one physical copy of each of the 32
+      layers; the fixed loop is a runtime contract.
+- [x] Convert mHC routers as FP32:
   - `mhc_attn.weight [8,8192]`, `mhc_attn.bias [8]`;
   - `mhc_ffn.weight [8,8192]`, `mhc_ffn.bias [8]`;
   - only for physical layers 4..27.
@@ -130,26 +129,42 @@ python -m tools.convert.sensenova_loop_9b.convert \
 The result is a 9.2 GB artifact with 447 objects and a verified structural summary. Do not create a
 second conversion output; rerun the same path only with explicit approval.
 
+Converter commits:
+
+- Gitea `a84ec296`: `feat(convert): add SenseNova-Loop-9B text and MTP converter`.
+- GitHub `aead052a`: same change with the required author identity.
+
 ### 3. Ops
 
-- [ ] Add closed mHC ops:
+- [x] Add closed mHC ops:
   - route op: two-stream RMS norm, 8 FP32 logits, pre-gates, post-gates, 20 log-space Sinkhorn
     passes, routed branch;
   - merge op: stream mix and post-gated branch add.
-- [ ] Use the official `MHCRouter` as the correctness contract:
+- [x] Use the official `MHCRouter` as the correctness contract:
   - official modeling code `sinkhorn()` at line 77;
   - `MHCRouter.forward()` around line 86;
   - `MHCRouter.merge()` at line 138.
-- [ ] Use the fork's route/merge kernels as an engineering reference:
+- [x] Use the fork's route/merge kernels as an engineering reference:
   - `ggml/src/ggml-cpu/ops.cpp:12526`;
   - `ggml/src/ggml-cpu/ops.cpp:12607`;
   - `ggml/src/ggml-cuda/mhc.cu:1`.
-- [ ] Add independent FP32/FP64 oracle tests. Match HF precision boundaries: FP32 router/math,
+- [x] Add independent FP32/FP64 oracle tests. Match HF precision boundaries: FP32 router/math,
       BF16 branch and mix storage/application.
-- [ ] Test token extents 1, 7, and 512, with and without strided stream views. Mirror the fork's
+- [x] Test token extents 1, 7, and 512, with and without strided stream views. Mirror the fork's
       cases at `tests/test-backend-ops.cpp:11157` through `11174`.
-- [ ] Add/confirm GQA geometry 16 Q heads / 4 KV heads / head dim 256.
-- [ ] Add MTP proposal geometry for hidden 4096 and 16/4 draft attention.
+- [x] Add/confirm GQA geometry 16 Q heads / 4 KV heads / head dim 256.
+- [x] Add MTP proposal geometry for hidden 4096 and 16/4 draft attention.
+
+Ops commits and verification:
+
+- Gitea `75f602c6` / GitHub `a5fc09d0`: mHC route and merge; `ninfer_mhc_test` passes.
+- Gitea `1516d1e3` / GitHub `fb9d0782`: 16/4 GQA and RoPE geometry; `ninfer_gqa_attention_test`
+  and `ninfer_rope_test` pass.
+- Gitea `0dfee239` / GitHub `ea0a8226`: MTP geometry; `ninfer_mtp_pack_test` passes.
+
+The 16/4 GQA geometry runs through the prompt attention path. The small-T INT8 kernel does not
+instantiate group size 4, so SenseNova is excluded from that route rather than silently using the
+35B 16/2 geometry. Geometry resolution now uses both Q-head and KV-head counts.
 
 ### 4. Target runtime
 
@@ -173,24 +188,28 @@ second conversion output; rerun the same path only with explicit approval.
 
 ### 5. Build and tests
 
-- [ ] Add CMake entries for converter, target, and tests.
-- [ ] Build with `./build-sandbox.sh`.
-- [ ] Run the full CTest suite.
-- [ ] Add tests:
-  - loop plan equals the expected 56 entries;
+- [x] Add CMake entries for the new ops and tests.
+- [x] Build the qualified op targets with `./build-sandbox.sh`.
+- [x] Run the new op CTests: mHC, 16/4 GQA, RoPE 16/4, and MTP pack D=4096.
+- [ ] Add the new target package, then run the full CTest suite.
+- [x] Add tests completed so far:
   - config rejection for non-fixed loop counts;
   - mHC numerical oracle;
   - mHC strided stream views;
-  - converter prefix normalization;
-  - converter strict shape rejection;
+  - converter fixture tests;
+  - MTP pack D=4096 test.
+- [ ] Add tests still pending:
+  - loop plan equals the expected 56 entries;
+  - converter prefix normalization against real source keys;
+  - converter strict shape rejection against a full fixture;
   - MTP binding shape validation;
   - prefix reuse with looped visits;
   - graph replay state correctness.
 
 ### 6. Correctness validation
 
-- [ ] Convert the real checkpoint to `.ninfer` without duplicating the 19 GB model directory.
-- [ ] Report expected artifact size before writing if conversion needs more than a few GB scratch.
+- [x] Convert the real checkpoint to `.ninfer` without duplicating the 19 GB model directory.
+- [x] Report expected artifact size before writing if conversion needs more than a few GB scratch.
 - [ ] Compare against official Hugging Face modeling code or a served reference on fixed prompts.
 - [ ] Validate:
   - prefill;
