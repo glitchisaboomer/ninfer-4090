@@ -73,6 +73,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
+  ops/launcher/mhc.cu
   ops/launcher/mtp_pack.cu
   ops/launcher/mtp_round.cu
   ops/launcher/speculative_round.cu
@@ -191,6 +192,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
+  ops/wrapper/mhc.cpp
   ops/wrapper/linear_add.cpp
   ops/wrapper/linear_pair.cpp
   ops/wrapper/linear_swiglu.cpp

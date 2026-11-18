@@ -160,6 +160,13 @@ inline std::vector<double> from_device_f32(const DeviceBuffer& d, std::size_t n)
     return o;
 }
 
+inline std::vector<double> from_device_f32(const void* device, std::size_t n) {
+    const std::vector<float> f = from_device<float>(device, n);
+    std::vector<double> o(n);
+    for (std::size_t i = 0; i < n; ++i) o[i] = double(f[i]);
+    return o;
+}
+
 inline std::vector<int> from_device_i32(const DeviceBuffer& d, std::size_t n) {
     static_assert(sizeof(int) == sizeof(std::int32_t));
     return from_device<int>(d, n);
