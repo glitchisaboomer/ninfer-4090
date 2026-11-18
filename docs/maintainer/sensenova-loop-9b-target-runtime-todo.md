@@ -318,9 +318,8 @@ feat(targets): add SenseNova program lifecycle
 The lifecycle and planning scaffolding is in place, and the current Program intentionally refuses
 to perform model execution rather than emitting fake tokens. This stage still needs:
 
-- qualified W8 dispatch for every SenseNova 4096-wide projection at small T, or a dedicated
-  small-T kernel path;
-- a real SenseNova `TextContext` that executes all 56 visits over the bound physical weights;
+- [x] qualified W8 dispatch for every SenseNova 4096-wide projection at small T and large T;
+- [ ] a real SenseNova `TextContext` that executes all 56 visits over the bound physical weights;
 - device-backed KV/GDN/mHC state images with per-visit identity;
 - prefill/decode graph state and reference comparisons.
 
@@ -490,3 +489,14 @@ Start with **A**:
 6. Mirror the commit on the GitHub lineage with the required author identity.
 
 Do not begin the registry or program work until the loop/state tests pass.
+
+### Stage E prerequisite committed during implementation
+
+A W8 dispatch smoke test now covers the SenseNova projection shapes:
+
+- `[10240,4096]`, `[8192,4096]`, `[4096,4096]`, `[1024,4096]`, `[24576,4096]`, `[12288,4096]`,
+  `[4096,12288]`;
+- token extents 1 and 65.
+
+`ninfer_linear_w8_sensenova_dispatch_test` passes. This qualifies routing only; the numerical
+oracle coverage for those exact shapes remains part of the forward-path validation work.
