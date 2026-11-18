@@ -300,8 +300,8 @@ full model pass.
 **Status: complete for the lifecycle scope.** The four SenseNova CTests pass after this change;
 device state images, real snapshot payloads, and graph capture remain explicitly assigned to stage E.
 
-- Gitea commit: `TBD`.
-- GitHub commit: `TBD`.
+- Gitea commit: `d284db59`.
+- GitHub commit: `7ad02569`.
 
 **Proposed commits**
 
