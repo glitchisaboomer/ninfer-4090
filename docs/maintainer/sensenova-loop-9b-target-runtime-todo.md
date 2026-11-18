@@ -500,3 +500,6 @@ A W8 dispatch smoke test now covers the SenseNova projection shapes:
 
 `ninfer_linear_w8_sensenova_dispatch_test` passes. This qualifies routing only; the numerical
 oracle coverage for those exact shapes remains part of the forward-path validation work.
+
+- Gitea commit: `9d6461f8`.
+- GitHub commit: `5cd11a8c`.
