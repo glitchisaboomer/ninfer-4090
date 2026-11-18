@@ -22,6 +22,17 @@ namespace ninfer::targets::sensenova_loop_9b { struct Package; }
 
 namespace ninfer::targets::sensenova_loop_9b::detail {
 
+struct StateImageInspection {
+    void* base                 = nullptr;
+    std::size_t bytes          = 0;
+    std::size_t kv_bytes       = 0;
+    std::size_t gdn_bytes      = 0;
+    std::size_t mhc_bytes      = 0;
+    void* mtp_kv_region        = nullptr;
+    void* gdn_region           = nullptr;
+    void* mhc_region           = nullptr;
+};
+
 struct LaneStateSnapshot {
     std::uint32_t lane                    = 0;
     bool occupied                         = false;
@@ -124,6 +135,10 @@ class Program {
 public:
     [[nodiscard]] static LaneStateSnapshot inspect_lane_for_test(const Program& program,
                                                                  std::uint32_t lane);
+    [[nodiscard]] static StateImageInspection inspect_state_images_for_test(
+        const Program& program);
+    static void write_state_image_markers_for_test(Program& program, std::uint8_t value);
+    static bool verify_state_image_markers_for_test(const Program& program, std::uint8_t value);
     static std::unique_ptr<Program> create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                            std::uint32_t context, std::size_t reservation_bytes);
     ~Program() noexcept;

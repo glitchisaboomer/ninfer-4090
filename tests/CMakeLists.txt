@@ -87,6 +87,9 @@ ninfer_add_host_test(ninfer_sensenova_loop_9b_loop_plan_test
 
 ninfer_add_host_test(ninfer_sensenova_loop_9b_sequence_plan_test
   SOURCES targets/sensenova_loop_9b/test_sequence_plan.cpp)
+
+ninfer_add_host_test(ninfer_sensenova_loop_9b_state_images_test
+  SOURCES targets/sensenova_loop_9b/test_state_images.cpp)
 target_include_directories(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)

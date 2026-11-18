@@ -1,9 +1,11 @@
 #include "targets/sensenova_loop_9b/impl/runtime_stub.h"
 
+#include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
 #include "targets/sensenova_loop_9b/impl/runtime/layouts.h"
+#include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -141,6 +143,11 @@ struct LaneState {
 };
 
 struct Program::Impl {
+    DeviceBuffer state_images;
+    std::size_t state_image_bytes = 0;
+    std::size_t state_kv_bytes    = 0;
+    std::size_t state_gdn_bytes   = 0;
+    std::size_t state_mhc_bytes   = 0;
     MemorySummary memory;
     runtime::AdmissionResources admission;
     std::uint32_t max_concurrency = 1;
@@ -168,6 +175,20 @@ std::unique_ptr<Program> Program::create(std::uint32_t active_lanes, std::uint32
     impl->memory.runtime_reservation_bytes = reservation_bytes;
     impl->max_concurrency                = active_lanes;
     impl->kv_capacity                    = kv_pages * kSenseNovaPageTokens;
+
+    // Use the declared KV capacity as the fixed per-domain token extent. The region offsets are
+    // derived from StateImageLayout, so every logical visit has a stable address for graph replay.
+    const std::size_t kv_bytes = StateImageLayout::total_kv_bytes(
+        impl->kv_capacity, false, false);
+    const std::size_t fixed_bytes = StateImageLayout::fixed_bytes();
+    impl->state_kv_bytes           = kv_bytes;
+    impl->state_gdn_bytes          = StateImageLayout::kGdnSlots *
+                                     StateLayout::gdn_state_bytes_per_slot();
+    impl->state_mhc_bytes          = StateImageLayout::kMhcSlots *
+                                     StateLayout::mhc_state_bytes_per_slot();
+    impl->state_image_bytes        = kv_bytes + fixed_bytes;
+    impl->state_images             = DeviceBuffer(impl->state_image_bytes);
+    impl->state_images.fill(0);
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
 
@@ -183,6 +204,37 @@ LaneStateSnapshot Program::inspect_lane_for_test(const Program& program, std::ui
         .frontier = state.frontier,
         .page_entitlement = state.page_entitlement,
     };
+}
+
+StateImageInspection Program::inspect_state_images_for_test(const Program& program) {
+    const Impl& impl = *program.impl_;
+    auto* base       = impl.state_images.p;
+    return StateImageInspection{
+        .base          = base,
+        .bytes         = impl.state_image_bytes,
+        .kv_bytes      = impl.state_kv_bytes,
+        .gdn_bytes     = impl.state_gdn_bytes,
+        .mhc_bytes     = impl.state_mhc_bytes,
+        .mtp_kv_region = static_cast<std::uint8_t*>(base) +
+                         StateImageLayout::kv_offset(StateLayout::full_attention_state_slots,
+                                                     impl.kv_capacity, false, false),
+        .gdn_region    = static_cast<std::uint8_t*>(base) + impl.state_kv_bytes,
+        .mhc_region    = static_cast<std::uint8_t*>(base) + impl.state_kv_bytes +
+                         impl.state_gdn_bytes,
+    };
+}
+
+void Program::write_state_image_markers_for_test(Program& program, std::uint8_t value) {
+    program.impl_->state_images.fill(value);
+}
+
+bool Program::verify_state_image_markers_for_test(const Program& program, std::uint8_t value) {
+    std::vector<std::uint8_t> actual(program.impl_->state_image_bytes);
+    program.impl_->state_images.copy_to_host(actual.data(), actual.size());
+    for (const std::uint8_t byte : actual) {
+        if (byte != value) { return false; }
+    }
+    return true;
 }
 
 Program::Program(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}

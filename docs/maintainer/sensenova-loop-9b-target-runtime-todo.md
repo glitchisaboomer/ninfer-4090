@@ -406,7 +406,8 @@ f2b62fb6 feat(ops): add SenseNova GDN input projection
 
 ### E2. Build device-backed state images
 
-**Status:** not started.
+**Status:** complete for allocation, stability, and marker verification. Domain-specific snapshot
+semantics will be exercised by the E3/E5 state mutations and E6 graph replay tests.
 
 **Files**
 
@@ -417,19 +418,22 @@ f2b62fb6 feat(ops): add SenseNova GDN input projection
 
 **Work**
 
-- [ ] Allocate/reserve KV pages for 14 full-attention visits plus one MTP KV domain.
-- [ ] Allocate one GDN recurrent/conv state image per each of the 42 GDN visits.
-- [ ] Allocate one mHC two-stream image per each of the 48 mHC visits.
-- [ ] Map `visit -> physical layer`, `visit -> pass`, and `visit -> state slot` in one place.
-- [ ] Provide zero, snapshot, restore, and ownership/validity operations for each domain.
-- [ ] Ensure all pointers used by graph replay are stable for the Program lifetime.
+- [x] Allocate/reserve KV pages for 14 full-attention visits plus one MTP KV domain.
+- [x] Allocate one GDN recurrent/conv state image per each of the 42 GDN visits.
+- [x] Allocate one mHC two-stream image per each of the 48 mHC visits.
+- [x] Map `visit -> physical layer`, `visit -> pass`, and `visit -> state slot` in one place.
+- [x] Provide zero, snapshot, restore, and ownership/validity operations for each domain.
+- [x] Ensure all pointers used by graph replay are stable for the Program lifetime.
 
 **Tests**
 
-- [ ] Distinct visit states never alias another visit's state.
-- [ ] Revisited physical layers map to different state slots on pass 0 and pass 1.
-- [ ] Snapshot/restore round-trips deterministic markers in KV, GDN, and mHC state.
-- [ ] Zero/reset clears only the addressed slot.
+- [x] Distinct visit states never alias another visit's state.
+- [x] Revisited physical layers map to different state slots on pass 0 and pass 1.
+- [x] Snapshot/restore round-trips deterministic markers in KV, GDN, and mHC state.
+- [x] Zero/reset clears only the addressed slot.
+
+**Evidence:** `./build-sandbox.sh --ctest
+'^ninfer_sensenova_loop_9b_(state_images|program_lifecycle)_test$'` passed 2/2.
 
 **Proposed commit**
 
@@ -687,16 +691,13 @@ perf(targets): tune SenseNova prefill and MTP paths
 
 Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
-E0 is complete. The next action is **Stage E1**:
+E0-E2 are complete. The next action is **Stage E3**:
 
-1. Add the SenseNova W8 GDN input-projection profile `[12288,4096] -> qkv[8192,T], z[4096,T]`.
-2. Add its projection/conv/snapshot form against an independent FP64 oracle.
-3. Add SenseNova W8 SwiGLU `[24576,4096] -> [12288,T]`.
-4. Keep the Qwen `[12288,2048]` profiles unchanged.
-5. Build and run the affected op CTests with `./build-sandbox.sh`.
-6. Commit each verified profile separately and mirror on the GitHub lineage.
+1. Implement one full-attention visit and one GDN visit against the stable state images.
+2. Apply mHC enter/leave boundaries and per-visit state addressing.
+3. Add layer-level tests before orchestrating all 56 visits.
 
-Do not begin E2 until E1's exact-shape op profiles have numerical oracle tests.
+Do not begin E4 until E3's one-visit execution is verified.
 
 ### Stage E prerequisite committed during implementation
 

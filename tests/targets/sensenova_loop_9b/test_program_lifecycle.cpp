@@ -1,4 +1,6 @@
 #include "targets/sensenova_loop_9b/impl/runtime_stub.h"
+#include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
+#include "targets/sensenova_loop_9b/impl/state_layout.h"
 
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/sensenova_loop_9b/package.h>
@@ -39,6 +41,34 @@ void test_lifecycle() {
     expect(!active.occupied && !active.retained, "lane starts empty");
 }
 
+void test_state_images() {
+    auto program = sn::Program::create(1, 16, 2048, 1U << 20U);
+    const auto images = sn::Program::inspect_state_images_for_test(*program);
+    expect(images.base != nullptr, "state images are device-backed");
+    expect(images.bytes == images.kv_bytes + images.gdn_bytes + images.mhc_bytes,
+           "state image regions cover the allocation");
+    expect(images.kv_bytes == sn::StateImageLayout::total_kv_bytes(16 * 128, false, false),
+           "KV region uses declared KV capacity");
+    expect(images.gdn_bytes == 42 * sn::StateLayout::gdn_state_bytes_per_slot(),
+           "GDN region covers 42 visit slots");
+    expect(images.mhc_bytes == 48 * sn::StateLayout::mhc_state_bytes_per_slot(),
+           "mHC region covers 48 visit slots");
+    expect(images.gdn_region != images.mhc_region && images.gdn_region != images.mtp_kv_region,
+           "state domains do not alias");
+
+    sn::Program::write_state_image_markers_for_test(*program, 0xa5);
+    expect(sn::Program::verify_state_image_markers_for_test(*program, 0xa5),
+           "state image marker write/verify");
+    expect(!sn::Program::verify_state_image_markers_for_test(*program, 0x5a),
+           "state image marker mismatch is observed");
+    sn::Program::write_state_image_markers_for_test(*program, 0);
+
+    const auto again = sn::Program::inspect_state_images_for_test(*program);
+    expect(again.base == images.base && again.gdn_region == images.gdn_region &&
+               again.mhc_region == images.mhc_region,
+           "state addresses are stable across access");
+}
+
 void test_memory() {
     auto program   = sn::Program::create(1, 16, 2048, 987654321ULL);
     const auto mem = program->memory_summary();
@@ -51,6 +81,7 @@ void test_memory() {
 
 int main() {
     test_lifecycle();
+    test_state_images();
     test_memory();
     if (failures != 0) {
         std::cerr << "FAIL senseNova program lifecycle: " << failures << '\n';
