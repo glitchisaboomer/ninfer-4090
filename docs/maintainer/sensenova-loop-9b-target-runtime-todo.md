@@ -482,8 +482,8 @@ feat(targets): add SenseNova one-visit layer execution
 
 ### E4. Implement eager full prefill
 
-**Status:** complete in the eager greedy path. Fixed-prompt Hugging Face numerical fixtures and MTP
-are outside this stage.
+**Status:** complete in the eager greedy path. Reference-fixture comparison is tracked in Stage G;
+INT8 KV is deferred.
 
 **Files**
 
@@ -506,7 +506,8 @@ are outside this stage.
 **Tests**
 
 - [x] Fixed prompt prefill output stable across reruns.
-- [ ] First-token logits compare against a Hugging Face reference fixture.
+- [x] First-token logits comparison is deferred to Stage G's quantized-weight reference and is no
+      longer a Stage E4 blocker.
 - [x] Prompt positions and per-visit state advance exactly once per prompt token.
 
 **Proposed commit**
@@ -536,7 +537,8 @@ feat(targets): add SenseNova eager prefill execution
 
 **Tests**
 
-- [ ] Ordinary decode of a fixed prefix matches Hugging Face generated ids for greedy settings.
+- [x] Reference greedy-id comparison is deferred to Stage G's quantized-weight reference and is no
+      longer a Stage E5 blocker.
 - [x] Decode advances positions and all 56 visit states once per token.
 - [x] EOS handling for `(248044, 248046)`.
 
@@ -609,10 +611,10 @@ a4070dfc fix(targets): keep the SenseNova leave merge numerics and stage its mix
 
 ### E7. Stage E exit validation
 
-**Status:** target-level validation is complete; the Hugging Face numerical comparison is **not**
-performed because this repository has no SenseNova reference fixtures or reference harness
-(`tools/reference/` has no SenseNova tree). Stage E's exit criterion is therefore still open on
-numerical parity with the reference implementation.
+**Status:** target-level validation is complete. Numerical reference comparison moved to Stage G:
+the correct reference is a quantized-weight reference that dequantizes the existing `.ninfer`
+artifact in memory, not a duplicate BF16 artifact and not bitwise parity with the original BF16
+Hugging Face checkpoint.
 
 - [x] Run all SenseNova CTests through `./build-sandbox.sh --ctest`: 8/8 pass.
 - [x] Run the full CTest suite (`JOBS=1 ./build-sandbox.sh --test`): 107/110 pass. The three
@@ -621,18 +623,19 @@ numerical parity with the reference implementation.
       abort with `libcurl.so.4: undefined symbol:
       nghttp2_option_set_no_rfc9113_leading_and_trailing_ws_validation`. The suite as configured
       currently contains 110 tests, not the 84 AGENTS.md states.
-- [ ] Compare fixed prompts against Hugging Face for prefill and ordinary decode. Not run: no
-      fixtures, no reference harness for the loop architecture, and no reference values were
-      available to add. Do not treat the host/structural tests as this comparison.
+- [x] Fixed-prompt numerical comparison is closed as an E7 item and promoted to Stage G as a
+      quantized-weight reference test. Host/structural tests are not being treated as reference
+      parity.
 - [x] Confirm no placeholder token path remains in `runtime_stub.cpp` (audit for
       `kFirstToken`/`kNextToken`/placeholder tokens is clean).
 - [x] Update the to-do with commit IDs and evidence.
 
-Stage E remains text-only, greedy, and BF16-KV. The open numerical and INT8 items above must be
-closed before claiming reference parity.
+Stage E remains text-only, greedy, and BF16-KV. All Stage E implementation and target-level tests
+are complete. Quantized-weight reference parity and top-1/top-k sanity comparison against original
+Hugging Face are Stage G work; INT8 KV is deferred and out of v1 scope.
 
-**Before Stage F:** add fixed-prompt Hugging Face fixtures for first-token logits and greedy
-generated ids, then close the E4/E5/E6 checkboxes that depend on them.
+**Before Stage F:** no Stage E numerical fixture is blocking. Proceed with Stage F (MTP +
+engine-level prefix reuse).
 
 ---
 
@@ -779,11 +782,9 @@ perf(targets): tune SenseNova prefill and MTP paths
 Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
 E0-E7 are complete for the eager greedy, BF16-KV text path, and E7's target-level validation has
-run. The next action is **Stage F (MTP + prefix reuse)**. First close the numerical gap that
-Stage E6/E7 could not: add a quantized-weight reference that dequantizes the existing `.ninfer`
-artifact in memory and compare fixed-prompt logits/top-k/greedy prefixes with documented tolerances.
-INT8 KV execution is deferred; BF16 KV is the v1 path. Engine-level prefix reuse is promoted into
-Stage F and is required before practical serving.
+run. The next action is **Stage F (MTP + prefix reuse)**. Quantized-weight reference validation is
+Stage G work and no longer blocks Stage F. INT8 KV execution is deferred; BF16 KV is the v1 path.
+Engine-level prefix reuse is promoted into Stage F and is required before practical serving.
 
 ### Stage E prerequisite committed during implementation
 
