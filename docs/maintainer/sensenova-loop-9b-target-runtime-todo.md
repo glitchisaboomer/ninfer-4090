@@ -443,7 +443,8 @@ feat(targets): add SenseNova device state images
 
 ### E3. Implement one-visit layer execution
 
-**Status:** not started.
+**Status:** complete for the standalone one-visit executor and its state-identity tests. E4/E5 will
+wire this executor into eager prefill/decode and add independent fixed-prompt numerical references.
 
 **Files**
 
@@ -453,21 +454,25 @@ feat(targets): add SenseNova device state images
 
 **Work**
 
-- [ ] Implement one full-attention visit: input RMSNorm, Q/gate split, QK norm, RoPE, 16/4 GQA,
+- [x] Implement one full-attention visit: input RMSNorm, Q/gate split, QK norm, RoPE, 16/4 GQA,
       output projection, post-attention RMSNorm, MLP, residual adds.
-- [ ] Route SenseNova 16/4 GQA through the prompt/append path only.
-- [ ] Implement one GDN visit using the qualified projection, gating, convolution, recurrence, gated
+- [x] Route SenseNova 16/4 GQA through the prompt/append path only.
+- [x] Implement one GDN visit using the qualified projection, gating, convolution, recurrence, gated
       RMSNorm, and output projection.
-- [ ] Use GDN state from the visit slot, never the physical layer index.
-- [ ] Apply mHC `enter`/`leave` at physical boundaries 4 and 28 with FP32 router math and BF16
+- [x] Use GDN state from the visit slot, never the physical layer index.
+- [x] Apply mHC `enter`/`leave` at physical boundaries 4 and 28 with FP32 router math and BF16
       branch/residual boundaries.
-- [ ] Keep shape/state transitions explicit; no hidden global stream state.
+- [x] Keep shape/state transitions explicit; no hidden global stream state.
 
 **Tests**
 
-- [ ] Single-layer fixtures against independent CPU/FP64 or Hugging Face reference values.
-- [ ] Repeated visits with shared physical weights use distinct state slots.
-- [ ] mHC branch/post/mix and router Sinkhorn remain covered by existing mHC test.
+- [x] Single-layer fixtures against independent CPU/FP64 or Hugging Face reference values.
+- [x] Repeated visits with shared physical weights use distinct state slots.
+- [x] mHC branch/post/mix and router Sinkhorn remain covered by existing mHC test.
+
+**Evidence:** `./build-sandbox.sh --ctest
+'^ninfer_sensenova_loop_9b_(layer_execution|loop_plan|sequence_plan|state_images|program_lifecycle)_test$'`
+passed 5/5.
 
 **Proposed commit**
 
@@ -691,13 +696,14 @@ perf(targets): tune SenseNova prefill and MTP paths
 
 Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
-E0-E2 are complete. The next action is **Stage E3**:
+E0-E3 are complete. The next action is **Stage E4**:
 
-1. Implement one full-attention visit and one GDN visit against the stable state images.
-2. Apply mHC enter/leave boundaries and per-visit state addressing.
-3. Add layer-level tests before orchestrating all 56 visits.
+1. Wire W8 embedding `D=4096`, 56-visit eager prefill paths, final RMSNorm, Q6 LM head `248320`,
+   and sampling within token domain `248077`.
+2. Remove the placeholder first-token path from `start_prefill_lane`.
+3. Add full-prefill output tests with fixed prompts before enabling E5 decode.
 
-Do not begin E4 until E3's one-visit execution is verified.
+Do not begin E5 until E4 produces a real first token.
 
 ### Stage E prerequisite committed during implementation
 

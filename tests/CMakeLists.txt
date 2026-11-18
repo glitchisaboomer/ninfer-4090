@@ -114,6 +114,18 @@ target_include_directories(ninfer_sensenova_loop_9b_bindings_test PRIVATE
 target_link_libraries(ninfer_sensenova_loop_9b_bindings_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_sensenova_loop_9b_bindings_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# One-visit layer execution for the fixed 56-visit plan: the standalone executor's planning and
+# validation surface, plus one-visit execution proofs over the GDN/mHC/KV visit state slots.
+ninfer_add_op_test(ninfer_sensenova_loop_9b_layer_execution_test
+  SOURCES targets/sensenova_loop_9b/test_layer_execution.cpp
+          ops/linear/linear_test_common.cpp
+          ../src/targets/sensenova_loop_9b/impl/runtime/layer_execution.cpp
+  LIBRARIES ninfer_ops)
+target_include_directories(ninfer_sensenova_loop_9b_layer_execution_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
+target_link_libraries(ninfer_sensenova_loop_9b_layer_execution_test PRIVATE ${NINFER_CUDART_TARGET})
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
