@@ -313,6 +313,20 @@ feat(targets): add SenseNova program lifecycle
 
 ## E. Text prefill and ordinary decode execution
 
+**Status: in progress / blocked on real forward implementation.**
+
+The lifecycle and planning scaffolding is in place, and the current Program intentionally refuses
+to perform model execution rather than emitting fake tokens. This stage still needs:
+
+- qualified W8 dispatch for every SenseNova 4096-wide projection at small T, or a dedicated
+  small-T kernel path;
+- a real SenseNova `TextContext` that executes all 56 visits over the bound physical weights;
+- device-backed KV/GDN/mHC state images with per-visit identity;
+- prefill/decode graph state and reference comparisons.
+
+This is recorded explicitly so no later stage can mistake the lifecycle skeleton for working text
+generation.
+
 **Goal:** generate text correctly through the fixed 56-visit schedule without MTP.
 
 **Files**
