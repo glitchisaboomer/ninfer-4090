@@ -80,6 +80,11 @@ endfunction()
 ninfer_add_host_test(ninfer_paged_kv_delta_layout_test
   SOURCES test_paged_kv_delta_layout.cpp)
 
+# SenseNova-Loop-9B's fixed 56-visit plan and per-visit state identities are pure code, so they
+# are tested host-only before any target runtime machinery exists.
+ninfer_add_host_test(ninfer_sensenova_loop_9b_loop_plan_test
+  SOURCES targets/sensenova_loop_9b/test_loop_plan.cpp)
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
