@@ -213,6 +213,66 @@ int run_case(const char* label, int d, int tokens, std::uint32_t seed, bool stri
     return failures;
 }
 
+// The leave-boundary reduction replaces an identity merge (zero branch, zero post, uniform 0.5
+// mix). It must be bit-identical to that merge, not merely inside the BF16 tolerance, because the
+// 56-visit pass previously produced the merged bytes.
+int run_reduce_case(const char* label, int d, int tokens, std::uint32_t seed, bool strided) {
+    const std::size_t residual_count = static_cast<std::size_t>(2) * d * tokens;
+    std::vector<float> residual(residual_count);
+    fill_uniform(residual, seed, -2.0f, 2.0f);
+    round_to_bf16(residual);
+
+    DeviceBuffer d_residual = make_residual(residual, d, tokens, strided, false);
+    DeviceBuffer d_out(static_cast<std::size_t>(d) * tokens * sizeof(std::uint16_t));
+    Tensor residual_tensor = residual_view(d_residual, d, tokens, strided, false);
+    Tensor out_tensor(d_out.p, DType::BF16, {d, tokens});
+
+    ops::mhc_reduce(residual_tensor, 2, out_tensor, nullptr);
+    cuda_synchronize();
+
+    std::vector<double> expected(static_cast<std::size_t>(d) * tokens);
+    for (int token = 0; token < tokens; ++token) {
+        for (int column = 0; column < d; ++column) {
+            const double x0 = residual[(static_cast<std::size_t>(token) * 2) * d + column];
+            const double x1 = residual[(static_cast<std::size_t>(token) * 2 + 1) * d + column];
+            expected[static_cast<std::size_t>(token) * d + column] =
+                static_cast<double>(bf16_value(static_cast<float>((x0 + x1) / 2.0)));
+        }
+    }
+    const PointwiseCriterion bf16_criterion{1.0e-4, 3.0e-3};
+    int failures = verify_pointwise(std::string(label) + " reduce",
+                                    from_device_bf16(d_out.p, expected.size()), expected,
+                                    bf16_criterion);
+
+    // Independent byte-level parity with the identity merge the Op replaces.
+    DeviceBuffer d_mix(static_cast<std::size_t>(4) * tokens * sizeof(float));
+    const std::vector<float> half_mix(static_cast<std::size_t>(4) * tokens, 0.5f);
+    d_mix.copy_from_host(half_mix.data(), half_mix.size() * sizeof(float));
+    DeviceBuffer d_branch(static_cast<std::size_t>(d) * tokens * sizeof(std::uint16_t));
+    DeviceBuffer d_post(static_cast<std::size_t>(2) * tokens * sizeof(float));
+    d_branch.fill(0);
+    d_post.fill(0);
+    DeviceBuffer d_merge(static_cast<std::size_t>(2) * d * tokens * sizeof(std::uint16_t));
+    Tensor branch_tensor(d_branch.p, DType::BF16, {d, tokens});
+    Tensor post_tensor(d_post.p, DType::FP32, {2, tokens});
+    Tensor mix_tensor(d_mix.p, DType::FP32, {2, 2, tokens});
+    Tensor merge_tensor(d_merge.p, DType::BF16, {d, 2, tokens});
+    ops::mhc_merge(residual_tensor, branch_tensor, post_tensor, mix_tensor, 2, merge_tensor,
+                   nullptr);
+    cuda_synchronize();
+
+    std::vector<std::uint16_t> reduce_bits(static_cast<std::size_t>(d) * tokens);
+    std::vector<std::uint16_t> merge_bits(reduce_bits.size());
+    d_out.copy_to_host(reduce_bits.data(), reduce_bits.size() * sizeof(std::uint16_t));
+    d_merge.copy_to_host(merge_bits.data(), merge_bits.size() * sizeof(std::uint16_t),
+                         static_cast<std::size_t>(d) * tokens * sizeof(std::uint16_t));
+    if (reduce_bits != merge_bits) {
+        std::cerr << "FAIL: " << label << " reduce is not bit-identical to the identity merge\n";
+        ++failures;
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -229,6 +289,10 @@ int main() {
     failures += run_case("mhc d1000 t1 view", 1000, 1, 9005U, true, true);
     failures += run_case("mhc d1000 t7 view", 1000, 7, 9006U, true, true);
     failures += run_case("mhc d1000 t512 view", 1000, 512, 9007U, true, true);
+    failures += run_reduce_case("mhc_reduce d4096 t1", 4096, 1, 9101U, false);
+    failures += run_reduce_case("mhc_reduce d4096 t1 strided", 4096, 1, 9102U, true);
+    failures += run_reduce_case("mhc_reduce d4096 t7 strided", 4096, 7, 9103U, true);
+    failures += run_reduce_case("mhc_reduce d1000 t17 view", 1000, 17, 9104U, true);
     std::cout << (failures ? "FAIL" : "OK") << " mhc\n";
     return failures ? 1 : 0;
 }

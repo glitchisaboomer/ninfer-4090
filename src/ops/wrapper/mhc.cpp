@@ -118,4 +118,19 @@ void mhc_merge(const Tensor& residual, const Tensor& branch, const Tensor& post,
     detail::mhc_merge_launch(residual, branch, post, mix, streams, out, stream);
 }
 
+void mhc_reduce(const Tensor& residual, int streams, Tensor& out, cudaStream_t stream) {
+    require(streams == 2, "only two residual streams are supported");
+    require_residual(residual, streams);
+    const int d      = residual.ne[0];
+    const int tokens = residual.ne[2];
+
+    require(out.dtype == DType::BF16 && out.ne[0] == d && out.ne[1] == tokens &&
+                out.ne[2] == 1 && out.ne[3] == 1 && out.is_contiguous(),
+            "out must be contiguous BF16 [D,T]");
+    require(out.data != nullptr, "out data must be non-null");
+    require(!overlaps(residual, out), "input and out must not overlap");
+
+    detail::mhc_reduce_launch(residual, streams, out, stream);
+}
+
 } // namespace ninfer::ops

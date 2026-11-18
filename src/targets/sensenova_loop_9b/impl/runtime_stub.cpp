@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
+#include "targets/sensenova_loop_9b/impl/runtime/graph_impl.h"
 #include "targets/sensenova_loop_9b/impl/runtime/layer_execution.h"
 #include "targets/sensenova_loop_9b/impl/runtime/layouts.h"
 #include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
@@ -81,6 +82,7 @@ struct SequencePlan::Impl {
     std::size_t device_reservation_bytes    = 0;
     std::size_t workspace_bytes             = 0;
     std::size_t request_transient_bytes     = 0;
+    bool use_cuda_graph                     = false;
 };
 
 SequencePlan::SequencePlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -97,6 +99,7 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept { return imp
 std::size_t SequencePlan::request_transient_capacity_bytes() const noexcept {
     return impl_->request_transient_bytes;
 }
+bool SequencePlan::use_cuda_graph() const noexcept { return impl_->use_cuda_graph; }
 
 struct SequencePlanner::Impl {
     EngineOptions options;
@@ -133,6 +136,7 @@ SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
     impl->workspace_bytes = layout.workspace_bytes;
     impl->request_transient_bytes = layout.request_transient_bytes;
     impl->device_reservation_bytes = layout.device_reservation_bytes;
+    impl->use_cuda_graph           = layout.inputs.use_cuda_graph;
     return SequencePlan(std::move(impl));
 }
 
@@ -181,6 +185,22 @@ struct Program::Impl {
     DeviceBuffer decode_workspace;
     std::size_t decode_workspace_bytes = 0;
 
+    // Stage E6: fixed-address per-lane decode staging. The captured step reads the token id and
+    // position from here, and the head's sampled token, logprob, and margin are read back after
+    // replay. One 256-byte slot per lane keeps every address stable for the Program lifetime.
+    bool use_cuda_graph = false;
+    static constexpr std::size_t kLaneIoBytes = 256;
+    DeviceBuffer decode_io;
+    struct LaneIo {
+        Tensor ids;
+        Tensor positions;
+        Tensor sampled;
+        Tensor logprob;
+        Tensor margin;
+    };
+    std::array<LaneIo, kMaximumConcurrency> lane_io{};
+    std::array<DecodeGraphRunner, kMaximumConcurrency> decode_graphs;
+
     // Per-lane host-side execution results. Spans handed to the engine point at these arrays, which
     // are stable for the Program lifetime.
     struct LaneExecution {
@@ -198,25 +218,29 @@ struct Program::Impl {
 
 std::unique_ptr<Program> Program::create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                          std::uint32_t context, std::size_t reservation_bytes) {
-    return create_impl(nullptr, nullptr, active_lanes, kv_pages, context, reservation_bytes);
+    return create_impl(nullptr, nullptr, active_lanes, kv_pages, context, reservation_bytes, false);
 }
 
 std::unique_ptr<Program> Program::create(const RuntimeModelView& model, cudaStream_t stream,
                                          std::uint32_t active_lanes, std::uint32_t kv_pages,
-                                         std::uint32_t context, std::size_t reservation_bytes) {
-    return create_impl(&model, stream, active_lanes, kv_pages, context, reservation_bytes);
+                                         std::uint32_t context, std::size_t reservation_bytes,
+                                         bool use_cuda_graph) {
+    return create_impl(&model, stream, active_lanes, kv_pages, context, reservation_bytes,
+                       use_cuda_graph);
 }
 
 std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cudaStream_t stream,
                                               std::uint32_t active_lanes, std::uint32_t kv_pages,
                                               std::uint32_t context,
-                                              std::size_t reservation_bytes) {
+                                              std::size_t reservation_bytes,
+                                              bool use_cuda_graph) {
     if (active_lanes == 0 || active_lanes > kMaximumConcurrency) {
         throw std::invalid_argument("sensenova_loop_9b: invalid active lane count");
     }
     auto impl                            = std::make_unique<Impl>();
     impl->model  = model;
     impl->stream = stream;
+    impl->use_cuda_graph = use_cuda_graph;
     impl->admission.active_lanes         = active_lanes;
     impl->admission.main_kv_pages        = kv_pages;
     impl->memory.max_context             = context;
@@ -299,6 +323,20 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
         impl->decode_workspace_bytes =
             TextExecutionContext::forward_workspace_capacity_bytes(1, impl->kv_capacity);
         impl->decode_workspace = DeviceBuffer(impl->decode_workspace_bytes);
+
+        // Fixed-address staging for the captured decode step. The tensors are views into one
+        // allocation, so no host pointer ever changes across capture, replay, or the eager path.
+        impl->decode_io = DeviceBuffer(Impl::kLaneIoBytes * active_lanes);
+        auto* io_base   = static_cast<std::uint8_t*>(impl->decode_io.p);
+        for (std::uint32_t lane = 0; lane < active_lanes; ++lane) {
+            auto* slot = io_base + static_cast<std::size_t>(lane) * Impl::kLaneIoBytes;
+            Impl::LaneIo& io = impl->lane_io[lane];
+            io.ids       = Tensor(slot, DType::I32, {1});
+            io.positions = Tensor(slot + 4, DType::I32, {1});
+            io.sampled   = Tensor(slot + 8, DType::I32, {1});
+            io.logprob   = Tensor(slot + 12, DType::FP32, {1});
+            io.margin    = Tensor(slot + 16, DType::FP32, {1});
+        }
     }
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
@@ -346,6 +384,29 @@ bool Program::verify_state_image_markers_for_test(const Program& program, std::u
         if (byte != value) { return false; }
     }
     return true;
+}
+
+DecodeGraphInspection Program::inspect_decode_graph_for_test(const Program& program,
+                                                             std::uint32_t lane) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("lane is out of range"); }
+    DecodeGraphInspection inspection;
+    inspection.configured = program.impl_->use_cuda_graph;
+    inspection.attempted  = program.impl_->decode_graphs[lane].attempted();
+    inspection.ready      = program.impl_->decode_graphs[lane].ready();
+    inspection.diagnostic = program.impl_->decode_graphs[lane].diagnostic();
+    return inspection;
+}
+
+void Program::seed_lane_for_test(Program& program, std::uint32_t lane, std::uint32_t frontier,
+                                 std::uint32_t last_token) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("lane is out of range"); }
+    LaneState& state = program.impl_->lanes[lane];
+    state = LaneState{};
+    state.lifecycle   = Lifecycle::Active;
+    state.prompt_tokens = frontier;
+    state.frontier    = frontier;
+    program.impl_->execution[lane] = Impl::LaneExecution{};
+    program.impl_->execution[lane].last_token = last_token;
 }
 
 Program::Program(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -518,39 +579,55 @@ void Program::decode_one(std::uint32_t lane) {
         throw std::logic_error("sensenova_loop_9b: decode frontier exceeds the KV capacity");
     }
 
-    const auto started             = std::chrono::steady_clock::now();
-    WorkspaceArena workspace(DeviceSpan{impl_->decode_workspace.p, impl_->decode_workspace_bytes});
-    const DeviceArena::Scope scope = workspace.scope();
+    Impl::LaneIo& io = impl_->lane_io[lane];
+    if (io.ids.data == nullptr) {
+        throw std::logic_error("sensenova_loop_9b: decode staging is not prepared");
+    }
+
+    const auto started          = std::chrono::steady_clock::now();
+    const TokenId input         = impl_->execution[lane].last_token;
+    const std::int32_t position = static_cast<std::int32_t>(state.frontier);
+    CUDA_CHECK(cudaMemcpyAsync(io.ids.data, &input, sizeof(TokenId), cudaMemcpyHostToDevice,
+                               impl_->stream));
+    CUDA_CHECK(cudaMemcpyAsync(io.positions.data, &position, sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, impl_->stream));
+
+    const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
+                                         impl_->gdn_conv, impl_->mhc_router};
+    // The captured body must be valid at every later frontier, so it runs with the envelope of the
+    // declared KV capacity instead of this step's frontier. The causal mask itself is still read
+    // from the uploaded position, and the decode workspace is sized for exactly this envelope.
+    auto run_forward = [&] {
+        WorkspaceArena workspace(DeviceSpan{impl_->decode_workspace.p,
+                                            impl_->decode_workspace_bytes});
+        TextExecutionContext context(*impl_->model, impl_->stream,
+                                     static_cast<std::byte*>(impl_->state_images.p),
+                                     impl_->kv_capacity, workspace, bindings);
+        context.forward_full(io.ids, io.positions, impl_->kv_capacity, io.sampled, &io.logprob,
+                             &io.margin);
+    };
 
     TokenId host_token = 0;
     float host_logprob = 0.0F;
     float host_margin  = 0.0F;
     try {
-        Tensor ids       = workspace.alloc(DType::I32, {1});
-        Tensor positions = workspace.alloc(DType::I32, {1});
-        Tensor sampled   = workspace.alloc(DType::I32, {1});
-        Tensor logprob   = workspace.alloc(DType::FP32, {1});
-        Tensor margin    = workspace.alloc(DType::FP32, {1});
+        bool launched = false;
+        if (impl_->use_cuda_graph) {
+            DecodeGraphRunner& graph = impl_->decode_graphs[lane];
+            if (!graph.attempted()) { (void)graph.try_capture(impl_->stream, run_forward); }
+            if (graph.ready()) {
+                graph.launch(impl_->stream);
+                launched = true;
+            }
+        }
+        if (!launched) { run_forward(); }
 
-        const TokenId input         = impl_->execution[lane].last_token;
-        const std::int32_t position = static_cast<std::int32_t>(state.frontier);
-        CUDA_CHECK(cudaMemcpyAsync(ids.data, &input, sizeof(TokenId), cudaMemcpyHostToDevice,
-                                   impl_->stream));
-        CUDA_CHECK(cudaMemcpyAsync(positions.data, &position, sizeof(std::int32_t),
-                                   cudaMemcpyHostToDevice, impl_->stream));
-
-        const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
-                                             impl_->gdn_conv, impl_->mhc_router};
-        TextExecutionContext context(*impl_->model, impl_->stream,
-                                     static_cast<std::byte*>(impl_->state_images.p),
-                                     impl_->kv_capacity, workspace, bindings);
-        context.forward_full(ids, positions, state.frontier + 1, sampled, &logprob, &margin);
-
-        CUDA_CHECK(cudaMemcpyAsync(&host_token, sampled.data, sizeof(TokenId),
+        // Host frontier publication stays outside the captured region: only the kernels replay.
+        CUDA_CHECK(cudaMemcpyAsync(&host_token, io.sampled.data, sizeof(TokenId),
                                    cudaMemcpyDeviceToHost, impl_->stream));
-        CUDA_CHECK(cudaMemcpyAsync(&host_logprob, logprob.data, sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(&host_logprob, io.logprob.data, sizeof(float),
                                    cudaMemcpyDeviceToHost, impl_->stream));
-        CUDA_CHECK(cudaMemcpyAsync(&host_margin, margin.data, sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(&host_margin, io.margin.data, sizeof(float),
                                    cudaMemcpyDeviceToHost, impl_->stream));
         CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
     } catch (const std::bad_alloc&) {
@@ -661,6 +738,37 @@ std::uint32_t Program::retained_lane_depth(std::uint32_t lane) const noexcept {
 
 void Program::evict_retained_lane(std::uint32_t lane) noexcept {
     if (has_retained_lane(lane)) { abort_lane(lane); }
+}
+
+PrefixStateSnapshot Program::capture_prefix_state(std::uint32_t lane) const {
+    if (lane >= impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (impl_->state_images.p == nullptr || impl_->state_image_bytes == 0) {
+        throw std::logic_error("sensenova_loop_9b: prefix snapshot requires state images");
+    }
+    PrefixStateSnapshot snapshot;
+    snapshot.device_ = DeviceBuffer(impl_->state_image_bytes);
+    CUDA_CHECK(cudaMemcpyAsync(snapshot.device_.p, impl_->state_images.p, impl_->state_image_bytes,
+                               cudaMemcpyDeviceToDevice, impl_->stream));
+    CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
+    snapshot.token_count_ = impl_->lanes[lane].frontier;
+    snapshot.last_token_  = impl_->execution[lane].last_token;
+    return snapshot;
+}
+
+void Program::restore_prefix_state(std::uint32_t lane, const PrefixStateSnapshot& snapshot) {
+    if (lane >= impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (snapshot.device_.p == nullptr || snapshot.device_.bytes != impl_->state_image_bytes) {
+        throw std::invalid_argument(
+            "sensenova_loop_9b: prefix snapshot does not match this Program's state image");
+    }
+    if (impl_->lanes[lane].lifecycle == Lifecycle::Free) {
+        throw std::logic_error("sensenova_loop_9b: prefix restore requires an occupied lane");
+    }
+    CUDA_CHECK(cudaMemcpyAsync(impl_->state_images.p, snapshot.device_.p, impl_->state_image_bytes,
+                               cudaMemcpyDeviceToDevice, impl_->stream));
+    CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
+    impl_->lanes[lane].frontier        = snapshot.token_count_;
+    impl_->execution[lane].last_token  = snapshot.last_token_;
 }
 
 GenerationTimings Program::generation_timings_lane(std::uint32_t lane) const noexcept {

@@ -118,6 +118,16 @@ target_include_directories(ninfer_sensenova_loop_9b_program_lifecycle_test PRIVA
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
 target_link_libraries(ninfer_sensenova_loop_9b_program_lifecycle_test PRIVATE ${NINFER_CUDART_TARGET})
 
+# Decode-graph capture and replay for the SenseNova one-token step. The cases use real device
+# nodes, so capture, replay semantics, and the eager fallback are exercised on the runtime;
+# whole-model token equality additionally needs the licensed artifact and is not part of this test.
+ninfer_add_test(ninfer_sensenova_loop_9b_graph_replay_test
+  SOURCES targets/sensenova_loop_9b/test_graph_replay.cpp)
+target_include_directories(ninfer_sensenova_loop_9b_graph_replay_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
+target_link_libraries(ninfer_sensenova_loop_9b_graph_replay_test PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
+
 # Real-artifact load-plan verification for the SenseNova target. Skips cleanly when the licensed
 # artifact is not installed.
 ninfer_add_test(ninfer_sensenova_loop_9b_bindings_test

@@ -5,6 +5,7 @@
 // compile against a closed target package without pretending that generation is implemented.
 
 #include <ninfer/targets/sensenova_loop_9b/package.h>
+#include "core/arena.h"
 #include "runtime/contract/types.h"
 #include <cuda_runtime.h>
 
@@ -42,6 +43,43 @@ struct LaneStateSnapshot {
     std::uint32_t generated_tokens        = 0;
     std::uint32_t frontier                = 0;
     std::uint32_t page_entitlement        = 0;
+};
+
+// Diagnostic view of one lane's decode graph. `configured` is the plan's graph intent;
+// `attempted` records that the lane tried to capture once; `ready` reports a replayable graph.
+// A configured lane that attempted and is not ready fell back to eager decode, and
+// `diagnostic` says why.
+struct DecodeGraphInspection {
+    bool configured = false;
+    bool attempted  = false;
+    bool ready      = false;
+    std::string diagnostic;
+};
+
+// A prefix-boundary copy of every device state domain -- all 15 KV domains, all 42 GDN slots,
+// and all 48 mHC slots -- together with the host identity needed to resume at that boundary.
+// The copy is complete by construction: its byte count must equal the Program's whole state
+// image, so no looped visit identity is left behind when it is restored.
+class PrefixStateSnapshot {
+public:
+    PrefixStateSnapshot() noexcept = default;
+    ~PrefixStateSnapshot()         = default;
+
+    PrefixStateSnapshot(PrefixStateSnapshot&&) noexcept            = default;
+    PrefixStateSnapshot& operator=(PrefixStateSnapshot&&) noexcept = default;
+    PrefixStateSnapshot(const PrefixStateSnapshot&)                = delete;
+    PrefixStateSnapshot& operator=(const PrefixStateSnapshot&)     = delete;
+
+    [[nodiscard]] bool empty() const noexcept { return device_.bytes == 0; }
+    [[nodiscard]] std::size_t bytes() const noexcept { return device_.bytes; }
+    [[nodiscard]] std::uint32_t token_count() const noexcept { return token_count_; }
+    [[nodiscard]] std::uint32_t last_token() const noexcept { return last_token_; }
+
+private:
+    DeviceBuffer device_;
+    std::uint32_t token_count_ = 0;
+    std::uint32_t last_token_  = 0;
+    friend class Program;
 };
 
 class RequestBasePlan {
@@ -97,6 +135,7 @@ public:
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
+    [[nodiscard]] bool use_cuda_graph() const noexcept;
 
 private:
     struct Impl;
@@ -140,11 +179,16 @@ public:
         const Program& program);
     static void write_state_image_markers_for_test(Program& program, std::uint8_t value);
     static bool verify_state_image_markers_for_test(const Program& program, std::uint8_t value);
+    [[nodiscard]] static DecodeGraphInspection inspect_decode_graph_for_test(
+        const Program& program, std::uint32_t lane);
+    static void seed_lane_for_test(Program& program, std::uint32_t lane,
+                                   std::uint32_t frontier, std::uint32_t last_token);
     static std::unique_ptr<Program> create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                            std::uint32_t context, std::size_t reservation_bytes);
     static std::unique_ptr<Program> create(const RuntimeModelView& model, cudaStream_t stream,
                                            std::uint32_t active_lanes, std::uint32_t kv_pages,
-                                           std::uint32_t context, std::size_t reservation_bytes);
+                                           std::uint32_t context, std::size_t reservation_bytes,
+                                           bool use_cuda_graph = false);
     ~Program() noexcept;
 
     Program(const Program&)            = delete;
@@ -178,6 +222,14 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+
+    // Stage E6 prefix reuse primitive. `capture_prefix_state` copies the whole state image at the
+    // lane's current frontier into a fresh device buffer and records that frontier and the last
+    // committed token. `restore_prefix_state` writes the image back and reinstates those two host
+    // values, so the next decode step continues from the snapshot's boundary. Restoring into a
+    // free (aborted) lane is rejected: a snapshot must never resurrect released state.
+    [[nodiscard]] PrefixStateSnapshot capture_prefix_state(std::uint32_t lane) const;
+    void restore_prefix_state(std::uint32_t lane, const PrefixStateSnapshot& snapshot);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
     void snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
@@ -201,7 +253,8 @@ private:
     static std::unique_ptr<Program> create_impl(const RuntimeModelView* model, cudaStream_t stream,
                                                 std::uint32_t active_lanes,
                                                 std::uint32_t kv_pages, std::uint32_t context,
-                                                std::size_t reservation_bytes);
+                                                std::size_t reservation_bytes,
+                                                bool use_cuda_graph);
     std::unique_ptr<Impl> impl_;
     friend struct ::ninfer::targets::sensenova_loop_9b::Package;
 };

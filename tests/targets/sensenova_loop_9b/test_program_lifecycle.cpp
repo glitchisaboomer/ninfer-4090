@@ -137,6 +137,53 @@ void test_output_contract() {
            "a lane that has not run reports zero timings");
 }
 
+void test_prefix_state_snapshot() {
+    auto program = sn::Program::create(1, 8, 4096, 1U << 20U);
+    sn::Program::seed_lane_for_test(*program, 0, 7, sn::TextConfig::end_of_text_token);
+    sn::Program::write_state_image_markers_for_test(*program, 0x5A);
+
+    const sn::PrefixStateSnapshot snapshot = program->capture_prefix_state(0);
+    const auto image = sn::Program::inspect_state_images_for_test(*program);
+    expect(!snapshot.empty(), "prefix snapshot owns a device copy");
+    expect(snapshot.bytes() == image.bytes,
+           "prefix snapshot covers the whole state image, including every looped visit");
+    expect(snapshot.token_count() == 7, "prefix snapshot records the frontier");
+    expect(snapshot.last_token() == sn::TextConfig::end_of_text_token,
+           "prefix snapshot records the last committed token");
+
+    sn::Program::write_state_image_markers_for_test(*program, 0x00);
+    program->restore_prefix_state(0, snapshot);
+    expect(sn::Program::verify_state_image_markers_for_test(*program, 0x5A),
+           "prefix restore brings back all 15 KV, 42 GDN, and 48 mHC domains");
+    expect(sn::Program::inspect_lane_for_test(*program, 0).frontier == 7,
+           "prefix restore reinstates the host frontier");
+
+    bool rejected = false;
+    try {
+        program->restore_prefix_state(0, sn::PrefixStateSnapshot{});
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    expect(rejected, "an empty snapshot is rejected");
+
+    program->abort_lane(0);
+    bool aborted_rejected = false;
+    try {
+        program->restore_prefix_state(0, snapshot);
+    } catch (const std::logic_error&) {
+        aborted_rejected = true;
+    }
+    expect(aborted_rejected, "a snapshot cannot resurrect an aborted lane");
+}
+
+void test_decode_graph_reporting() {
+    auto program = sn::Program::create(1, 8, 4096, 1U << 20U);
+    const auto inspection = sn::Program::inspect_decode_graph_for_test(*program, 0);
+    expect(!inspection.configured, "the test factory does not configure decode graphs");
+    expect(!inspection.attempted && !inspection.ready,
+           "a Program without a model has no captured decode step");
+}
+
 void test_memory() {
     auto program   = sn::Program::create(1, 16, 2048, 987654321ULL);
     const auto mem = program->memory_summary();
@@ -153,6 +200,8 @@ int main() {
     test_prefill_requires_model();
     test_decode_batch_validation();
     test_output_contract();
+    test_prefix_state_snapshot();
+    test_decode_graph_reporting();
     test_memory();
     if (failures != 0) {
         std::cerr << "FAIL senseNova program lifecycle: " << failures << '\n';
