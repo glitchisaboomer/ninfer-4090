@@ -28,8 +28,8 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
 
 bool gqa_attention_uses_small_t(std::int32_t tokens);
 
-GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
-                                              std::int32_t batch_size,
+GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t kv_heads,
+                                              std::int32_t width, std::int32_t batch_size,
                                               GqaExecutionEnvelope envelope);
 
 const char* gqa_attention_route_name(GqaAttentionRoute route);

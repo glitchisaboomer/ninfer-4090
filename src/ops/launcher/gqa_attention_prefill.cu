@@ -163,6 +163,11 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                                                  metadata, out, stream, make_rerotate_freq(cache.rope_inv_freq));
         return;
     }
+    if (q.ne[1] == GqaSenseNovaGeometry::QHeads && cache.num_kv_heads == GqaSenseNovaGeometry::KVHeads) {
+        gqa_attention_prompt_attention_launch_for<GqaSenseNovaGeometry>(q, positions, scale, cache,
+                                                                        metadata, out, stream, make_rerotate_freq(cache.rope_inv_freq));
+        return;
+    }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
                                                              out, stream, make_rerotate_freq(cache.rope_inv_freq));
 }
@@ -199,6 +204,12 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
                                                                      metadata, out, stream, make_rerotate_freq(cache.rope_inv_freq));
+            return;
+        }
+        if (q.ne[1] == GqaSenseNovaGeometry::QHeads && cache.num_kv_heads == GqaSenseNovaGeometry::KVHeads) {
+            gqa_kv_append_launch_for<GqaSenseNovaGeometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<GqaSenseNovaGeometry>(q, positions, scale, cache,
+                                                                            metadata, out, stream, make_rerotate_freq(cache.rope_inv_freq));
             return;
         }
         gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);

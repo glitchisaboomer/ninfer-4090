@@ -179,7 +179,7 @@ AttentionRun run_append_attention_view(Cache& cache,
 
     const ops::GqaExecutionEnvelope envelope{visible, visible};
     const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kQHeads, DType::BF16, envelope, 1,
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKVHeads, DType::BF16, envelope, 1,
                                                            tokens, tokens);
     DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});

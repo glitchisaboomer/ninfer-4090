@@ -426,6 +426,8 @@ int main() {
     failures +=
         run_pair_case({"35b text native-context tail", 256, 64, 1, 7, kTextTheta}, 16, 2, 262'137);
     failures += run_pair_case({"35b text mrope", 256, 64, 3, 7, kTextTheta}, 16, 2, 2048, 16, 8);
+    failures += run_pair_case({"sensenova text decode", 256, 64, 1, 7, kTextTheta}, 16, 4, 4096);
+    failures += run_pair_case({"sensenova text mrope", 256, 64, 3, 7, kTextTheta}, 16, 4, 2048, 16, 8);
 
     // MTP bulk K append uses the single-tensor form; proposal tail uses the pair form above.
     failures += run_single_case({"27b mtp k mrope", 256, 64, 3, 128, kTextTheta}, 4, 8192);

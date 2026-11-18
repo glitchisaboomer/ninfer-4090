@@ -28,6 +28,26 @@ std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
 }
 
+bool is_sensenova_geometry(std::int32_t q_heads, std::int32_t kv_heads) {
+    return q_heads == 16 && kv_heads == 4;
+}
+
+std::int32_t kv_heads_for_geometry(const Tensor& q, const PagedKVLayerView& cache,
+                                   const char* op) {
+    if (q.ne[1] == 24 && cache.num_kv_heads == 4) { return 4; }
+    if (q.ne[1] == 16 && cache.num_kv_heads == 2) { return 2; }
+    if (is_sensenova_geometry(q.ne[1], cache.num_kv_heads)) { return 4; }
+    throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
+}
+
+std::int32_t kv_heads_for_geometry(const Tensor& q, const PagedKVBatchLayerView& cache,
+                                   const char* op) {
+    if (q.ne[1] == 24 && cache.num_kv_heads == 4) { return 4; }
+    if (q.ne[1] == 16 && cache.num_kv_heads == 2) { return 2; }
+    if (is_sensenova_geometry(q.ne[1], cache.num_kv_heads)) { return 4; }
+    throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
+}
+
 void require_kv_heads(std::int32_t kv_heads, const char* op) {
     if (kv_heads != 4 && kv_heads != 2) {
         throw std::invalid_argument(std::string(op) + ": unsupported KV head geometry");
@@ -225,7 +245,7 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
         throw std::invalid_argument(std::string(op) + ": scale must be positive and finite");
     }
     const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
+    const std::int32_t kv_heads = kv_heads_for_geometry(q, cache, op);
     const std::int32_t tokens   = q.ne[2];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
     require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
@@ -257,7 +277,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         throw std::invalid_argument(std::string(op) + ": scale must be positive and finite");
     }
     const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
+    const std::int32_t kv_heads = kv_heads_for_geometry(q, cache, op);
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
     if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
@@ -356,9 +376,10 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
 
 namespace detail {
 
-GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
-                                              std::int32_t batch_size,
+GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t kv_heads,
+                                              std::int32_t width, std::int32_t batch_size,
                                               GqaExecutionEnvelope envelope) {
+    if (is_sensenova_geometry(q_heads, kv_heads)) { return GqaAttentionRoute::Prompt; }
     if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys = kThreeChunkPromptVisibleKeys;
@@ -383,11 +404,13 @@ const char* gqa_attention_route_name(GqaAttentionRoute route) {
 
 } // namespace detail
 
-std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
+std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, std::int32_t kv_heads,
+                                                   DType cache_dtype,
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
-    (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
+    (void)q_heads;
+    (void)kv_heads;
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
@@ -406,7 +429,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     };
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
-            detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
+            detail::gqa_attention_resolve_route(q_heads, kv_heads, width, batch_size, envelope);
         if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
@@ -439,7 +462,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     }
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q.ne[1], op);
+    const std::int32_t kv_heads = kv_heads_for_geometry(q, cache, op);
     require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
     require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");
@@ -447,7 +470,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+        detail::gqa_attention_resolve_route(q.ne[1], cache.num_kv_heads, width, batch, envelope);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
@@ -501,7 +524,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
+        detail::gqa_attention_resolve_route(q.ne[1], cache.num_kv_heads, q.ne[2], 1, envelope);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;

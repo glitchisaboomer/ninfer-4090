@@ -21,5 +21,6 @@ struct GqaGeometry {
 
 using Gqa27Geometry = GqaGeometry<24, 4, 1>;
 using Gqa35Geometry = GqaGeometry<16, 2, 2>;
+using GqaSenseNovaGeometry = GqaGeometry<16, 4, 1>;
 
 } // namespace ninfer::ops

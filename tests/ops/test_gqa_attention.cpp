@@ -51,6 +51,7 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"qwen3_6_27b", 24, 4},
     {"qwen3_6_35b_a3b", 16, 2},
+    {"sensenova_loop_9b", 16, 4},
 };
 
 struct AttentionCase {
@@ -972,7 +973,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1034,7 +1035,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1208,7 +1209,7 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(maximum_visible),
                                              static_cast<std::uint32_t>(maximum_visible)};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, batch, test_case.width, test_case.width);
+        geometry.q_heads, geometry.kv_heads, dtype, envelope, batch, test_case.width, test_case.width);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -1339,11 +1340,11 @@ int verify_workspace_capacity_contract() {
     for (const DType dtype : {DType::BF16, DType::I8}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
-            ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);
+            ops::gqa_attention_workspace_capacity_bytes(16, 2, dtype, envelope, 1, 1, 17);
         std::size_t witness = 0;
         for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
             witness = std::max(witness, ops::gqa_attention_workspace_capacity_bytes(
-                                            16, dtype, envelope, 1, tokens, tokens));
+                                            16, 2, dtype, envelope, 1, tokens, tokens));
         }
         if (interval != witness) {
             std::cerr << "gqa_attention interval capacity has no exact route witness\n";
@@ -1352,14 +1353,14 @@ int verify_workspace_capacity_contract() {
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
+            16, 2, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
     } catch (const std::invalid_argument&) {
         std::cerr << "gqa_attention rejected its maximum visible-key envelope\n";
         ++failures;
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            16, 2, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
         std::cerr << "gqa_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}

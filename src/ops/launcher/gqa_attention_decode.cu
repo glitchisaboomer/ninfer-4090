@@ -135,7 +135,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         // overlays p_s, both ride in the dynamic arena -- so every INT8 configuration opts in now,
         // including the ones whose K/V arena is a static tile.
         constexpr std::size_t kDynamicBytes =
-            (DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0ULL) +
+            (DynamicArena ? gqa_attention_decode_i8_arena_bytes<KeyBlock>() : 0ULL) +
             gqa_attention_decode_i8_shift_bytes<Geometry, TokenTile>();
         static const cudaError_t attr = cudaFuncSetAttribute(
             gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
@@ -175,13 +175,16 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     } else if constexpr (TokenTile == 6) {
         // Three Q row tiles for the 27B group of six (RowTiles = 3).
         if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<6, 1, 32, false>();
+            launch.template operator()<6, 2, 32, false>();
         } else if (implementation_window <= 2054) {
-            launch.template operator()<6, 1, 32, false>();
+            launch.template operator()<6, 2, 32, false>();
         } else if (implementation_window <= 8198) {
+            // Bc=64 still needs 72,848 B of dynamic arena against a 99,328 B per-SM ceiling, so a
+            // second block cannot be resident no matter what is requested. Asking for 2 here would
+            // only halve the register budget ptxas may use for a block that stays alone.
             launch.template operator()<6, 1, 64, true>();
         } else {
-            launch.template operator()<6, 1, 32, false>();
+            launch.template operator()<6, 2, 32, false>();
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {
@@ -254,6 +257,8 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
     if (q_heads == Gqa27Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_dtype);
     }
+    // Q=16 is shared by 35B and SenseNova. The capacity is the same for both
+    // selected split scales; the launch site chooses the geometry from KV heads.
     if (q_heads == Gqa35Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
     }
