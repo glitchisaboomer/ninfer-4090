@@ -69,6 +69,10 @@ using W8MtpAttentionOutputGeometry     = W8LinearGeometry<5120, 6144>;
 using W8MtpGateUpProjectionGeometry    = W8LinearGeometry<34816, 5120>;
 using W8MtpDownProjectionGeometry      = W8LinearGeometry<5120, 17408>;
 using W835bMtpProjectionGeometry       = W8LinearGeometry<2048, 4096>;
+using W8SenseNovaMtpFcProjectionGeometry = W8LinearGeometry<4096, 8192>;
+using W8SenseNovaMtpAttnOutputGeometry  = W8LinearGeometry<4096, 8192>;
+using W8SenseNovaMtpGateUpGeometry      = W8LinearGeometry<24576, 4096>;
+using W8SenseNovaMtpDownGeometry        = W8LinearGeometry<4096, 12288>;
 
 inline constexpr std::int32_t kW8VocabularyFirstSmallT         = 1;
 inline constexpr std::int32_t kW8VocabularyLastSmallT          = 33;
