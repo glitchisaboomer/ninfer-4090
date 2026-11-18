@@ -178,8 +178,8 @@ into a stable loaded model, but no generation path is needed yet.
   tests pass.
 - Note: building every test currently hits an unrelated `kKVHeads` typo in
   `tests/ops/gqa_relocation_test_common.h`; that pre-existing issue is outside this stage.
-- Gitea commit: `TBD`.
-- GitHub commit: `TBD`.
+- Gitea commit: `0a1dbb7a`.
+- GitHub commit: `f6ff7656`.
 
 **Proposed commit**
 
