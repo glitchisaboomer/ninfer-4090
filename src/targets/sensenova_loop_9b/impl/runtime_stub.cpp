@@ -4,14 +4,20 @@
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
+#include "targets/sensenova_loop_9b/impl/runtime/layer_execution.h"
 #include "targets/sensenova_loop_9b/impl/runtime/layouts.h"
 #include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
+#include "targets/sensenova_loop_9b/impl/runtime/text_execution.h"
+
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <array>
+#include <string>
 #include <vector>
 #include <stdexcept>
 #include <utility>
@@ -160,8 +166,36 @@ struct Program::Impl {
     std::array<float, kMaximumConcurrency> pending_logprobs{};
     std::vector<TokenId> egress_tokens;
     std::vector<float> egress_logprobs;
+    std::vector<float> egress_margins;
     std::vector<std::int32_t> egress_row_counts;
     std::size_t egress_span = 1;
+
+    // Execution assets prepared once from the stored artifact forms: the identity KV page map and
+    // row selector, the op-form GDN convolution and mHC router weights, and the Program-owned
+    // transient region eager decode runs in (the engine supplies a per-request region only for
+    // prefill, and a decode step has no request-scoped allocation of its own).
+    DeviceBuffer kv_aux;
+    Tensor kv_block_table;  // I32 [kv_pages]
+    Tensor kv_table_rows;   // I32 [1]
+    DeviceBuffer visit_assets;
+    std::array<Tensor, TextConfig::layers> gdn_conv{};
+    std::array<Tensor, 2 * TextConfig::layers> mhc_router{};
+    DeviceBuffer decode_workspace;
+    std::size_t decode_workspace_bytes = 0;
+
+    // Per-lane host-side execution results. Spans handed to the engine point at these arrays, which
+    // are stable for the Program lifetime.
+    struct LaneExecution {
+        TokenId last_token = 0;
+        std::array<TokenId, 1> prefill_tokens{};
+        std::array<float, 1> prefill_logprobs{};
+        std::array<float, 1> prefill_margins{};
+        std::array<TokenId, 1> pending_tokens{};
+        std::array<float, 1> pending_logprobs{};
+        std::array<float, 1> pending_margins{};
+        GenerationTimings timings{};
+    };
+    std::array<LaneExecution, kMaximumConcurrency> execution;
 };
 
 std::unique_ptr<Program> Program::create(std::uint32_t active_lanes, std::uint32_t kv_pages,
@@ -207,6 +241,67 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
     impl->state_image_bytes        = kv_bytes + fixed_bytes;
     impl->state_images             = DeviceBuffer(impl->state_image_bytes);
     impl->state_images.fill(0);
+
+    if (model != nullptr) {
+        // Identity logical-to-physical page map for every KV domain, followed by the B=1 row
+        // selector. Both are constant for the Program lifetime: every domain is one contiguous
+        // sequence, so the same table describes all fifteen.
+        const std::size_t pages = impl->kv_capacity / StateImageLayout::kKvPageTokens;
+        impl->kv_aux = DeviceBuffer((pages + 1) * sizeof(std::int32_t));
+        std::vector<std::int32_t> kv_host(pages + 1);
+        for (std::size_t page = 0; page < pages; ++page) {
+            kv_host[page] = static_cast<std::int32_t>(page);
+        }
+        kv_host[pages] = 0;
+        impl->kv_aux.copy_from_host(kv_host.data(), kv_host.size() * sizeof(std::int32_t));
+        impl->kv_block_table =
+            Tensor(impl->kv_aux.p, DType::I32, {static_cast<std::int32_t>(pages)});
+        impl->kv_table_rows =
+            Tensor(static_cast<std::int32_t*>(impl->kv_aux.p) + pages, DType::I32, {1});
+
+        // The op forms differ from the stored forms, so they are prepared once here rather than
+        // transposed on every visit. The transposes are stream-ordered and drained before the
+        // first forward can read them.
+        const std::size_t conv_bytes = static_cast<std::size_t>(TextConfig::convolution_dim) *
+                                       TextConfig::gdn_conv_kernel * sizeof(std::uint16_t);
+        const std::size_t router_bytes = static_cast<std::size_t>(MhcConfig::input_width) *
+                                         MhcConfig::logits * sizeof(float);
+        impl->visit_assets = DeviceBuffer(conv_bytes * TextConfig::layers +
+                                          router_bytes * 2 * TextConfig::layers);
+        auto* assets_base = static_cast<std::uint8_t*>(impl->visit_assets.p);
+        std::size_t asset_offset = 0;
+        for (int layer = 0; layer < TextConfig::layers; ++layer) {
+            Tensor& conv = impl->gdn_conv[layer];
+            conv = Tensor(assets_base + asset_offset, DType::BF16,
+                          {TextConfig::convolution_dim, TextConfig::gdn_conv_kernel});
+            asset_offset += conv_bytes;
+            if (!TextConfig::is_full_attention(layer)) {
+                transpose_gdn_convolution_weight(model->layers[layer].gdn.convolution, conv,
+                                                 impl->stream);
+            }
+        }
+        for (int layer = 0; layer < TextConfig::layers; ++layer) {
+            for (int branch = 0; branch < 2; ++branch) {
+                Tensor& router = impl->mhc_router[2 * layer + branch];
+                router = Tensor(assets_base + asset_offset, DType::FP32,
+                                {MhcConfig::input_width, MhcConfig::logits});
+                asset_offset += router_bytes;
+                if (TextConfig::is_mhc_layer(layer)) {
+                    transpose_mhc_router_weight(
+                        branch == 0 ? model->layers[layer].mhc_attn.weight
+                                    : model->layers[layer].mhc_ffn.weight,
+                        router, impl->stream);
+                }
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(impl->stream));
+
+        // Decode runs one token at a time from a Program-owned region sized for the widest causal
+        // history the declared capacity allows.
+        impl->decode_workspace_bytes =
+            TextExecutionContext::forward_workspace_capacity_bytes(1, impl->kv_capacity);
+        impl->decode_workspace = DeviceBuffer(impl->decode_workspace_bytes);
+    }
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
 
@@ -265,8 +360,17 @@ RequestBasePlan Program::plan_request_base(const qwen3_6::PreparedPrompt& prompt
     impl->summary.prompt_tokens = summary.prompt_tokens;
     impl->summary.requested_output_tokens = options.requested_output_tokens;
     impl->summary.effective_output_tokens = options.requested_output_tokens;
-    impl->summary.transient_bytes         = 4096;
-    impl->summary.transient_alignment     = 256;
+    // Eager prefill runs the whole prompt in one forward, so the request needs the embedding
+    // hidden state, the mHC stream buffers, the worst visit scratch, the head columns, and the
+    // device copies of its ids/positions.
+    const std::uint32_t plan_tokens =
+        std::max<std::uint32_t>(1, summary.prompt_tokens);
+    const std::size_t forward_bytes =
+        TextExecutionContext::forward_workspace_capacity_bytes(plan_tokens, plan_tokens);
+    const std::size_t staging_bytes =
+        ((2ULL * plan_tokens * sizeof(std::int32_t) + 255ULL) / 256ULL) * 256ULL;
+    impl->summary.transient_bytes     = forward_bytes + staging_bytes;
+    impl->summary.transient_alignment = 256;
     impl->summary.admission               = {1, 1, 0};
     const std::uint32_t chunks = summary.prompt_tokens == 0
                                      ? 1
@@ -301,25 +405,100 @@ runtime::AdmissionResources Program::admission_capacity() const noexcept { retur
 runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
                                                        qwen3_6::PreparedPrompt&& prompt,
                                                        RequestPlan&& plan,
-                                                       runtime::TransientRegion) {
+                                                       runtime::TransientRegion transient) {
     if (lane >= impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (!can_admit_lane(lane, plan)) { throw std::logic_error("lane is not admissible"); }
-    const PromptSummary info = prompt.summary();
-    LaneState& state          = impl_->lanes[lane];
-    state                     = LaneState{};
-    state.lifecycle           = Lifecycle::Pending;
-    state.prompt_tokens       = info.prompt_tokens;
-    state.page_entitlement    = (info.prompt_tokens + kSenseNovaPageTokens - 1) /
-                                kSenseNovaPageTokens;
-    state.frontier            = info.prompt_tokens;
+    if (impl_->model == nullptr) {
+        throw std::logic_error("sensenova_loop_9b: text prefill requires a loaded model; "
+                               "the test Program factory has none");
+    }
+
+    qwen3_6::PreparedPromptData data = qwen3_6::PreparedPromptAccess::take(std::move(prompt));
+    if (data.token_ids.empty()) {
+        throw std::invalid_argument("sensenova_loop_9b: prompt has no tokens");
+    }
+    if (data.token_ids.size() != data.positions.size()) {
+        throw std::invalid_argument("sensenova_loop_9b: prompt positions do not match its tokens");
+    }
+    if (data.token_ids.size() > impl_->kv_capacity) {
+        throw std::invalid_argument("sensenova_loop_9b: prompt exceeds the declared KV capacity");
+    }
+    if (data.has_media()) {
+        throw std::logic_error("sensenova_loop_9b: vision prompts are not supported");
+    }
+    if (!transient) {
+        throw std::invalid_argument("sensenova_loop_9b: text prefill requires a transient region");
+    }
+    const auto tokens = static_cast<std::uint32_t>(data.token_ids.size());
+
+    WorkspaceArena workspace(DeviceSpan{transient.data, transient.size});
+    const DeviceArena::Scope scope = workspace.scope();
+    const auto started             = std::chrono::steady_clock::now();
+
+    TokenId host_token  = 0;
+    float host_logprob  = 0.0F;
+    float host_margin   = 0.0F;
+    try {
+        const auto token_extent = static_cast<std::int32_t>(tokens);
+        Tensor ids        = workspace.alloc(DType::I32, {token_extent});
+        Tensor positions  = workspace.alloc(DType::I32, {token_extent});
+        Tensor sampled    = workspace.alloc(DType::I32, {1});
+        Tensor logprob    = workspace.alloc(DType::FP32, {1});
+        Tensor margin     = workspace.alloc(DType::FP32, {1});
+        CUDA_CHECK(cudaMemcpyAsync(ids.data, data.token_ids.data(),
+                                   tokens * sizeof(TokenId), cudaMemcpyHostToDevice,
+                                   impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(positions.data, data.positions.data(),
+                                   tokens * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                   impl_->stream));
+
+        const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
+                                             impl_->gdn_conv, impl_->mhc_router};
+        TextExecutionContext context(*impl_->model, impl_->stream,
+                                     static_cast<std::byte*>(impl_->state_images.p),
+                                     impl_->kv_capacity, workspace, bindings);
+        context.forward_full(ids, positions, tokens, sampled, &logprob, &margin);
+
+        CUDA_CHECK(cudaMemcpyAsync(&host_token, sampled.data, sizeof(TokenId),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(&host_logprob, logprob.data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(&host_margin, margin.data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
+    } catch (const std::bad_alloc&) {
+        throw std::invalid_argument(
+            "sensenova_loop_9b: request transient region is too small for text prefill");
+    }
+
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                               .count();
+
+    LaneState& state       = impl_->lanes[lane];
+    state                  = LaneState{};
+    state.lifecycle        = Lifecycle::Pending;
+    state.prompt_tokens    = tokens;
+    state.page_entitlement = (tokens + kSenseNovaPageTokens - 1) / kSenseNovaPageTokens;
+    state.frontier         = tokens;
+
+    Impl::LaneExecution& execution = impl_->execution[lane];
+    execution                      = Impl::LaneExecution{};
+    execution.last_token          = host_token;
+    execution.prefill_tokens[0]   = host_token;
+    execution.prefill_logprobs[0] = host_logprob;
+    execution.prefill_margins[0]  = host_margin;
+    execution.timings.prefill_seconds     = seconds;
+    execution.timings.first_token_seconds = seconds;
+    execution.timings.total_seconds       = seconds;
 
     runtime::PrefillStepResult result;
-    result.summary.prompt_tokens      = info.prompt_tokens;
-    result.processed_prompt_tokens    = info.prompt_tokens;
-    result.host_input_consumed        = true;
-    result.complete                   = true;
-    static constexpr TokenId kFirstToken = 0;
-    result.round.tokens                = std::span<const TokenId>(&kFirstToken, 1);
+    result.summary.prompt_tokens   = tokens;
+    result.processed_prompt_tokens = tokens;
+    result.host_input_consumed     = true;
+    result.complete                = true;
+    result.round.tokens            = std::span<const TokenId>(execution.prefill_tokens);
+    result.round.logprobs          = std::span<const float>(execution.prefill_logprobs);
+    result.round.margins           = std::span<const float>(execution.prefill_margins);
     return result;
 }
 

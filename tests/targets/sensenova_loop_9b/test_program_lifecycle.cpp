@@ -15,7 +15,8 @@
 
 namespace {
 
-namespace sn = ninfer::targets::sensenova_loop_9b::detail;
+namespace sn      = ninfer::targets::sensenova_loop_9b::detail;
+namespace qwen3_6 = ninfer::targets::qwen3_6;
 
 int failures = 0;
 
@@ -69,6 +70,29 @@ void test_state_images() {
            "state addresses are stable across access");
 }
 
+void test_prefill_requires_model() {
+    auto program = sn::Program::create(1, 32, 4096, 1U << 20U);
+
+    // The test factory has no loaded model. An empty prompt must not be the
+    // reason this fails: the missing model is reported first, and no lane state
+    // is mutated.
+    qwen3_6::PreparedPrompt prompt;
+    auto plan = sn::RequestPlanForTest::make();
+    bool reported_missing_model = false;
+    try {
+        (void)program->start_prefill_lane(0, std::move(prompt), std::move(plan), {});
+    } catch (const std::logic_error& error) {
+        reported_missing_model =
+            std::string_view(error.what()).find("loaded model") != std::string_view::npos;
+    } catch (...) {
+    }
+    expect(reported_missing_model, "prefill without a loaded model reports the missing model");
+
+    const auto lane = sn::Program::inspect_lane_for_test(*program, 0);
+    expect(!lane.occupied && lane.frontier == 0 && lane.prompt_tokens == 0,
+           "a rejected prefill leaves the lane untouched");
+}
+
 void test_memory() {
     auto program   = sn::Program::create(1, 16, 2048, 987654321ULL);
     const auto mem = program->memory_summary();
@@ -82,6 +106,7 @@ void test_memory() {
 int main() {
     test_lifecycle();
     test_state_images();
+    test_prefill_requires_model();
     test_memory();
     if (failures != 0) {
         std::cerr << "FAIL senseNova program lifecycle: " << failures << '\n';
