@@ -54,13 +54,6 @@ detail::SequencePlanner make_planner(DeviceContext& device, const EngineOptions&
     return detail::SequencePlanner::create(options, weights_profile);
 }
 
-std::unique_ptr<detail::Program> make_program(const detail::LoadedModel&, detail::SequencePlan&& plan,
-                                      DeviceContext& device) {
-    (void)device;
-    return detail::Program::create(plan.max_concurrency(), plan.kv_capacity(), plan.capacity(),
-                                   plan.device_reservation_bytes());
-}
-
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
@@ -105,7 +98,10 @@ detail::SequencePlanner Package::make_sequence_planner(DeviceContext& device, co
 
 std::unique_ptr<detail::Program> Package::create_program(const LoadedModel& model, SequencePlan&& plan,
                                                  DeviceContext& device) {
-    return make_program(model, std::move(plan), device);
+    if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    return detail::Program::create(model.impl_->data.runtime, device.stream, plan.max_concurrency(),
+                                   plan.kv_capacity(), plan.capacity(),
+                                   plan.device_reservation_bytes());
 }
 
 } // namespace ninfer::targets::sensenova_loop_9b

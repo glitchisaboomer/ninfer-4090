@@ -17,6 +17,7 @@
 #include <utility>
 
 namespace ninfer::targets::sensenova_loop_9b::detail {
+
 namespace {
 
 SequencePlanningInputs planning_inputs(const EngineOptions& options,
@@ -143,6 +144,8 @@ struct LaneState {
 };
 
 struct Program::Impl {
+    const RuntimeModelView* model = nullptr;
+    cudaStream_t stream           = nullptr;
     DeviceBuffer state_images;
     std::size_t state_image_bytes = 0;
     std::size_t state_kv_bytes    = 0;
@@ -163,10 +166,25 @@ struct Program::Impl {
 
 std::unique_ptr<Program> Program::create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                          std::uint32_t context, std::size_t reservation_bytes) {
+    return create_impl(nullptr, nullptr, active_lanes, kv_pages, context, reservation_bytes);
+}
+
+std::unique_ptr<Program> Program::create(const RuntimeModelView& model, cudaStream_t stream,
+                                         std::uint32_t active_lanes, std::uint32_t kv_pages,
+                                         std::uint32_t context, std::size_t reservation_bytes) {
+    return create_impl(&model, stream, active_lanes, kv_pages, context, reservation_bytes);
+}
+
+std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cudaStream_t stream,
+                                              std::uint32_t active_lanes, std::uint32_t kv_pages,
+                                              std::uint32_t context,
+                                              std::size_t reservation_bytes) {
     if (active_lanes == 0 || active_lanes > kMaximumConcurrency) {
         throw std::invalid_argument("sensenova_loop_9b: invalid active lane count");
     }
     auto impl                            = std::make_unique<Impl>();
+    impl->model  = model;
+    impl->stream = stream;
     impl->admission.active_lanes         = active_lanes;
     impl->admission.main_kv_pages        = kv_pages;
     impl->memory.max_context             = context;

@@ -6,6 +6,7 @@
 
 #include <ninfer/targets/sensenova_loop_9b/package.h>
 #include "runtime/contract/types.h"
+#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -141,6 +142,9 @@ public:
     static bool verify_state_image_markers_for_test(const Program& program, std::uint8_t value);
     static std::unique_ptr<Program> create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                            std::uint32_t context, std::size_t reservation_bytes);
+    static std::unique_ptr<Program> create(const RuntimeModelView& model, cudaStream_t stream,
+                                           std::uint32_t active_lanes, std::uint32_t kv_pages,
+                                           std::uint32_t context, std::size_t reservation_bytes);
     ~Program() noexcept;
 
     Program(const Program&)            = delete;
@@ -187,6 +191,10 @@ public:
 private:
     struct Impl;
     explicit Program(std::unique_ptr<Impl> impl) noexcept;
+    static std::unique_ptr<Program> create_impl(const RuntimeModelView* model, cudaStream_t stream,
+                                                std::uint32_t active_lanes,
+                                                std::uint32_t kv_pages, std::uint32_t context,
+                                                std::size_t reservation_bytes);
     std::unique_ptr<Impl> impl_;
     friend struct ::ninfer::targets::sensenova_loop_9b::Package;
 };
