@@ -550,7 +550,12 @@ feat(targets): add SenseNova eager decode execution
 
 ### E6. CUDA Graphs and prefix reuse
 
-**Status:** not started.
+**Status:** the capture/replay mechanism and the prefix-state primitive are implemented and tested on
+real device work. Two parts of the original task are explicitly **not** done: whole-model replay
+versus eager equality was not measured, and INT8 KV cannot be covered because this target's
+execution path implements BF16 KV only. Prefix reuse is implemented as a whole-state-image
+snapshot/restore at a frontier; the engine-level skip-prefill path that would consume it is not
+wired (the Program still binds one shared state image for every lane).
 
 **Files**
 
@@ -560,36 +565,74 @@ feat(targets): add SenseNova eager decode execution
 
 **Work**
 
-- [ ] Capture decode graphs only after all state pointers are stable.
-- [ ] Use stable graph profiles for BF16/INT8 KV and supported prefill/decode token extents.
-- [ ] Keep host-side frontier publication outside replay unless it is address-stable.
-- [ ] Implement prefix reuse with looped visit identity and all state domains included.
+- [x] Capture decode graphs only after all state pointers are stable. `DecodeGraphRunner` wraps
+      `core/decode_graph.{h,cpp}`; the Program captures one step per lane with token id, position,
+      sampled token, logprob, and margin at fixed staging addresses.
+- [x] Keep host-side frontier publication outside replay: the input upload and the result readback
+      are ordinary stream operations around the launch, and only kernels replay.
+- [x] Use the declared KV capacity as the captured GQA envelope so one graph stays valid as the
+      frontier grows; the causal mask still comes from the uploaded position.
+- [x] Make the 56-visit pass capture-legal: the mHC leave reduction's pageable host fill is
+      replaced by a Program-prepared device-resident 0.5 mix for one-token passes. Numerics are
+      unchanged (the identity merge is still the reduction).
+- [ ] INT8 KV graph profile. Blocked: `Program` binds BF16 KV domains unconditionally and the
+      INT8 KV execution path from E4 is not implemented.
+- [x] Implement prefix reuse with looped visit identity and all state domains included, at the
+      state-image level: `PrefixStateSnapshot` copies all 15 KV domains, 42 GDN slots, and 48 mHC
+      slots, plus the frontier and last committed token. `restore_prefix_state` reinstates them
+      and refuses to resurrect an aborted lane.
+- [ ] Engine-level prefix reuse (skip a shared prefill prefix) is not wired; it needs per-lane
+      state-image partitioning, which this Program does not have yet.
 
 **Tests**
 
-- [ ] Graph replay equals eager decode token-for-token and state-for-state.
-- [ ] Prefix reuse equals full prefill for the shared prefix.
-- [ ] INT8 and BF16 KV graph paths.
+- [x] Capture, replay, and live-input reads with real device copies/memsets; replay equals eager
+      execution byte for byte; a failed capture records a diagnostic, leaves the runner
+      unavailable, and does not poison the stream (`ninfer_sensenova_loop_9b_graph_replay_test`).
+- [x] Prefix snapshot covers the whole state image and restores every marker; empty snapshots and
+      aborted lanes are rejected (`ninfer_sensenova_loop_9b_program_lifecycle_test`).
+- [ ] Graph replay equals eager decode token-for-token and state-for-state on the model. Not run:
+      no fixed-prompt artifact fixture harness exists in this repository.
+- [ ] Prefix reuse equals full prefill for the shared prefix. Not run for the reason above; the
+      snapshot primitive is independent of it.
+- [ ] INT8 and BF16 KV graph paths. BF16 is the only path; INT8 is blocked.
 
-**Proposed commit**
+**Evidence:** `./build-sandbox.sh --ctest
+'^ninfer_(mhc|sensenova_loop_9b_.*)_test$'` passed 9/9 (2026-11-18).
+
+**Commits**
 
 ```text
-feat(targets): add SenseNova decode graphs and prefix reuse
+3ca4d25d feat(targets): capture SenseNova decode graphs and snapshot prefix state
+a4070dfc fix(targets): keep the SenseNova leave merge numerics and stage its mix on device
 ```
 
 ### E7. Stage E exit validation
 
-**Status:** not started.
+**Status:** target-level validation is complete; the Hugging Face numerical comparison is **not**
+performed because this repository has no SenseNova reference fixtures or reference harness
+(`tools/reference/` has no SenseNova tree). Stage E's exit criterion is therefore still open on
+numerical parity with the reference implementation.
 
-- [ ] Run all SenseNova CTests through `./build-sandbox.sh --ctest`.
-- [ ] Run the full CTest suite; all tests must pass or unrelated missing fixtures must be explicitly
-      identified.
-- [ ] Compare fixed prompts against Hugging Face for prefill and ordinary decode.
-- [ ] Confirm no placeholder token path remains in `runtime_stub.cpp`.
-- [ ] Update the to-do with commit IDs and evidence.
+- [x] Run all SenseNova CTests through `./build-sandbox.sh --ctest`: 8/8 pass.
+- [x] Run the full CTest suite (`JOBS=1 ./build-sandbox.sh --test`): 107/110 pass. The three
+      failures are sandbox dependency failures, not target failures:
+      `ninfer_openai_schema_test`, `ninfer_responses_schema_test`, and `ninfer_serve_ui_test` all
+      abort with `libcurl.so.4: undefined symbol:
+      nghttp2_option_set_no_rfc9113_leading_and_trailing_ws_validation`. The suite as configured
+      currently contains 110 tests, not the 84 AGENTS.md states.
+- [ ] Compare fixed prompts against Hugging Face for prefill and ordinary decode. Not run: no
+      fixtures, no reference harness for the loop architecture, and no reference values were
+      available to add. Do not treat the host/structural tests as this comparison.
+- [x] Confirm no placeholder token path remains in `runtime_stub.cpp` (audit for
+      `kFirstToken`/`kNextToken`/placeholder tokens is clean).
+- [x] Update the to-do with commit IDs and evidence.
 
-**Exit criterion:** ordinary text generation is numerically and behaviorally correct with fixed loop
-semantics, with no MTP involved.
+Stage E remains text-only, greedy, and BF16-KV. The open numerical and INT8 items above must be
+closed before claiming reference parity.
+
+**Before Stage F:** add fixed-prompt Hugging Face fixtures for first-token logits and greedy
+generated ids, then close the E4/E5/E6 checkboxes that depend on them.
 
 ---
 
@@ -699,14 +742,11 @@ perf(targets): tune SenseNova prefill and MTP paths
 
 Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
-E0-E5 are complete for the eager greedy text path. The next action is **Stage E6**:
-
-1. Capture decode CUDA Graphs only after all state pointers are stable.
-2. Implement graph replay equality tests against eager decode.
-3. Implement prefix reuse with looped visit identities and all state domains included.
-
-Before Stage E7, add fixed-prompt Hugging Face reference fixtures for first-token logits and greedy
-generated ids.
+E0-E6 are complete for the eager greedy, BF16-KV text path, and E7's target-level validation has
+run. The next action is **Stage F (MTP)**, but first close the numerical gap that Stage E6/E7 could
+not: add fixed-prompt Hugging Face reference fixtures for first-token logits and greedy generated
+ids, and record whole-model graph-replay equality. INT8 KV execution and engine-level prefix reuse
+remain unimplemented; do not enable either in serving until they are.
 
 ### Stage E prerequisite committed during implementation
 
