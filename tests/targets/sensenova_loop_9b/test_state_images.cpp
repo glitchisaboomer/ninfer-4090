@@ -57,6 +57,13 @@ void test_stable_visit_mapping() {
     expect(sn::StateImageLayout::kv_domain_for_visit(0) !=
                sn::StateImageLayout::kv_domain_for_visit(14),
            "distinct KV visits do not alias");
+    for (std::size_t visit = 0; visit < sn::LoopPlan::kVisits; ++visit) {
+        if (sn::LoopPlan::is_full_attention(visit)) {
+            expect(sn::StateImageLayout::kv_domain_for_visit(visit) <
+                       sn::StateLayout::full_attention_state_slots,
+                   "full-attention KV domain stays within the text domain range");
+        }
+    }
     expect(sn::StateImageLayout::gdn_slot_for_visit(4) !=
                sn::StateImageLayout::gdn_slot_for_visit(28),
            "revisited physical layers use different GDN slots");

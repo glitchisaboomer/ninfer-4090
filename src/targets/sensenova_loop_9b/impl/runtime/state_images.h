@@ -52,9 +52,14 @@ public:
     }
 
     [[nodiscard]] static constexpr std::size_t kv_domain_for_visit(std::size_t visit) noexcept {
-        // full-attention visits are assigned compactly in visit order; the single MTP domain is
-        // deliberately last and is never aliased with a text visit.
-        return visit;
+        // Full-attention visits are assigned compactly in visit order. The single MTP domain is
+        // deliberately last and is never aliased with a text visit. Non-attention visits have no
+        // KV domain; callers must check LoopPlan::is_full_attention(visit) before using this.
+        std::size_t domain = 0;
+        for (std::size_t v = 0; v < visit; ++v) {
+            if (LoopPlan::is_full_attention(v)) { ++domain; }
+        }
+        return domain;
     }
 
     [[nodiscard]] static constexpr std::size_t gdn_slot_for_visit(std::size_t visit) noexcept {
