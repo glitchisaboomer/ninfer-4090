@@ -95,6 +95,17 @@ target_include_directories(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
 target_link_libraries(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE ninfer_engine)
 
+# Text execution context skeleton: non-owning model/stream/state-image/workspace handles and
+# host-computable visit state addresses. Runs with dummy host storage only; links ninfer_engine
+# for the borrowed-arena primitive and the CUDA runtime headers for cudaStream_t.
+ninfer_add_host_test(ninfer_sensenova_loop_9b_text_execution_test
+  SOURCES targets/sensenova_loop_9b/test_text_execution.cpp
+          ../src/targets/sensenova_loop_9b/impl/runtime/text_execution.cpp)
+target_include_directories(ninfer_sensenova_loop_9b_text_execution_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
+target_link_libraries(ninfer_sensenova_loop_9b_text_execution_test PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
+
 ninfer_add_test(ninfer_sensenova_loop_9b_program_lifecycle_test
   SOURCES targets/sensenova_loop_9b/test_program_lifecycle.cpp
   LIBRARIES ninfer_engine)
