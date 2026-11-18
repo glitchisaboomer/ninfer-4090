@@ -516,5 +516,20 @@ Remaining hard blocker before text execution can be correct:
 - GDN gating has no qualified kernel for SenseNova's `[hidden=4096, heads=32]` parent geometry.
   A trial generalization of the Qwen 35B path failed the FP64 oracle and was reverted. Do not
   wire the 56-visit forward loop until this op has an independent oracle test.
-- The stage-B/C/D Program remains lifecycle scaffolding only. It deliberately does not emit real
-  tokens.
+
+### Stage E active work item: SenseNova GDN gating op
+
+- [ ] Implement `gdn_gating_proj` and `gdn_norm_gating_proj` for exactly
+      `heads=32`, `hidden=4096`, parent `ab_weight [64,4096]`; a weight is 32 rows, not 48.
+- [ ] Use the Qwen 35B path as the structural reference: BF16 parent halves, FP32 `A_log` and
+      `dt_bias`, FP32 `[32,T]` `g`/`beta`, and the same logical formula and FP64 oracle.
+- [ ] Use the SenseNova llama.cpp fork only as execution-order evidence; the C++ numerical
+      contract remains Hugging Face `Qwen3_5GatedDeltaNet` because the official checkpoint's
+      `modeling_sensenova_loop.py` subclasses it.
+- [ ] Add first-class SenseNova geometry admission, planner, wrappers, and independent
+      CTest coverage at T=1, small-T, fused-boundary, prefill chunk, and long-token extents.
+- [ ] Do not widen existing Qwen 27B/35B profiles implicitly and do not bypass the oracle.
+- [ ] After this op passes, continue Stage E with device-backed state images, snapshot/restore,
+      graph stability, the 56-visit forward pass, and reference validation.
+- [ ] The stage-B/C/D Program remains lifecycle scaffolding only until the execution path is
+      wired. It deliberately does not emit real tokens.
