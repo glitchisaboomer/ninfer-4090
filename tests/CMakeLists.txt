@@ -95,16 +95,19 @@ target_include_directories(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
 target_link_libraries(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE ninfer_engine)
 
-# Text execution context skeleton: non-owning model/stream/state-image/workspace handles and
-# host-computable visit state addresses. Runs with dummy host storage only; links ninfer_engine
-# for the borrowed-arena primitive and the CUDA runtime headers for cudaStream_t.
+# Text execution context: non-owning model/stream/state-image/workspace handles, host-computable
+# visit state addresses, and the embedding/head entry points that bracket the 56 visits. The cases
+# themselves are host-only -- they exercise validation and the workspace contract with dummy or
+# metadata-only bindings -- but the translation unit composes the ops, so the target links
+# ninfer_ops. The numeric head check needs the licensed [248320,4096] LM head and belongs to a
+# real-artifact test, not here.
 ninfer_add_host_test(ninfer_sensenova_loop_9b_text_execution_test
   SOURCES targets/sensenova_loop_9b/test_text_execution.cpp
           ../src/targets/sensenova_loop_9b/impl/runtime/text_execution.cpp)
 target_include_directories(ninfer_sensenova_loop_9b_text_execution_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
-target_link_libraries(ninfer_sensenova_loop_9b_text_execution_test PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
+target_link_libraries(ninfer_sensenova_loop_9b_text_execution_test PRIVATE ninfer_engine ninfer_ops ${NINFER_CUDART_TARGET})
 
 ninfer_add_test(ninfer_sensenova_loop_9b_program_lifecycle_test
   SOURCES targets/sensenova_loop_9b/test_program_lifecycle.cpp
