@@ -100,8 +100,8 @@ capacity; no layer-count constants are duplicated in execution code.
 
 - Built and ran `ninfer_sensenova_loop_9b_loop_plan_test`: passed.
 - CTest: `100% tests passed, 0 tests failed out of 1`.
-- Gitea commit: `TBD`.
-- GitHub commit: `TBD`.
+- Gitea commit: `02d886cf`.
+- GitHub commit: `b32c764f`.
 
 **Proposed commit**
 
