@@ -162,8 +162,6 @@ struct Program::Impl {
     std::uint32_t max_concurrency = 1;
     std::uint32_t kv_capacity = 0;
     std::array<LaneState, kMaximumConcurrency> lanes;
-    std::array<TokenId, kMaximumConcurrency> pending_tokens{};
-    std::array<float, kMaximumConcurrency> pending_logprobs{};
     std::vector<TokenId> egress_tokens;
     std::vector<float> egress_logprobs;
     std::vector<float> egress_margins;
@@ -506,34 +504,98 @@ runtime::PrefillStepResult Program::advance_prefill_lane(std::uint32_t) {
     throw std::logic_error("sensenova_loop_9b: prefill completes in one staged step");
 }
 
+void Program::decode_one(std::uint32_t lane) {
+    LaneState& state = impl_->lanes[lane];
+    if (state.lifecycle != Lifecycle::Pending) {
+        throw std::logic_error("decode requires a pending lane");
+    }
+    if (impl_->model == nullptr) {
+        throw std::logic_error("sensenova_loop_9b: text decode requires a loaded model");
+    }
+    if (state.frontier >= impl_->kv_capacity) {
+        throw std::logic_error("sensenova_loop_9b: decode frontier exceeds the KV capacity");
+    }
+
+    const auto started             = std::chrono::steady_clock::now();
+    WorkspaceArena workspace(DeviceSpan{impl_->decode_workspace.p, impl_->decode_workspace_bytes});
+    const DeviceArena::Scope scope = workspace.scope();
+
+    TokenId host_token = 0;
+    float host_logprob = 0.0F;
+    float host_margin  = 0.0F;
+    try {
+        Tensor ids       = workspace.alloc(DType::I32, {1});
+        Tensor positions = workspace.alloc(DType::I32, {1});
+        Tensor sampled   = workspace.alloc(DType::I32, {1});
+        Tensor logprob   = workspace.alloc(DType::FP32, {1});
+        Tensor margin    = workspace.alloc(DType::FP32, {1});
+
+        const TokenId input         = impl_->execution[lane].last_token;
+        const std::int32_t position = static_cast<std::int32_t>(state.frontier);
+        CUDA_CHECK(cudaMemcpyAsync(ids.data, &input, sizeof(TokenId), cudaMemcpyHostToDevice,
+                                   impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(positions.data, &position, sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, impl_->stream));
+
+        const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
+                                             impl_->gdn_conv, impl_->mhc_router};
+        TextExecutionContext context(*impl_->model, impl_->stream,
+                                     static_cast<std::byte*>(impl_->state_images.p),
+                                     impl_->kv_capacity, workspace, bindings);
+        context.forward_full(ids, positions, state.frontier + 1, sampled, &logprob, &margin);
+
+        CUDA_CHECK(cudaMemcpyAsync(&host_token, sampled.data, sizeof(TokenId),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(&host_logprob, logprob.data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(&host_margin, margin.data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
+    } catch (const std::bad_alloc&) {
+        throw std::invalid_argument(
+            "sensenova_loop_9b: decode workspace is too small for one token");
+    }
+
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    Impl::LaneExecution& execution = impl_->execution[lane];
+    execution.pending_tokens[0]    = host_token;
+    execution.pending_logprobs[0]  = host_logprob;
+    execution.pending_margins[0]   = host_margin;
+    execution.timings.decode_seconds += seconds;
+    execution.timings.total_seconds =
+        execution.timings.prefill_seconds + execution.timings.decode_seconds;
+}
+
 runtime::BatchedGeneratedRound Program::decode_batch(std::span<const std::uint32_t> lanes,
                                                      std::span<const runtime::RoundBudget> budgets) {
     if (lanes.empty() || lanes.size() > impl_->max_concurrency ||
         budgets.size() != lanes.size()) {
         throw std::invalid_argument("sensenova_loop_9b: invalid decode batch");
     }
+    (void)budgets; // one greedy token per lane; the round budget bounds acceptance, not the pass
     impl_->egress_tokens.clear();
     impl_->egress_logprobs.clear();
+    impl_->egress_margins.clear();
     impl_->egress_row_counts.clear();
     impl_->egress_span = 1;
-    for (std::size_t row = 0; row < lanes.size(); ++row) {
-        const std::uint32_t lane = lanes[row];
-        if (lane >= impl_->max_concurrency || impl_->lanes[lane].lifecycle != Lifecycle::Pending) {
-            throw std::logic_error("decode batch lane is not pending");
+    for (const std::uint32_t lane : lanes) {
+        if (lane >= impl_->max_concurrency) {
+            throw std::out_of_range("decode batch lane is out of range");
         }
-        static constexpr TokenId kNextToken = 0;
-        impl_->egress_tokens.push_back(kNextToken);
-        impl_->egress_logprobs.push_back(0.0F);
+        decode_one(lane);
+        const Impl::LaneExecution& execution = impl_->execution[lane];
+        impl_->egress_tokens.push_back(execution.pending_tokens[0]);
+        impl_->egress_logprobs.push_back(execution.pending_logprobs[0]);
+        impl_->egress_margins.push_back(execution.pending_margins[0]);
         impl_->egress_row_counts.push_back(1);
-        impl_->pending_tokens[lane]   = kNextToken;
-        impl_->pending_logprobs[lane] = 0.0F;
     }
     return runtime::BatchedGeneratedRound{
-        .tokens      = impl_->egress_tokens,
-        .row_counts  = impl_->egress_row_counts,
-        .row_stride  = 1,
-        .logprobs    = impl_->egress_logprobs,
-        .margins     = {},
+        .tokens     = impl_->egress_tokens,
+        .row_counts = impl_->egress_row_counts,
+        .row_stride = 1,
+        .logprobs   = impl_->egress_logprobs,
+        .margins    = impl_->egress_margins,
     };
 }
 
@@ -573,6 +635,11 @@ void Program::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                           : Lifecycle::Active;
         state.generated_tokens += accepted_tokens[row];
         state.frontier += accepted_tokens[row];
+        // The lane's next decode step starts from the token the round actually
+        // licensed, so a rejected round never advances the host frontier.
+        if (accepted_tokens[row] > 0) {
+            impl_->execution[lane].last_token = impl_->execution[lane].pending_tokens[0];
+        }
     }
 }
 
@@ -593,7 +660,7 @@ void Program::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 GenerationTimings Program::generation_timings_lane(std::uint32_t lane) const noexcept {
-    return lane < impl_->max_concurrency ? GenerationTimings{} : GenerationTimings{};
+    return lane < impl_->max_concurrency ? impl_->execution[lane].timings : GenerationTimings{};
 }
 
 SpeculativeStats Program::speculative_stats_lane(std::uint32_t lane) const noexcept {

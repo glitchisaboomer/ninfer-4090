@@ -93,6 +93,29 @@ void test_prefill_requires_model() {
            "a rejected prefill leaves the lane untouched");
 }
 
+void test_decode_batch_validation() {
+    auto program = sn::Program::create(2, 32, 4096, 1U << 20U);
+
+    std::array<std::uint32_t, 1> lanes{0};
+    std::array<ninfer::runtime::RoundBudget, 1> budgets{ninfer::runtime::RoundBudget{8}};
+    bool rejected_not_pending = false;
+    try {
+        (void)program->decode_batch(lanes, budgets);
+    } catch (const std::logic_error& error) {
+        rejected_not_pending =
+            std::string_view(error.what()).find("pending lane") != std::string_view::npos;
+    } catch (...) {
+    }
+    expect(rejected_not_pending, "decode rejects a lane that is not pending");
+
+    bool rejected_empty = false;
+    try {
+        (void)program->decode_batch({}, {});
+    } catch (const std::invalid_argument&) { rejected_empty = true; } catch (...) {
+    }
+    expect(rejected_empty, "decode rejects an empty batch");
+}
+
 void test_memory() {
     auto program   = sn::Program::create(1, 16, 2048, 987654321ULL);
     const auto mem = program->memory_summary();
@@ -107,6 +130,7 @@ int main() {
     test_lifecycle();
     test_state_images();
     test_prefill_requires_model();
+    test_decode_batch_validation();
     test_memory();
     if (failures != 0) {
         std::cerr << "FAIL senseNova program lifecycle: " << failures << '\n';

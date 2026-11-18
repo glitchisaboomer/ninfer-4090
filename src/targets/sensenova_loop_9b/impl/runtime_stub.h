@@ -191,6 +191,13 @@ public:
 private:
     struct Impl;
     explicit Program(std::unique_ptr<Impl> impl) noexcept;
+    // Stage E5A: one eager decode step for a pending lane. Samples exactly one
+    // token from the lane's last committed token and frontier, and publishes it
+    // as that lane's pending token. Lane-visible state (last token, frontier,
+    // generated count) advances only in resolve_pending_batch; the KV/GDN/mHC
+    // state images advance when the forward runs, which is the eager path's
+    // commit point until snapshots land with graph/prefix work.
+    void decode_one(std::uint32_t lane);
     static std::unique_ptr<Program> create_impl(const RuntimeModelView* model, cudaStream_t stream,
                                                 std::uint32_t active_lanes,
                                                 std::uint32_t kv_pages, std::uint32_t context,
