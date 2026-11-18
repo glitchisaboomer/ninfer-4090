@@ -503,3 +503,18 @@ oracle coverage for those exact shapes remains part of the forward-path validati
 
 - Gitea commit: `9d6461f8`.
 - GitHub commit: `5cd11a8c`.
+
+Additional numeric domain qualification committed during Stage E preparation:
+
+- Gitea `25f56805` / GitHub `117df35f`: SenseNova W8 4096-wide projections, W8 embedding
+  `D=4096`, and Q6 LM head `K=4096`.
+- Verified by `ninfer_linear_w8_a16_test`, `ninfer_embedding_test`, and
+  `ninfer_linear_q6_a16_test`.
+
+Remaining hard blocker before text execution can be correct:
+
+- GDN gating has no qualified kernel for SenseNova's `[hidden=4096, heads=32]` parent geometry.
+  A trial generalization of the Qwen 35B path failed the FP64 oracle and was reverted. Do not
+  wire the 56-visit forward loop until this op has an independent oracle test.
+- The stage-B/C/D Program remains lifecycle scaffolding only. It deliberately does not emit real
+  tokens.
