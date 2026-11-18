@@ -636,9 +636,11 @@ generated ids, then close the E4/E5/E6 checkboxes that depend on them.
 
 ---
 
-## F. MTP propose, verify, and rollback
+## F. MTP propose, verify, rollback, and engine-level prefix reuse
 
-**Goal:** one-layer MTP works for K=1..15 and never diverges from ordinary decode.
+**Goal:** one-layer MTP works for K=1..15, never diverges from ordinary decode, and the engine can
+reuse a committed prefix without re-prefilling it. Both are required before the target is useful in
+practice: MTP supplies decode speed, and prefix reuse supplies interactive/serving latency.
 
 **Files**
 
@@ -647,8 +649,27 @@ generated ids, then close the E4/E5/E6 checkboxes that depend on them.
 - `src/targets/sensenova_loop_9b/impl/runtime/verify.h`
 - `src/targets/sensenova_loop_9b/impl/runtime/verify.cpp`
 - `src/targets/sensenova_loop_9b/impl/runtime/speculative.h`
+- `src/targets/sensenova_loop_9b/impl/runtime/prefix_reuse.h`
+- `src/targets/sensenova_loop_9b/impl/runtime/prefix_reuse.cpp`
+- `src/targets/sensenova_loop_9b/impl/runtime_stub.cpp`
 - `tests/targets/sensenova_loop_9b/test_mtp_rollback.cpp`
+- `tests/targets/sensenova_loop_9b/test_prefix_reuse.cpp`
 - `tests/CMakeLists.txt`
+
+**Checkpoints**
+
+- **F1 — MTP proposal and stem:** implement MTP input packing, W8 `fc`, one 16/4 attention layer,
+  MLP, final norm, main LM head, separate MTP KV state, and draft-head shortlist for K=1..15.
+- **F2 — MTP verification and rollback:** verify proposals against target logits, roll back target
+  KV/GDN/mHC/MTP state on rejection, preserve next-round state after acceptance, and integrate graph
+  profiles only after rollback correctness is established.
+- **F3 — Engine-level prefix reuse:** promote E6's whole-state-image snapshot into real skip-prefill
+  reuse. This requires per-lane/per-prefix state-image ownership or copy-on-write; restored frontier
+  and last-token state; identity lookup for shared prompt prefixes; and safe interaction with
+  admission and lifecycle transitions. The current single shared `Program` state image is a known
+  blocker.
+- **F4 — Combined validation:** MTP + prefix reuse together, including multi-lane state isolation,
+  graph replay after restore, and fixed-prefix equivalence against full prefill.
 
 **Work**
 
@@ -667,6 +688,11 @@ generated ids, then close the E4/E5/E6 checkboxes that depend on them.
 - [ ] Roll back target KV, GDN, mHC, and MTP state to the accepted prefix.
 - [ ] Preserve next-round proposal state after acceptance.
 - [ ] Integrate graph profiles only after rollback correctness is established.
+- [ ] Add engine-level prefix reuse with looped visit identity and all state domains included.
+- [ ] Skip prefill from a restored frontier and resume from the restored last committed token.
+- [ ] Add per-lane/per-prefix state ownership or copy-on-write so concurrent requests cannot
+      clobber one another's KV/GDN/mHC state.
+- [ ] Integrate prefix identity with request planning and admission accounting.
 
 **Tests**
 
@@ -676,15 +702,21 @@ generated ids, then close the E4/E5/E6 checkboxes that depend on them.
 - [ ] K boundaries `1`, `2`, `15`.
 - [ ] Draft shortlist membership.
 - [ ] Speculative stats count accepted/drafted tokens correctly.
+- [ ] Prefix reuse equals full prefill for the shared prefix, including all loop visits and state
+      domains.
+- [ ] MTP + prefix reuse remains state-isolated across concurrent lanes.
 
-**Exit criterion:** MTP acceptance and rejection paths are bit-equivalent in state to ordinary
-decode for the accepted token sequence.
+**Exit criterion:** MTP acceptance/rejection is bit-equivalent in state to ordinary decode for the
+accepted token sequence, and prefix reuse produces the same state and next token as full prefill
+without clobbering other lanes.
 
 **Proposed commits**
 
 ```text
 feat(targets): add SenseNova MTP proposal path
 feat(targets): add SenseNova MTP verification and rollback
+feat(targets): wire SenseNova engine-level prefix reuse
+test(targets): validate SenseNova MTP and prefix reuse together
 ```
 
 ---
@@ -711,9 +743,13 @@ feat(targets): add SenseNova MTP verification and rollback
 - [ ] Validate generation config EOS `(248044, 248046)` and `use_cache=true`.
 - [ ] Map the official chat template.
 - [ ] Register the serving identity `sensenova_loop_9b`.
-- [ ] Compare fixed prompts against the official Hugging Face reference.
-- [ ] Validate prefill, ordinary decode, MTP propose/verify, K=1..15, INT8/BF16 KV, restart, and
-      state-cache behavior.
+- [ ] Build a quantized-weight reference by dequantizing the existing `.ninfer` artifact in memory;
+      do not create a duplicate BF16 artifact. Compare fixed prompts against that reference with
+      explicit tolerances.
+- [ ] As a weaker semantic sanity check, compare top-1/top-k overlap against the original BF16
+      Hugging Face checkpoint, without requiring bitwise logits.
+- [ ] Validate prefill, ordinary decode, MTP propose/verify, K=1..15, engine-level prefix reuse,
+      restart, and state-cache behavior. INT8 KV is deferred; BF16 KV is the v1 path.
 - [ ] Run the full CTest suite; all 84 tests must pass.
 - [ ] Benchmark text-only baseline.
 - [ ] Benchmark MTP at K=3, 5, 7; choose a conservative default.
@@ -742,11 +778,12 @@ perf(targets): tune SenseNova prefill and MTP paths
 
 Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
-E0-E6 are complete for the eager greedy, BF16-KV text path, and E7's target-level validation has
-run. The next action is **Stage F (MTP)**, but first close the numerical gap that Stage E6/E7 could
-not: add fixed-prompt Hugging Face reference fixtures for first-token logits and greedy generated
-ids, and record whole-model graph-replay equality. INT8 KV execution and engine-level prefix reuse
-remain unimplemented; do not enable either in serving until they are.
+E0-E7 are complete for the eager greedy, BF16-KV text path, and E7's target-level validation has
+run. The next action is **Stage F (MTP + prefix reuse)**. First close the numerical gap that
+Stage E6/E7 could not: add a quantized-weight reference that dequantizes the existing `.ninfer`
+artifact in memory and compare fixed-prompt logits/top-k/greedy prefixes with documented tolerances.
+INT8 KV execution is deferred; BF16 KV is the v1 path. Engine-level prefix reuse is promoted into
+Stage F and is required before practical serving.
 
 ### Stage E prerequisite committed during implementation
 
