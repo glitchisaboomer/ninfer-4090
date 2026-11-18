@@ -287,7 +287,7 @@ AttentionRun run_pool_attention(const PoolCache& cache, const std::vector<__nv_b
 
     const ninfer::ops::GqaExecutionEnvelope envelope{visible, visible};
     const std::size_t workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
-        kQHeads, kKVHeads, ninfer::DType::BF16, envelope, 1, tokens, tokens);
+        kQHeads, kKvHeads, ninfer::DType::BF16, envelope, 1, tokens, tokens);
     ninfer::DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     ninfer::DeviceArena workspace(ninfer::DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
 

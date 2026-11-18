@@ -1,0 +1,160 @@
+#pragma once
+
+// Stage B deliberately publishes a minimal engine-compatible Program. Execution and state
+// ownership are added in stages D/E; this surface exists so the registry and Engine variant
+// compile against a closed target package without pretending that generation is implemented.
+
+#include <ninfer/targets/sensenova_loop_9b/package.h>
+#include "runtime/contract/types.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+
+namespace ninfer {
+class DeviceContext;
+class DiskStateCache;
+} // namespace ninfer
+
+namespace ninfer::targets::sensenova_loop_9b { struct Package; }
+
+namespace ninfer::targets::sensenova_loop_9b::detail {
+
+class RequestBasePlan {
+public:
+    RequestBasePlan(RequestBasePlan&&) noexcept;
+    RequestBasePlan& operator=(RequestBasePlan&&) noexcept;
+    ~RequestBasePlan();
+
+    RequestBasePlan(const RequestBasePlan&)            = delete;
+    RequestBasePlan& operator=(const RequestBasePlan&) = delete;
+
+    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+
+private:
+    struct Impl;
+    explicit RequestBasePlan(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+    friend class Program;
+};
+
+class RequestPlan {
+public:
+    RequestPlan(RequestPlan&&) noexcept;
+    RequestPlan& operator=(RequestPlan&&) noexcept;
+    ~RequestPlan();
+
+    RequestPlan(const RequestPlan&)            = delete;
+    RequestPlan& operator=(RequestPlan&)       = delete;
+
+    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+
+private:
+    struct Impl;
+    explicit RequestPlan(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+    friend class Program;
+};
+
+class SequencePlan {
+public:
+    SequencePlan(SequencePlan&&) noexcept;
+    SequencePlan& operator=(SequencePlan&&) noexcept;
+    ~SequencePlan();
+
+    SequencePlan(const SequencePlan&)            = delete;
+    SequencePlan& operator=(const SequencePlan&) = delete;
+
+    [[nodiscard]] std::uint32_t capacity() const noexcept;
+    [[nodiscard]] std::uint32_t kv_capacity() const noexcept;
+    [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
+    [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
+    [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
+
+private:
+    struct Impl;
+    explicit SequencePlan(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+    friend class SequencePlanner;
+    friend class Program;
+    friend struct ::ninfer::targets::sensenova_loop_9b::Package;
+};
+
+class SequencePlanner {
+public:
+    static SequencePlanner create(const EngineOptions& options, WeightsProfile weights_profile);
+    SequencePlanner(SequencePlanner&&) noexcept;
+    SequencePlanner& operator=(SequencePlanner&&) noexcept;
+    ~SequencePlanner();
+
+    SequencePlanner(const SequencePlanner&)            = delete;
+    SequencePlanner& operator=(const SequencePlanner&) = delete;
+
+    [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
+    [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
+
+private:
+    struct Impl;
+    explicit SequencePlanner(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+    friend struct ::ninfer::targets::sensenova_loop_9b::Package;
+};
+
+class Program {
+public:
+    static std::unique_ptr<Program> create(std::uint32_t active_lanes, std::uint32_t kv_pages,
+                                           std::uint32_t context, std::size_t reservation_bytes);
+    ~Program() noexcept;
+
+    Program(const Program&)            = delete;
+    Program& operator=(const Program&) = delete;
+    Program(Program&&)                 = delete;
+    Program& operator=(Program&&)      = delete;
+
+    [[nodiscard]] RequestBasePlan plan_request_base(const qwen3_6::PreparedPrompt& prompt,
+                                                    const runtime::ResolvedExecutionOptions& options);
+    [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane, const qwen3_6::PreparedPrompt& prompt,
+                                                    const RequestBasePlan& base);
+    [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
+    [[nodiscard]] bool can_admit_lane_after_retained_eviction(std::uint32_t lane,
+                                                              const RequestPlan& plan) const noexcept;
+    [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
+                                                                qwen3_6::PreparedPrompt&& prompt,
+                                                                RequestPlan&& plan,
+                                                                runtime::TransientRegion transient);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_batch(std::span<const std::uint32_t> lanes,
+                 std::span<const runtime::RoundBudget> budgets);
+    void set_token_mask_lane(std::uint32_t lane, std::span<const std::uint32_t> mask);
+    void resolve_prefill_lane(std::uint32_t lane, bool terminal);
+    void resolve_pending_batch(std::span<const std::uint32_t> lanes,
+                               std::span<const std::uint32_t> accepted_tokens,
+                               std::span<const std::uint8_t> terminal,
+                               std::span<const std::uint8_t> cancelled);
+    void abort_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
+    void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    void snapshot_lane_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
+    void snapshot_turn_checkpoint_to_disk(std::uint32_t lane, DiskStateCache& disk_cache);
+    void set_disk_state_cache(DiskStateCache* cache) noexcept;
+    [[nodiscard]] std::string config_signature_slug() const;
+
+    [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    void reset_memory_peaks() noexcept;
+
+private:
+    struct Impl;
+    explicit Program(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+    friend struct ::ninfer::targets::sensenova_loop_9b::Package;
+};
+
+} // namespace ninfer::targets::sensenova_loop_9b::detail

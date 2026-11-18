@@ -122,8 +122,7 @@ publishes a stable model view. Token generation is not required yet.
 - `src/targets/sensenova_loop_9b/impl/load/bindings.h`
 - `src/targets/sensenova_loop_9b/impl/load/bindings.cpp`
 - `src/targets/sensenova_loop_9b/impl/package.cpp`
-- `src/targets/sensenova_loop_9b/impl/variant.h`
-- `src/targets/sensenova_loop_9b/impl/variant.cpp`
+- `src/targets/sensenova_loop_9b/impl/runtime_stub.{h,cpp}` (temporary engine-compatible Program surface)
 - `src/targets/sensenova_loop_9b/CMakeLists.txt`
 - `src/CMakeLists.txt`
 - `src/targets/registry.h`
@@ -134,40 +133,53 @@ publishes a stable model view. Token generation is not required yet.
 
 **Work**
 
-- [ ] Implement `Package`:
+- [x] Implement `Package`:
   - `model_id = "sensenova-loop-9b"`;
   - `weights_id = "groupwise-int"`;
   - target key `sensenova_loop_9b`;
   - strict `resolve_weights`;
   - `plan_load`, `construct_loaded_model`, `sampling_defaults`.
-- [ ] Bind all 447 objects from the converter inventory:
+- [x] Bind all 447 objects from the converter inventory:
   - 6 frontend resources;
   - 32 physical text layers;
   - mHC routers as FP32 `Tensor`, never quantized `Weight`;
   - draft head and token IDs;
   - MTP layer tensors.
-- [ ] Build a model view with:
+- [x] Build a model view with:
   - 8 physical full layers;
   - 24 physical GDN layers;
   - 24 physical mHC router payloads;
   - one MTP layer;
   - draft head;
   - frontend resources.
-- [ ] Add `LoadedSenseNovaLoop9B` and `SenseNovaLoop9BInstance` to `ActiveTarget`.
-- [ ] Add registry dispatch by identity.
-- [ ] Ensure unsupported identities fail with a clear target error.
+- [x] Add `LoadedSenseNovaLoop9B` and `SenseNovaLoop9BInstance` to `ActiveTarget`.
+- [x] Add registry dispatch by identity.
+- [x] Ensure unsupported identities fail with a clear target error.
+- [x] Add a temporary engine-compatible Program stub. It intentionally throws if prefill/decode is
+      attempted; execution is stages D/E, not stage B.
 
 **Tests**
 
-- [ ] Exact object names and shapes accepted.
-- [ ] Vision objects absent; no unintended vision requirement.
-- [ ] mHC tensors bound as FP32.
-- [ ] MTP and draft-head objects bound.
-- [ ] Wrong identity rejected.
-- [ ] Sample defaults present for the SenseNova identity.
+- [x] Exact object names and shapes accepted.
+- [x] Vision objects absent; no unintended vision requirement.
+- [x] mHC tensors bound as FP32.
+- [x] MTP and draft-head objects bound.
+- [x] Wrong identity rejected.
+- [x] Materialization plan has 447 objects, 441 device tensors, 6 host resources, and nonzero
+      capacity against the real artifact.
 
 **Exit criterion:** `construct_target()` loads `/home/user/models/sensenova/SenseNova-Loop-9B.ninfer`
 into a stable loaded model, but no generation path is needed yet.
+
+**Status: complete.**
+
+- Built `ninfer_sensenova_loop_9b_bindings_test` and `ninfer_engine` with `./build-sandbox.sh`.
+- CTest via `./build-sandbox.sh --ctest ninfer_sensenova_loop_9b`: both loop-plan and bindings
+  tests pass.
+- Note: building every test currently hits an unrelated `kKVHeads` typo in
+  `tests/ops/gqa_relocation_test_common.h`; that pre-existing issue is outside this stage.
+- Gitea commit: `TBD`.
+- GitHub commit: `TBD`.
 
 **Proposed commit**
 

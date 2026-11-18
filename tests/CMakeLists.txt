@@ -85,6 +85,17 @@ ninfer_add_host_test(ninfer_paged_kv_delta_layout_test
 ninfer_add_host_test(ninfer_sensenova_loop_9b_loop_plan_test
   SOURCES targets/sensenova_loop_9b/test_loop_plan.cpp)
 
+# Real-artifact load-plan verification for the SenseNova target. Skips cleanly when the licensed
+# artifact is not installed.
+ninfer_add_test(ninfer_sensenova_loop_9b_bindings_test
+  SOURCES targets/sensenova_loop_9b/test_bindings.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_sensenova_loop_9b_bindings_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
+target_link_libraries(ninfer_sensenova_loop_9b_bindings_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_sensenova_loop_9b_bindings_test PROPERTIES SKIP_RETURN_CODE 77)
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}

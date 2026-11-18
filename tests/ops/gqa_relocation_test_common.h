@@ -740,7 +740,7 @@ inline AttentionRun run_cached_attention(const Cache& cache, const std::vector<_
 
     const ops::GqaExecutionEnvelope envelope{visible, visible};
     const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKVHeads, DType::BF16, envelope, 1, tokens,
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKvHeads, DType::BF16, envelope, 1, tokens,
                                                    tokens);
     DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
@@ -770,7 +770,7 @@ inline AttentionRun run_cached_attention_view(const Cache& cache,
 
     const ops::GqaExecutionEnvelope envelope{visible, visible};
     const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKVHeads, DType::BF16, envelope, 1, tokens,
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKvHeads, DType::BF16, envelope, 1, tokens,
                                                    tokens);
     DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
@@ -799,7 +799,7 @@ inline AttentionRun run_cached_attention_view_i8(const Int8Cache& cache,
 
     const ops::GqaExecutionEnvelope envelope{visible, visible};
     const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKVHeads, DType::I8, envelope, 1, tokens,
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKvHeads, DType::I8, envelope, 1, tokens,
                                                    tokens);
     DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
@@ -835,7 +835,7 @@ inline AttentionRun run_append_attention(Cache& cache, const std::vector<__nv_bf
 
     const ops::GqaExecutionEnvelope envelope{visible, visible};
     const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKVHeads, DType::BF16, envelope, 1, tokens,
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKvHeads, DType::BF16, envelope, 1, tokens,
                                                    tokens);
     DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
@@ -880,7 +880,7 @@ inline AttentionRun run_prefill_attention_i8(const std::vector<__nv_bfloat16>& q
 
     const ops::GqaExecutionEnvelope envelope{visible, visible};
     const std::size_t workspace_bytes =
-        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKVHeads, DType::I8, envelope, 1, tokens,
+        ops::gqa_attention_workspace_capacity_bytes(kQHeads, kKvHeads, DType::I8, envelope, 1, tokens,
                                                    tokens);
     DeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     DeviceArena workspace(DeviceSpan{workspace_buffer.p, workspace_buffer.bytes});
