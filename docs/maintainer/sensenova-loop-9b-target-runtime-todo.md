@@ -380,7 +380,11 @@ prove that a launcher exists; they do not provide the numerical contracts requir
 
 - [x] Add `gdn_input_proj` for W8 parent `[12288,4096]` producing `qkv [8192,T]` and `z [4096,T]`.
 - [ ] Add the fused projection/convolution/snapshot form for the same parent and `conv [4,8192]`.
-- [ ] Add W8 `linear_swiglu` for `[24576,4096] -> [12288,T]`.
+- [ ] Add W8 `linear_swiglu` for `[24576,4096] -> [12288,T]`. A direct reuse of the generic
+      rowsplit MMA epilogue failed to compile in this TU, and the current exact/decode pair kernels
+      hard-code `[12288,2048]`. The next implementation must template those pair kernels on
+      `(intermediate, hidden)` and qualify T=1..48 explicitly; do not fake the profile by routing
+      through unrelated W8 linear plus external SiLU.
 - [ ] Keep the existing `[12288,2048]` Qwen 35B profiles unchanged.
 - [ ] Verify every added profile against an independent FP64 exact-decode oracle.
 
