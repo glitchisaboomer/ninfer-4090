@@ -69,6 +69,8 @@ using W8MtpAttentionOutputGeometry     = W8LinearGeometry<5120, 6144>;
 using W8MtpGateUpProjectionGeometry    = W8LinearGeometry<34816, 5120>;
 using W8MtpDownProjectionGeometry      = W8LinearGeometry<5120, 17408>;
 using W835bMtpProjectionGeometry       = W8LinearGeometry<2048, 4096>;
+using W8SenseNovaQkvProjectionGeometry   = W8LinearGeometry<8192, 4096>;
+using W8SenseNovaZProjectionGeometry     = W8LinearGeometry<4096, 4096>;
 using W8SenseNovaMtpFcProjectionGeometry = W8LinearGeometry<4096, 8192>;
 using W8SenseNovaMtpAttnOutputGeometry  = W8LinearGeometry<4096, 8192>;
 using W8SenseNovaMtpGateUpGeometry      = W8LinearGeometry<24576, 4096>;
@@ -88,6 +90,10 @@ inline constexpr std::int32_t kW8MtpDownFirstSmallT            = 1;
 inline constexpr std::int32_t kW8MtpDownLastSmallT             = 48;
 inline constexpr std::int32_t kW835bMtpProjectionFirstSmallT   = 1;
 inline constexpr std::int32_t kW835bMtpProjectionLastSmallT    = 48;
+inline constexpr std::int32_t kW8SenseNovaQkvFirstSmallT       = 1;
+inline constexpr std::int32_t kW8SenseNovaQkvLastSmallT        = 48;
+inline constexpr std::int32_t kW8SenseNovaZFirstSmallT         = 1;
+inline constexpr std::int32_t kW8SenseNovaZLastSmallT          = 48;
 
 template <class Geometry, int ActiveTokens>
 struct W8LinearSmallTProductionSchedule;
@@ -221,6 +227,38 @@ struct W8LinearSmallTProductionSchedule<W835bMtpProjectionGeometry, ActiveTokens
         ActiveTokens == 4 || (ActiveTokens >= 27 && ActiveTokens <= 40) ? Cache::cg : Cache::ca;
     using Type =
         W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess, kActivationCache>;
+};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8SenseNovaQkvProjectionGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kW8SenseNovaQkvFirstSmallT);
+    static_assert(ActiveTokens <= kW8SenseNovaQkvLastSmallT);
+    static constexpr int kTileTokens = ActiveTokens <= 8    ? 8
+                                       : ActiveTokens <= 16 ? 16
+                                       : ActiveTokens <= 24 ? 24
+                                       : ActiveTokens <= 32 ? 32
+                                       : ActiveTokens <= 40 ? 40
+                                                            : 48;
+    static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
+};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8SenseNovaZProjectionGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kW8SenseNovaZFirstSmallT);
+    static_assert(ActiveTokens <= kW8SenseNovaZLastSmallT);
+    static constexpr int kTileTokens = ActiveTokens <= 8    ? 8
+                                       : ActiveTokens <= 16 ? 16
+                                       : ActiveTokens <= 24 ? 24
+                                       : ActiveTokens <= 32 ? 32
+                                       : ActiveTokens <= 40 ? 40
+                                                            : 48;
+    static constexpr int kKWarps     = ActiveTokens <= 24 ? 8 : 4;
+    static constexpr auto kScaleAccess = W8SmallTMmaScaleAccess::Shared;
+    static constexpr int kMinBlocks  = kKWarps == 4 ? 4 : 2;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess>;
 };
 
 } // namespace ninfer::ops::detail

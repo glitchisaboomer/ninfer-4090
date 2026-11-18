@@ -360,7 +360,7 @@ fix(targets): correct SenseNova GDN state accounting
 
 ### E1. Qualify the missing exact-shape op profiles
 
-**Status:** not started.
+**Status:** in progress. The GDN input projection is complete; W8 SwiGLU remains.
 
 GDN gating is done, but the rest of the GDN/MLP input path is not. W8 dispatch smoke tests only
 prove that a launcher exists; they do not provide the numerical contracts required by the runtime.
@@ -378,7 +378,7 @@ prove that a launcher exists; they do not provide the numerical contracts requir
 
 **Work**
 
-- [ ] Add `gdn_input_proj` for W8 parent `[12288,4096]` producing `qkv [8192,T]` and `z [4096,T]`.
+- [x] Add `gdn_input_proj` for W8 parent `[12288,4096]` producing `qkv [8192,T]` and `z [4096,T]`.
 - [ ] Add the fused projection/convolution/snapshot form for the same parent and `conv [4,8192]`.
 - [ ] Add W8 `linear_swiglu` for `[24576,4096] -> [12288,T]`.
 - [ ] Keep the existing `[12288,2048]` Qwen 35B profiles unchanged.
@@ -386,9 +386,12 @@ prove that a launcher exists; they do not provide the numerical contracts requir
 
 **Tests**
 
-- [ ] `ninfer_gdn_input_proj_test` covers T=1, small T, MTP-like widths, and prefill widths.
+- [x] `ninfer_gdn_input_proj_test` covers T=1, small T, MTP-like widths, and prefill widths.
 - [ ] `ninfer_linear_swiglu_w8_a16_test` covers SenseNova gate/up shape at equivalent extents.
 - [ ] Existing Qwen GDN/MLP tests remain green.
+
+**Evidence for completed GDN projection:** `./build-sandbox.sh --ctest
+'^ninfer_(gdn_input_proj|linear_w8_sensenova_dispatch|linear_w8_a16)_test$'` passed 3/3.
 
 **Proposed commits**
 

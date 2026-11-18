@@ -84,6 +84,12 @@ constexpr auto kMtpDownLaunchers =
 constexpr auto k35bMtpProjectionLaunchers = make_launchers<W835bMtpProjectionGeometry,
                                                            kW835bMtpProjectionFirstSmallT>(
     std::make_index_sequence<kW835bMtpProjectionLastSmallT - kW835bMtpProjectionFirstSmallT + 1>{});
+constexpr auto kSenseNovaQkvLaunchers =
+    make_launchers<W8SenseNovaQkvProjectionGeometry, kW8SenseNovaQkvFirstSmallT>(
+        std::make_index_sequence<kW8SenseNovaQkvLastSmallT - kW8SenseNovaQkvFirstSmallT + 1>{});
+constexpr auto kSenseNovaZLaunchers =
+    make_launchers<W8SenseNovaZProjectionGeometry, kW8SenseNovaZFirstSmallT>(
+        std::make_index_sequence<kW8SenseNovaZLastSmallT - kW8SenseNovaZFirstSmallT + 1>{});
 
 } // namespace
 
@@ -135,6 +141,23 @@ void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaS
         x.ne[1] >= kW8MtpDownFirstSmallT && x.ne[1] <= kW8MtpDownLastSmallT) {
         const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8MtpDownFirstSmallT);
         kMtpDownLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8SenseNovaQkvProjectionGeometry::kOutputRows &&
+        weight.k == W8SenseNovaQkvProjectionGeometry::kInputRows &&
+        weight.padded_shape[1] == W8SenseNovaQkvProjectionGeometry::kInputRows &&
+        x.ne[1] >= kW8SenseNovaQkvFirstSmallT && x.ne[1] <= kW8SenseNovaQkvLastSmallT) {
+        const std::size_t index =
+            static_cast<std::size_t>(x.ne[1] - kW8SenseNovaQkvFirstSmallT);
+        kSenseNovaQkvLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == W8SenseNovaZProjectionGeometry::kOutputRows &&
+        weight.k == W8SenseNovaZProjectionGeometry::kInputRows &&
+        weight.padded_shape[1] == W8SenseNovaZProjectionGeometry::kInputRows &&
+        x.ne[1] >= kW8SenseNovaZFirstSmallT && x.ne[1] <= kW8SenseNovaZLastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8SenseNovaZFirstSmallT);
+        kSenseNovaZLaunchers[index](x, weight, out, stream);
         return;
     }
     if (weight.n == W835bMtpProjectionGeometry::kOutputRows &&

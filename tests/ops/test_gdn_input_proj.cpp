@@ -83,9 +83,9 @@ int run_q4_q5() {
 }
 
 int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens) {
-    constexpr std::int32_t kHidden      = 2048;
-    constexpr std::int32_t kQkvRows     = 8192;
-    constexpr std::int32_t kZRows       = 4096;
+    constexpr std::int32_t kHidden  = 2048;
+    constexpr std::int32_t kQkvRows = 8192;
+    constexpr std::int32_t kZRows   = 4096;
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 501U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
@@ -108,15 +108,6 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens) {
                                     activation, kHidden, tokens);
     failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("gdn parent weight" + suffix);
-    return failures;
-}
-
-int run_w8() {
-    constexpr std::int32_t kHidden = 2048;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 503U));
-    int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 97}) { failures += run_w8_case(parent, tokens); }
     return failures;
 }
 
@@ -154,6 +145,57 @@ int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor&
     }
     return compare(label, actual, expected, criterion);
 }
+
+
+int run_w8_sensenova_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden  = 4096;
+    constexpr std::int32_t kQkvRows = 8192;
+    constexpr std::int32_t kZRows   = 4096;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 907U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kQkvRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor qkv_output = qkv.tensor();
+    Tensor z_output   = z.tensor();
+    ops::gdn_input_proj_sensenova(x, parent.view(), qkv_output, z_output, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " SenseNova W8 A16 T=" + std::to_string(tokens);
+    int failures = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
+    failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
+    failures += verify_output_range_sampled("gdn qkv" + suffix, qkv, kQkvRows, 0, kQkvRows,
+                                            parent.host, 0, activation, kHidden, tokens,
+                                            kGdnInputProjA16Tolerance);
+    // `verify_output_range_sampled` selects rows relative to output_rows; the Z output is its own
+    // [4096,T] tensor, while the parent row offset is still 8192.
+    failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
+                                    activation, kHidden, tokens);
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("gdn parent weight" + suffix);
+    return failures;
+}
+
+int run_w8() {
+    constexpr std::int32_t kHidden = 2048;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 503U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 97}) {
+        failures += run_w8_case(parent, tokens);
+    }
+
+    DevicePackedWeight sense_nova_parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, 4096, 907U));
+    for (const std::int32_t tokens : {1, 2, 6, 17, 64}) {
+        failures += run_w8_sensenova_case(sense_nova_parent, tokens);
+    }
+    return failures;
+}
+
 
 } // namespace
 

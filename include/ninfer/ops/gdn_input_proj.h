@@ -196,4 +196,14 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * SenseNova-Loop-9B exact storage domain. `query_key_value_z_weight` is one contiguous
+ * W8G32_F16S RowSplit parent [12288,4096] in q/k/value/z row order. The first 8192 rows are
+ * projected to `qkv [8192,T]` and the final 4096 rows to `z [4096,T]`, under the same exact-decode
+ * and naive-FP64 oracle as the other single-parent form. `x` is BF16 [4096,T]. All non-overlap and
+ * positive-T requirements match the policy-bearing single-parent form. W8 admits A16 only.
+ */
+void gdn_input_proj_sensenova(const Tensor& x, const Weight& query_key_value_z_weight,
+                              Tensor& qkv, Tensor& z, cudaStream_t stream);
+
 } // namespace ninfer::ops

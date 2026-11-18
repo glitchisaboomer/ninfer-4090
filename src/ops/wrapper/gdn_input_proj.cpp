@@ -216,6 +216,32 @@ void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* la
     }
 }
 
+Weight w8_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
+    const std::uint64_t kg       = static_cast<std::uint64_t>(parent.padded_shape[1]) /
+                             static_cast<std::uint64_t>(parent.group_size);
+    // W8G32 stores one signed byte per element, so a 32-element group occupies 32 bytes.
+    const std::uint64_t row_code_bytes = kg * static_cast<std::uint64_t>(parent.group_size);
+    const auto* bytes                  = static_cast<const std::uint8_t*>(parent.qdata);
+    const void* qdata = bytes + static_cast<std::uint64_t>(row_begin) * row_code_bytes;
+    const auto* scale_bytes = static_cast<const std::uint8_t*>(parent.scales);
+    const std::uint64_t row_scale_bytes = kg * sizeof(std::uint16_t);
+    const void* scales = scale_bytes + static_cast<std::uint64_t>(row_begin) * row_scale_bytes;
+
+    Weight view                  = parent;
+    view.payload                 = qdata;
+    view.payload_bytes           = static_cast<std::uint64_t>(rows) * row_code_bytes;
+    view.qdata                   = qdata;
+    view.qhigh                   = nullptr;
+    view.high_plane_bytes        = 0;
+    view.scales                  = scales;
+    view.shape[0]                = rows;
+    view.padded_shape[0]         = rows;
+    view.n                       = rows;
+    view.scale_ne[0]             = rows;
+    view.scale_nb[0]             = static_cast<std::int64_t>(row_scale_bytes);
+    return view;
+}
+
 void validate_policy(LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
@@ -477,6 +503,41 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     cudaStream_t stream) {
     dispatch_single_parent(x, query_key_value_z_weight, qkv, z, LinearPolicy::A16Only, nullptr,
                            stream);
+}
+
+void gdn_input_proj_sensenova(const Tensor& x, const Weight& query_key_value_z_weight,
+                              Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    constexpr std::int32_t kHidden  = 4096;
+    constexpr std::int32_t kQkvRows = 8192;
+    constexpr std::int32_t kZRows   = 4096;
+    constexpr std::int32_t kRows    = kQkvRows + kZRows;
+    const std::int32_t cols         = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(qkv, kQkvRows, cols, "qkv");
+    require_matrix(z, kZRows, cols, "z");
+    require_single_parent_nonoverlap(x, qkv, z);
+
+    if (query_key_value_z_weight.qtype != QType::W8G32_F16S ||
+        query_key_value_z_weight.layout != QuantLayout::RowSplit ||
+        query_key_value_z_weight.scale_dtype != DType::FP16 ||
+        query_key_value_z_weight.group_size != 32 || query_key_value_z_weight.group != 32 ||
+        query_key_value_z_weight.ndim != 2 || query_key_value_z_weight.n != kRows ||
+        query_key_value_z_weight.k != kHidden || query_key_value_z_weight.shape[0] != kRows ||
+        query_key_value_z_weight.shape[1] != kHidden ||
+        query_key_value_z_weight.padded_shape[0] != kRows ||
+        query_key_value_z_weight.padded_shape[1] != kHidden ||
+        query_key_value_z_weight.qhigh != nullptr ||
+        query_key_value_z_weight.high_plane_bytes != 0 ||
+        !aligned_to(query_key_value_z_weight.qdata, 16) ||
+        !aligned_to(query_key_value_z_weight.scales, 16)) {
+        throw std::invalid_argument("gdn_input_proj: invalid q/k/value/z weight");
+    }
+
+    Weight qkv_weight = w8_row_view(query_key_value_z_weight, 0, kQkvRows);
+    Weight z_weight   = w8_row_view(query_key_value_z_weight, kQkvRows, kZRows);
+    ops::linear(x, qkv_weight, qkv, stream);
+    ops::linear(x, z_weight, z, stream);
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
