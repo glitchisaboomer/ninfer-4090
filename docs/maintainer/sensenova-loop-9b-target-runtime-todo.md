@@ -313,20 +313,157 @@ feat(targets): add SenseNova program lifecycle
 
 ## E. Text prefill and ordinary decode execution
 
-**Status: in progress / blocked on real forward implementation.**
-
-The lifecycle and planning scaffolding is in place, and the current Program intentionally refuses
-to perform model execution rather than emitting fake tokens. This stage still needs:
-
-- [x] qualified W8 dispatch for every SenseNova 4096-wide projection at small T and large T;
-- [ ] a real SenseNova `TextContext` that executes all 56 visits over the bound physical weights;
-- device-backed KV/GDN/mHC state images with per-visit identity;
-- prefill/decode graph state and reference comparisons.
-
-This is recorded explicitly so no later stage can mistake the lifecycle skeleton for working text
-generation.
+**Status: in progress.** Stage E is now split into smaller independently verifiable pieces so each
+commit can have a real numerical or state-contract test. The lifecycle skeleton is not a working
+text path and must never be mistaken for one.
 
 **Goal:** generate text correctly through the fixed 56-visit schedule without MTP.
+
+### E0. Correct the execution-state contract before allocating anything
+
+**Status:** not started.
+
+The current `StateLayout` byte formula undercounts GDN state. The recurrent state is
+`FP32 [128,128,value_heads]` per logical visit, not `4 * value_dim` floats. For SenseNova
+`value_heads=32`, this is approximately 2 MiB of recurrent state per GDN visit, plus the width-3
+convolution history, rather than the roughly 64 KiB currently accounted. Sequence capacity and
+reservation must be corrected before device buffers are created.
+
+**Files**
+
+- `src/targets/sensenova_loop_9b/impl/state_layout.h`
+- `src/targets/sensenova_loop_9b/impl/runtime/layouts.cpp`
+- `tests/targets/sensenova_loop_9b/test_loop_plan.cpp`
+- `tests/targets/sensenova_loop_9b/test_sequence_plan.cpp`
+
+**Work**
+
+- [ ] Correct GDN recurrent bytes to `128 * 128 * value_heads * sizeof(float)`.
+- [ ] Correct GDN convolution bytes to `conv_channels * (kernel - 1) * sizeof(uint16_t)`.
+- [ ] Keep the 42 GDN visit identities and 14 full-attention KV visit identities explicit.
+- [ ] Assert reservation changes against all supported KV modes and max concurrency.
+- [ ] Do not allocate device state until this accounting test passes.
+
+**Tests**
+
+- [ ] State-layout unit test checks exact per-slot bytes and total fixed state bytes.
+- [ ] Sequence-plan test checks reservation includes corrected GDN state.
+
+**Proposed commit**
+
+```text
+fix(targets): correct SenseNova GDN state accounting
+```
+
+### E1. Qualify the missing exact-shape op profiles
+
+**Status:** not started.
+
+GDN gating is done, but the rest of the GDN/MLP input path is not. W8 dispatch smoke tests only
+prove that a launcher exists; they do not provide the numerical contracts required by the runtime.
+
+**Files**
+
+- `include/ninfer/ops/gdn_input_proj.h`
+- `src/ops/wrapper/gdn_input_proj.cpp`
+- `src/ops/gdn_input_proj/w8/*`
+- `include/ninfer/ops/linear_swiglu.h`
+- `src/ops/wrapper/linear_swiglu.cpp`
+- `src/ops/linear_swiglu/w8/*`
+- `tests/ops/test_gdn_input_proj.cpp`
+- `tests/ops/linear_swiglu/test_w8_a16.cpp`
+
+**Work**
+
+- [ ] Add `gdn_input_proj` for W8 parent `[12288,4096]` producing `qkv [8192,T]` and `z [4096,T]`.
+- [ ] Add the fused projection/convolution/snapshot form for the same parent and `conv [4,8192]`.
+- [ ] Add W8 `linear_swiglu` for `[24576,4096] -> [12288,T]`.
+- [ ] Keep the existing `[12288,2048]` Qwen 35B profiles unchanged.
+- [ ] Verify every added profile against an independent FP64 exact-decode oracle.
+
+**Tests**
+
+- [ ] `ninfer_gdn_input_proj_test` covers T=1, small T, MTP-like widths, and prefill widths.
+- [ ] `ninfer_linear_swiglu_w8_a16_test` covers SenseNova gate/up shape at equivalent extents.
+- [ ] Existing Qwen GDN/MLP tests remain green.
+
+**Proposed commits**
+
+```text
+feat(ops): add SenseNova GDN input projection
+feat(ops): add SenseNova W8 SwiGLU profile
+```
+
+### E2. Build device-backed state images
+
+**Status:** not started.
+
+**Files**
+
+- `src/targets/sensenova_loop_9b/impl/runtime/state_images.h`
+- `src/targets/sensenova_loop_9b/impl/runtime/state_images.cpp`
+- `src/targets/sensenova_loop_9b/impl/runtime_stub.{h,cpp}`
+- `tests/targets/sensenova_loop_9b/test_state_images.cpp`
+
+**Work**
+
+- [ ] Allocate/reserve KV pages for 14 full-attention visits plus one MTP KV domain.
+- [ ] Allocate one GDN recurrent/conv state image per each of the 42 GDN visits.
+- [ ] Allocate one mHC two-stream image per each of the 48 mHC visits.
+- [ ] Map `visit -> physical layer`, `visit -> pass`, and `visit -> state slot` in one place.
+- [ ] Provide zero, snapshot, restore, and ownership/validity operations for each domain.
+- [ ] Ensure all pointers used by graph replay are stable for the Program lifetime.
+
+**Tests**
+
+- [ ] Distinct visit states never alias another visit's state.
+- [ ] Revisited physical layers map to different state slots on pass 0 and pass 1.
+- [ ] Snapshot/restore round-trips deterministic markers in KV, GDN, and mHC state.
+- [ ] Zero/reset clears only the addressed slot.
+
+**Proposed commit**
+
+```text
+feat(targets): add SenseNova device state images
+```
+
+### E3. Implement one-visit layer execution
+
+**Status:** not started.
+
+**Files**
+
+- `src/targets/sensenova_loop_9b/impl/runtime/layer_execution.h`
+- `src/targets/sensenova_loop_9b/impl/runtime/layer_execution.cpp`
+- `tests/targets/sensenova_loop_9b/test_layer_execution.cpp`
+
+**Work**
+
+- [ ] Implement one full-attention visit: input RMSNorm, Q/gate split, QK norm, RoPE, 16/4 GQA,
+      output projection, post-attention RMSNorm, MLP, residual adds.
+- [ ] Route SenseNova 16/4 GQA through the prompt/append path only.
+- [ ] Implement one GDN visit using the qualified projection, gating, convolution, recurrence, gated
+      RMSNorm, and output projection.
+- [ ] Use GDN state from the visit slot, never the physical layer index.
+- [ ] Apply mHC `enter`/`leave` at physical boundaries 4 and 28 with FP32 router math and BF16
+      branch/residual boundaries.
+- [ ] Keep shape/state transitions explicit; no hidden global stream state.
+
+**Tests**
+
+- [ ] Single-layer fixtures against independent CPU/FP64 or Hugging Face reference values.
+- [ ] Repeated visits with shared physical weights use distinct state slots.
+- [ ] mHC branch/post/mix and router Sinkhorn remain covered by existing mHC test.
+
+**Proposed commit**
+
+```text
+feat(targets): add SenseNova one-visit layer execution
+```
+
+### E4. Implement eager full prefill
+
+**Status:** not started.
 
 **Files**
 
@@ -334,44 +471,103 @@ generation.
 - `src/targets/sensenova_loop_9b/impl/runtime/text_context.cpp`
 - `src/targets/sensenova_loop_9b/impl/runtime/prefill.h`
 - `src/targets/sensenova_loop_9b/impl/runtime/prefill.cpp`
-- `src/targets/sensenova_loop_9b/impl/runtime/decode.h`
-- `src/targets/sensenova_loop_9b/impl/runtime/decode.cpp`
-- `src/targets/sensenova_loop_9b/impl/runtime/mhc_state.h`
-- `src/targets/sensenova_loop_9b/impl/runtime/graph_impl.h`
 - `tests/targets/sensenova_loop_9b/test_text_execution.cpp`
-- `tests/targets/sensenova_loop_9b/test_graph_replay.cpp`
-- `tests/CMakeLists.txt`
 
 **Work**
 
-- [ ] Execute visit schedule exactly once per generated token.
-- [ ] Use 16/4 GQA for full-attention visits; only the prompt/append path for this geometry.
-- [ ] Use GDN state slot from the visit, never the physical layer index.
-- [ ] Apply mHC `enter`/`leave` stream-shape transitions at physical boundaries 4 and 28.
-- [ ] Use FP32 mHC router math with BF16 branch/residual boundary.
-- [ ] Apply per-visit RMSNorm/QK-norm weights bound from the physical layer.
-- [ ] Sample through token domain `248077`; LM head has `248320` rows.
-- [ ] Capture decode CUDA Graphs only after all state pointers are stable.
-- [ ] Implement prefix reuse with looped state identity.
+- [ ] Embed prompt tokens with W8 `D=4096` embedding.
+- [ ] Execute exactly the 56 visits in `LoopPlan` order for every prefill chunk.
+- [ ] Apply final RMSNorm, Q6 LM head over 248320 rows, and sample/argmax within token domain
+      `248077`.
+- [ ] Handle EOS ids `(248044, 248046)` through the existing output session contract.
+- [ ] Replace `start_prefill_lane` placeholder token `0` with the sampled first token.
+- [ ] Support INT8 and BF16 KV modes according to the selected execution plan.
 
 **Tests**
 
 - [ ] Fixed prompt prefill output stable across reruns.
-- [ ] Ordinary decode advances positions and all 56 visit states once per token.
-- [ ] Graph replay equals eager decode.
-- [ ] Prefix reuse equals full prefill for the shared prefix.
-- [ ] INT8 and BF16 KV paths.
-- [ ] EOS handling for `(248044, 248046)`.
+- [ ] First-token logits compare against a Hugging Face reference fixture.
+- [ ] Prompt positions and per-visit state advance exactly once per prompt token.
 
-**Exit criterion:** ordinary text generation is numerically and behaviorally correct with fixed loop
-semantics.
-
-**Proposed commits**
+**Proposed commit**
 
 ```text
-feat(targets): add SenseNova fixed-plan text execution
+feat(targets): add SenseNova eager prefill execution
+```
+
+### E5. Implement eager ordinary decode
+
+**Status:** not started.
+
+**Files**
+
+- `src/targets/sensenova_loop_9b/impl/runtime/decode.h`
+- `src/targets/sensenova_loop_9b/impl/runtime/decode.cpp`
+- `src/targets/sensenova_loop_9b/impl/runtime_stub.cpp`
+- `tests/targets/sensenova_loop_9b/test_text_execution.cpp`
+
+**Work**
+
+- [ ] Decode one token by executing all 56 visits once from the committed frontier.
+- [ ] Advance KV/GDN/mHC state only after sampling and acceptance.
+- [ ] Remove all placeholder `token 0` generation paths from `decode_batch`.
+- [ ] Wire generation timings and logprobs from real sampled logits.
+- [ ] Preserve batch lane identity and pending/active/retained lifecycle behavior.
+
+**Tests**
+
+- [ ] Ordinary decode of a fixed prefix matches Hugging Face generated ids for greedy settings.
+- [ ] Decode advances positions and all 56 visit states once per token.
+- [ ] EOS handling for `(248044, 248046)`.
+
+**Proposed commit**
+
+```text
+feat(targets): add SenseNova eager decode execution
+```
+
+### E6. CUDA Graphs and prefix reuse
+
+**Status:** not started.
+
+**Files**
+
+- `src/targets/sensenova_loop_9b/impl/runtime/graph_impl.h`
+- `src/targets/sensenova_loop_9b/impl/runtime/graph_impl.cpp`
+- `tests/targets/sensenova_loop_9b/test_graph_replay.cpp`
+
+**Work**
+
+- [ ] Capture decode graphs only after all state pointers are stable.
+- [ ] Use stable graph profiles for BF16/INT8 KV and supported prefill/decode token extents.
+- [ ] Keep host-side frontier publication outside replay unless it is address-stable.
+- [ ] Implement prefix reuse with looped visit identity and all state domains included.
+
+**Tests**
+
+- [ ] Graph replay equals eager decode token-for-token and state-for-state.
+- [ ] Prefix reuse equals full prefill for the shared prefix.
+- [ ] INT8 and BF16 KV graph paths.
+
+**Proposed commit**
+
+```text
 feat(targets): add SenseNova decode graphs and prefix reuse
 ```
+
+### E7. Stage E exit validation
+
+**Status:** not started.
+
+- [ ] Run all SenseNova CTests through `./build-sandbox.sh --ctest`.
+- [ ] Run the full CTest suite; all tests must pass or unrelated missing fixtures must be explicitly
+      identified.
+- [ ] Compare fixed prompts against Hugging Face for prefill and ordinary decode.
+- [ ] Confirm no placeholder token path remains in `runtime_stub.cpp`.
+- [ ] Update the to-do with commit IDs and evidence.
+
+**Exit criterion:** ordinary text generation is numerically and behaviorally correct with fixed loop
+semantics, with no MTP involved.
 
 ---
 
@@ -479,16 +675,16 @@ perf(targets): tune SenseNova prefill and MTP paths
 
 ## Current first action
 
-Start with **A**:
+Stages A-D and the GDN gating portion of Stage E are complete. The next action is now **Stage E0**:
 
-1. Create `src/targets/sensenova_loop_9b/impl/loop_plan.h`.
-2. Create `src/targets/sensenova_loop_9b/impl/state_layout.h` and `.cpp`.
-3. Add `tests/targets/sensenova_loop_9b/test_loop_plan.cpp` and `test_state_layout.cpp`.
-4. Build only those tests with `./build-sandbox.sh`.
-5. Commit as `feat(targets): add SenseNova fixed loop plan and state layout`.
-6. Mirror the commit on the GitHub lineage with the required author identity.
+1. Correct the GDN recurrent/convolution state byte accounting in `state_layout.h`.
+2. Update sequence reservation tests for the corrected state size.
+3. Build only the affected SenseNova tests with `./build-sandbox.sh`.
+4. Commit as `fix(targets): correct SenseNova GDN state accounting`.
+5. Mirror the commit on the GitHub lineage with the required author identity.
 
-Do not begin the registry or program work until the loop/state tests pass.
+Do not allocate device-backed state images until E0 passes. Do not begin E2 until E1's exact-shape
+op profiles have numerical oracle tests.
 
 ### Stage E prerequisite committed during implementation
 
