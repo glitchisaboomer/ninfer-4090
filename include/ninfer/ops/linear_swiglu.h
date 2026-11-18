@@ -68,4 +68,11 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
 
+/**
+ * SenseNova-Loop-9B exact W8 profile: gate/up `[24576,4096]`, x `[4096,T]`, out `[12288,T]`.
+ * The formula, oracle, non-overlap, and A16 requirements match the general W8 form.
+ */
+void linear_swiglu_sensenova(const Tensor& x, const Weight& gate_up_weight, Tensor& out,
+                             cudaStream_t stream);
+
 } // namespace ninfer::ops

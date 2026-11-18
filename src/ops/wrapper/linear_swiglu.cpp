@@ -2,6 +2,7 @@
 
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -119,6 +120,36 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream) {
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
+}
+
+
+void linear_swiglu_sensenova(const Tensor& x, const Weight& gate_up_weight, Tensor& out,
+                             cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || out.dtype != DType::BF16 || x.ne[0] != 4096 ||
+        out.ne[0] != 12288 || x.ne[1] <= 0 || out.ne[1] != x.ne[1] || x.ne[2] != 1 ||
+        x.ne[3] != 1 || out.ne[2] != 1 || out.ne[3] != 1 || !x.is_contiguous() ||
+        !out.is_contiguous() || !aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
+        throw std::invalid_argument("linear_swiglu_sensenova: invalid tensor shape");
+    }
+    const bool w8 = gate_up_weight.qtype == QType::W8G32_F16S &&
+                    gate_up_weight.layout == QuantLayout::RowSplit &&
+                    gate_up_weight.scale_dtype == DType::FP16 &&
+                    gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
+                    gate_up_weight.ndim == 2 && gate_up_weight.n == 24576 &&
+                    gate_up_weight.k == 4096 && gate_up_weight.shape[0] == 24576 &&
+                    gate_up_weight.shape[1] == 4096 && gate_up_weight.padded_shape[0] == 24576 &&
+                    gate_up_weight.padded_shape[1] == 4096 && gate_up_weight.qhigh == nullptr &&
+                    gate_up_weight.high_plane_bytes == 0 && gate_up_weight.qdata != nullptr &&
+                    gate_up_weight.scales != nullptr && aligned_to(gate_up_weight.qdata, 16) &&
+                    aligned_to(gate_up_weight.scales, 16);
+    if (!w8) { throw std::invalid_argument("linear_swiglu_sensenova: invalid weight"); }
+    if (x.ne[1] == 1) {
+        detail::w8_linear_swiglu_sensenova_decode_pair_r16_launch(x, gate_up_weight, out, stream);
+    } else if (x.ne[1] >= 2 && x.ne[1] <= 48) {
+        detail::w8_linear_swiglu_sensenova_splitk_exact_t_launch(x, gate_up_weight, out, stream);
+    } else {
+        throw std::invalid_argument("linear_swiglu_sensenova: unsupported T");
+    }
 }
 
 } // namespace ninfer::ops

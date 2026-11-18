@@ -211,7 +211,10 @@ void validate_profile(const Profile& profile) {
                     profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool w8 = profile.qtype == QType::W8G32_F16S && profile.gate_up_rows == 12288 &&
                     profile.input_rows == 2048 && profile.output_rows == 6144;
-    if ((!q4 && !w8) || profile.gate_up_rows != 2 * profile.output_rows) {
+    const bool w8_sensenova = profile.qtype == QType::W8G32_F16S &&
+                              profile.gate_up_rows == 24576 && profile.input_rows == 4096 &&
+                              profile.output_rows == 12288;
+    if ((!q4 && !w8 && !w8_sensenova) || profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
     if (profile.activation_compute != ActivationCompute::A16) {
@@ -257,8 +260,14 @@ int run_profile(std::string_view label, const Profile& profile,
     const ops::LinearPolicy policy    = profile.activation_compute == ActivationCompute::A4
                                             ? ops::LinearPolicy::AllowA4
                                             : ops::LinearPolicy::A16Only;
-    const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
-        profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
+    const bool sense_nova = profile.qtype == QType::W8G32_F16S &&
+                            profile.gate_up_rows == 24576 && profile.input_rows == 4096 &&
+                            profile.output_rows == 12288;
+    const std::size_t workspace_bytes =
+        sense_nova ? 0
+                   : ops::linear_swiglu_workspace_capacity_bytes(
+                         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1,
+                         maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures = 0;
@@ -274,15 +283,22 @@ int run_profile(std::string_view label, const Profile& profile,
         workspace.reset_peak();
         const std::string case_label = std::string(label) + " T=" + std::to_string(tokens);
         try {
-            ops::linear_swiglu(x, weight, destination, policy, workspace, nullptr);
+            if (sense_nova) {
+                ops::linear_swiglu_sensenova(x, weight, destination, nullptr);
+            } else {
+                ops::linear_swiglu(x, weight, destination, policy, workspace, nullptr);
+            }
             test::cuda_check(cudaDeviceSynchronize(), "synchronize LinearSwiGLU");
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
             ++failures;
             continue;
         }
-        const std::size_t exact_workspace = ops::linear_swiglu_workspace_capacity_bytes(
-            profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens, tokens);
+        const std::size_t exact_workspace =
+            sense_nova ? 0
+                       : ops::linear_swiglu_workspace_capacity_bytes(
+                             profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens,
+                             tokens);
         if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
             std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
             ++failures;

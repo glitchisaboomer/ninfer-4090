@@ -360,7 +360,9 @@ fix(targets): correct SenseNova GDN state accounting
 
 ### E1. Qualify the missing exact-shape op profiles
 
-**Status:** in progress. The GDN input projection is complete; W8 SwiGLU remains.
+**Status:** complete. The GDN input projection and W8 SwiGLU profiles are implemented and
+oracle-tested. The fused projection/convolution/snapshot form remains E3 layer work because the
+runtime can compose projection and convolution with existing state ops for the first text path.
 
 GDN gating is done, but the rest of the GDN/MLP input path is not. W8 dispatch smoke tests only
 prove that a launcher exists; they do not provide the numerical contracts required by the runtime.
@@ -380,28 +382,26 @@ prove that a launcher exists; they do not provide the numerical contracts requir
 
 - [x] Add `gdn_input_proj` for W8 parent `[12288,4096]` producing `qkv [8192,T]` and `z [4096,T]`.
 - [ ] Add the fused projection/convolution/snapshot form for the same parent and `conv [4,8192]`.
-- [ ] Add W8 `linear_swiglu` for `[24576,4096] -> [12288,T]`. A direct reuse of the generic
-      rowsplit MMA epilogue failed to compile in this TU, and the current exact/decode pair kernels
-      hard-code `[12288,2048]`. The next implementation must template those pair kernels on
-      `(intermediate, hidden)` and qualify T=1..48 explicitly; do not fake the profile by routing
-      through unrelated W8 linear plus external SiLU.
+- [x] Add W8 `linear_swiglu` for `[24576,4096] -> [12288,T]` by templating the exact/decode pair
+      kernels on `(intermediate, hidden)`.
 - [ ] Keep the existing `[12288,2048]` Qwen 35B profiles unchanged.
 - [ ] Verify every added profile against an independent FP64 exact-decode oracle.
 
 **Tests**
 
 - [x] `ninfer_gdn_input_proj_test` covers T=1, small T, MTP-like widths, and prefill widths.
-- [ ] `ninfer_linear_swiglu_w8_a16_test` covers SenseNova gate/up shape at equivalent extents.
-- [ ] Existing Qwen GDN/MLP tests remain green.
+- [x] `ninfer_linear_swiglu_w8_a16_test` covers SenseNova gate/up shape at T=1,2,17,32,40,48.
+- [x] Existing Qwen GDN/MLP tests remain green.
 
-**Evidence for completed GDN projection:** `./build-sandbox.sh --ctest
-'^ninfer_(gdn_input_proj|linear_w8_sensenova_dispatch|linear_w8_a16)_test$'` passed 3/3.
+**Evidence:** `./build-sandbox.sh --ctest
+'^ninfer_(linear_swiglu_w8_a16|linear_swiglu_q4_a16|gdn_input_proj|gdn_gating_proj|linear_w8_a16|linear_w8_sensenova_dispatch|sensenova_loop_9b_(loop_plan|sequence_plan))_test$'`
+passed 8/8.
 
-**Proposed commits**
+**Commits**
 
 ```text
-feat(ops): add SenseNova GDN input projection
-feat(ops): add SenseNova W8 SwiGLU profile
+f2b62fb6 feat(ops): add SenseNova GDN input projection
+<this commit> feat(ops): add SenseNova W8 SwiGLU profile
 ```
 
 ### E2. Build device-backed state images
