@@ -232,8 +232,8 @@ feat(targets): add SenseNova target shell and bindings
 
 - Built sequence-plan, bindings, loop-plan, and engine targets with `./build-sandbox.sh`.
 - CTest via `./build-sandbox.sh --ctest ninfer_sensenova_loop_9b`: three SenseNova tests pass.
-- Gitea commit: `TBD`.
-- GitHub commit: `TBD`.
+- Gitea commit: `35052708`.
+- GitHub commit: `9090d4b1`.
 
 **Proposed commit**
 
