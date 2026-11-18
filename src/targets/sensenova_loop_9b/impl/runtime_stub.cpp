@@ -494,6 +494,8 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
     result.processed_prompt_tokens = tokens;
     result.host_input_consumed     = true;
     result.complete                = true;
+    // The sampled id is published verbatim, including a generation-config EOS id; stopping is the
+    // output session's decision (TextConfig::end_of_text_token / end_of_message_token).
     result.round.tokens            = std::span<const TokenId>(execution.prefill_tokens);
     result.round.logprobs          = std::span<const float>(execution.prefill_logprobs);
     result.round.margins           = std::span<const float>(execution.prefill_margins);
@@ -584,6 +586,8 @@ runtime::BatchedGeneratedRound Program::decode_batch(std::span<const std::uint32
             throw std::out_of_range("decode batch lane is out of range");
         }
         decode_one(lane);
+        // Unfiltered, like prefill: an EOS id is a token the round licenses, not a token the target
+        // suppresses. The output session maps it to StopToken.
         const Impl::LaneExecution& execution = impl_->execution[lane];
         impl_->egress_tokens.push_back(execution.pending_tokens[0]);
         impl_->egress_logprobs.push_back(execution.pending_logprobs[0]);

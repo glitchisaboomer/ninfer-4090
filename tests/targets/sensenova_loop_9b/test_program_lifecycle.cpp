@@ -116,6 +116,27 @@ void test_decode_batch_validation() {
     expect(rejected_empty, "decode rejects an empty batch");
 }
 
+void test_output_contract() {
+    // The output session stops on the generation-config EOS ids. The target's obligation is the
+    // other half: sample inside a domain that contains them and pass them through unfiltered.
+    expect(sn::TextConfig::end_of_text_token == 248044 &&
+               sn::TextConfig::end_of_message_token == 248046,
+           "generation-config EOS ids are the published values");
+    expect(sn::TextConfig::end_of_text_token < sn::TextConfig::token_domain &&
+               sn::TextConfig::end_of_message_token < sn::TextConfig::token_domain,
+           "both EOS ids are inside the sampled token domain");
+    expect(sn::TextConfig::token_domain == 248077,
+           "the sampled domain is the tokenizer-addressable domain");
+    expect(sn::TextConfig::output_rows > sn::TextConfig::token_domain,
+           "the head's padded rows are outside the sampled domain");
+
+    auto program = sn::Program::create(1, 32, 4096, 1U << 20U);
+    const auto timings = program->generation_timings_lane(0);
+    expect(timings.prefill_seconds == 0.0 && timings.decode_seconds == 0.0 &&
+               timings.total_seconds == 0.0,
+           "a lane that has not run reports zero timings");
+}
+
 void test_memory() {
     auto program   = sn::Program::create(1, 16, 2048, 987654321ULL);
     const auto mem = program->memory_summary();
@@ -131,6 +152,7 @@ int main() {
     test_state_images();
     test_prefill_requires_model();
     test_decode_batch_validation();
+    test_output_contract();
     test_memory();
     if (failures != 0) {
         std::cerr << "FAIL senseNova program lifecycle: " << failures << '\n';

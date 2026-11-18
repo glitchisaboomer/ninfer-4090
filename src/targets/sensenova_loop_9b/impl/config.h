@@ -17,6 +17,13 @@ struct TextConfig {
     static constexpr int output_rows  = 248320;
     static constexpr int token_domain = 248077;
 
+    // Generation-config end-of-sequence ids: <|endoftext|> and <|im_end|>. Both lie inside the
+    // tokenizer-addressable domain, so the head can sample them; the target passes a sampled id
+    // through unchanged and the request's output session decides to stop. Neither is ever masked
+    // out of a round.
+    static constexpr int end_of_text_token    = 248044;
+    static constexpr int end_of_message_token = 248046;
+
     static constexpr int gdn_conv_kernel      = 4;
     static constexpr int gdn_conv_state_width = gdn_conv_kernel - 1;
     static constexpr int gdn_key_heads        = 16;
@@ -93,6 +100,8 @@ inline constexpr std::uint32_t kMaximumMtpDraftTokens = 15;
 inline constexpr std::uint32_t kNativeContext         = 262144;
 inline constexpr int kDraftHeadRows                   = 131072;
 
+static_assert(TextConfig::end_of_text_token < TextConfig::token_domain);
+static_assert(TextConfig::end_of_message_token < TextConfig::token_domain);
 static_assert(TextConfig::full_attention_layers() == 8);
 static_assert(TextConfig::gdn_layers() == 24);
 static_assert(TextConfig::mhc_layers() == 24);
