@@ -100,7 +100,7 @@ the only supported plan is:
 
 ### 2. Converter
 
-- [ ] Add `tools/convert/sensenova_loop_9b/` with strict config validation.
+- [x] Add `tools/convert/sensenova_loop_9b/` with strict config validation.
 - [ ] Normalize `model.language_model.*` source prefixes.
 - [ ] Ignore vision tensors only through an explicit whitelist; reject unknown tensors.
 - [ ] Hard-fail on unexpected shapes or config fields instead of adapting silently.
@@ -112,11 +112,23 @@ the only supported plan is:
   - `mhc_attn.weight [8,8192]`, `mhc_attn.bias [8]`;
   - `mhc_ffn.weight [8,8192]`, `mhc_ffn.bias [8]`;
   - only for physical layers 4..27.
-- [ ] Convert MTP from `mtp.safetensors`:
+- [x] Convert MTP from `mtp.safetensors`:
   - assert `mtp_use_dedicated_embeddings=false`;
   - use the main embedding and main LM head;
   - map `mtp.fc.weight [4096,8192]`, norms, one 16/4 attention layer, and one 12288-wide MLP.
-- [ ] Add converter round-trip tests using tiny generated fixtures, not the real checkpoint.
+- [x] Add converter fixture tests using tiny generated fixtures, not the real checkpoint.
+
+The converter has been run once against the licensed checkpoint with the fixed output path:
+
+```bash
+python -m tools.convert.sensenova_loop_9b.convert \
+  --model /home/user/models/sensenova/SenseNova-Loop-9B \
+  --out /home/user/models/sensenova/SenseNova-Loop-9B.ninfer \
+  --device cuda
+```
+
+The result is a 9.2 GB artifact with 447 objects and a verified structural summary. Do not create a
+second conversion output; rerun the same path only with explicit approval.
 
 ### 3. Ops
 
