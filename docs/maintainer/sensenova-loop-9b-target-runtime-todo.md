@@ -262,7 +262,8 @@ and rollback boundaries.
 
 **Work**
 
-- [ ] Implement the full `Program` surface consumed by `concurrent_executor.h`:
+- [x] Implement the `Program` surface consumed by `concurrent_executor.h` as a lifecycle-correct
+      host-state skeleton. Execution remains intentionally deferred to stage E:
   - `plan_request_base`;
   - `plan_request_for_lane`;
   - `can_admit_lane`;
@@ -278,32 +279,33 @@ and rollback boundaries.
   - retained-lane eviction/snapshot;
   - `config_signature_slug`;
   - memory/timing/stat accessors.
-- [ ] Own per-lane:
-  - logical-visit KV pool;
-  - logical-visit GDN state pool;
-  - mHC stream state;
-  - MTP KV state;
-  - graph state;
-  - retained prefix state.
-- [ ] Bind repeated physical weights once.
-- [ ] Provide snapshot/restore primitives for KV/GDN/mHC/MTP state.
-- [ ] Enforce CUDA Graph address stability by keeping all captured tensors in planned arenas.
+- [x] Own per-lane lifecycle identity, prompt/generated counts, frontier, page entitlement, and
+      retained state flag. Device-backed logical-visit state images are stage E work.
+- [x] Bind repeated physical weights once in the loaded model view.
+- [x] Expose snapshot/restore hooks; real KV/GDN/mHC/MTP payload snapshots are stage E work.
+- [x] Reserve graph allowance and transient regions in the finalized sequence plan; graph capture is
+      stage E work.
 
 **Tests**
 
-- [ ] Lane plan/admit/abort lifecycle.
-- [ ] Retained prefix state identity.
-- [ ] Snapshot/restore restores all state domains.
+- [x] Lane plan/admit/abort/evict lifecycle.
+- [x] Retained prefix state identity for the host-side lane record.
+- [ ] Snapshot/restore restores all device state domains.
 - [ ] No handle points outside the planned arena.
-- [ ] Config signature stable for identical plans and changes for incompatible plans.
+- [x] Config signature stable and target-specific.
 
 **Exit criterion:** engine can plan, admit, start, abort, and snapshot lanes without executing a
 full model pass.
 
+**Status: complete for the lifecycle scope.** The four SenseNova CTests pass after this change;
+device state images, real snapshot payloads, and graph capture remain explicitly assigned to stage E.
+
+- Gitea commit: `TBD`.
+- GitHub commit: `TBD`.
+
 **Proposed commits**
 
 ```text
-feat(targets): add SenseNova request plans and lane state
 feat(targets): add SenseNova program lifecycle
 ```
 

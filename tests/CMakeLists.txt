@@ -92,6 +92,14 @@ target_include_directories(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
 target_link_libraries(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE ninfer_engine)
 
+ninfer_add_test(ninfer_sensenova_loop_9b_program_lifecycle_test
+  SOURCES targets/sensenova_loop_9b/test_program_lifecycle.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_sensenova_loop_9b_program_lifecycle_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
+target_link_libraries(ninfer_sensenova_loop_9b_program_lifecycle_test PRIVATE ${NINFER_CUDART_TARGET})
+
 # Real-artifact load-plan verification for the SenseNova target. Skips cleanly when the licensed
 # artifact is not installed.
 ninfer_add_test(ninfer_sensenova_loop_9b_bindings_test

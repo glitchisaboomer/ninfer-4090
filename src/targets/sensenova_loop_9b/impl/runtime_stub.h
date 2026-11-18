@@ -22,6 +22,16 @@ namespace ninfer::targets::sensenova_loop_9b { struct Package; }
 
 namespace ninfer::targets::sensenova_loop_9b::detail {
 
+struct LaneStateSnapshot {
+    std::uint32_t lane                    = 0;
+    bool occupied                         = false;
+    bool retained                         = false;
+    std::uint32_t prompt_tokens           = 0;
+    std::uint32_t generated_tokens        = 0;
+    std::uint32_t frontier                = 0;
+    std::uint32_t page_entitlement        = 0;
+};
+
 class RequestBasePlan {
 public:
     RequestBasePlan(RequestBasePlan&&) noexcept;
@@ -38,6 +48,7 @@ private:
     explicit RequestBasePlan(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
     friend class Program;
+    friend class RequestPlanForTest;
 };
 
 class RequestPlan {
@@ -56,6 +67,7 @@ private:
     explicit RequestPlan(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
     friend class Program;
+    friend class RequestPlanForTest;
 };
 
 class SequencePlan {
@@ -103,8 +115,15 @@ private:
     friend struct ::ninfer::targets::sensenova_loop_9b::Package;
 };
 
+class RequestPlanForTest {
+public:
+    [[nodiscard]] static RequestPlan make();
+};
+
 class Program {
 public:
+    [[nodiscard]] static LaneStateSnapshot inspect_lane_for_test(const Program& program,
+                                                                 std::uint32_t lane);
     static std::unique_ptr<Program> create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                            std::uint32_t context, std::size_t reservation_bytes);
     ~Program() noexcept;
