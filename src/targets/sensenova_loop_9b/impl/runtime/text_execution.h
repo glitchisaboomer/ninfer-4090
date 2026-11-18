@@ -13,12 +13,16 @@
 //
 // Stage E4B adds the two ends of the forward pass -- the token embedding gather
 // and the final norm/head/greedy pick for the last column -- so the 56 layer
-// visits can be dropped between them without any lifecycle wiring. Sampling
-// beyond the greedy argmax and the visit orchestration itself land in later E4
-// stages.
+// visits can be dropped between them without any lifecycle wiring. Stage E4C
+// supplies the 56 visits themselves: a pure host-side loop over LoopPlan that
+// binds each visit's physical weights and its stable state addresses and calls
+// the injected one-visit executor. The default executor is the real E3 op
+// composition; a test can inject a recorder instead and observe the exact plan
+// without touching a GPU.
 
 #include <ninfer/targets/sensenova_loop_9b/package.h>
 #include "targets/sensenova_loop_9b/impl/loop_plan.h"
+#include "targets/sensenova_loop_9b/impl/runtime/layer_execution.h"
 #include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
 
 #include "core/arena.h"
@@ -27,8 +31,35 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::targets::sensenova_loop_9b::detail {
+
+// Non-owning assets the forward loop parents into each visit. They are prepared
+// once per Program (the stored forms are not the op forms) and are addressed by
+// physical layer, because that is the identity shared weights have:
+//
+//  * kv_block_table -- I32 [kv_pages], the identity logical-to-physical page map.
+//    Every KV domain is one contiguous sequence, so all 15 domains share it.
+//  * kv_table_rows   -- I32 [1] holding row 0, the B=1 selector the append path
+//    passes to the paged attention op.
+//  * gdn_convolution -- BF16 [convolution_dim,4] per physical layer (the stored
+//    form is [4,C]); only GDN layers are addressed.
+//  * mhc_router_weight -- FP32 [MhcConfig::input_width,8] per physical layer and
+//    branch, indexed 2*layer + branch (0 = attention router, 1 = FFN router).
+//
+// Router biases need no preparation and are read from the model view directly.
+struct TextExecutionBindings {
+    Tensor kv_block_table;
+    Tensor kv_table_rows;
+    std::span<const Tensor> gdn_convolution;
+    std::span<const Tensor> mhc_router_weight;
+};
+
+// One-visit executor. The real path is execute_layer_visit; tests inject a
+// recorder so the visit order, physical layers, and bound state addresses can be
+// proven without a device.
+using LayerVisitExecutor = void (*)(const LayerVisitRequest&);
 
 // Non-owning execution context for one forward pass over the 56-visit loop.
 //
@@ -41,10 +72,17 @@ public:
     // Throws std::invalid_argument when `stream` or `state_image_base` is
     // null, when `kv_capacity` is zero, or when the workspace capacity is
     // zero. `model` is a reference and is always valid; the context requires
-    // every handle to outlive it.
+    // every handle and asset to outlive it.
+    //
+    // The default bindings are empty, which is a legal host-only context: it can
+    // answer every state-address query, but forward_visits rejects it because a
+    // visit needs its op-form weights and its KV domain. Nothing is ever passed
+    // null to an executor silently.
     TextExecutionContext(const RuntimeModelView& model, cudaStream_t stream,
                          std::byte* state_image_base, std::uint32_t kv_capacity,
-                         WorkspaceArena& workspace);
+                         WorkspaceArena& workspace,
+                         TextExecutionBindings bindings = {},
+                         LayerVisitExecutor executor = &execute_layer_visit);
 
     [[nodiscard]] const RuntimeModelView& model() const noexcept { return model_; }
     [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
@@ -61,15 +99,17 @@ public:
 
     // Stable base of visit `visit`'s GDN state slot: [recurrent FP32 | conv
     // BF16], StateLayout::gdn_state_bytes_per_slot() bytes. The slot base is
-    // the state image base plus the KV-region size plus the GDN slot offset.
-    // Throws std::out_of_range for a visit that has no GDN slot
-    // (>= StateImageLayout::kGdnSlots).
+    // the state image base plus the KV-region size plus the compact GDN slot
+    // offset (StateImageLayout::gdn_slot_for_visit). Throws std::out_of_range
+    // for a visit outside the plan or one that has no GDN slot (a
+    // full-attention visit).
     [[nodiscard]] std::byte* gdn_state_base(std::size_t visit) const;
 
     // Stable base of visit `visit`'s mHC state slot: BF16 [8192],
     // StateLayout::mhc_state_bytes_per_slot() bytes. The mHC region follows
-    // the full GDN region in the state image. Throws std::out_of_range for a
-    // visit that has no mHC slot (>= StateImageLayout::kMhcSlots).
+    // the full GDN region in the state image, and slots are compact
+    // (StateImageLayout::mhc_slot_for_visit). Throws std::out_of_range for a
+    // visit outside the plan or one that has no mHC slot.
     [[nodiscard]] std::byte* mhc_state_base(std::size_t visit) const;
 
     // KV domain index for a visit, forwarded to
@@ -123,12 +163,45 @@ public:
     [[nodiscard]] static std::size_t head_workspace_capacity_bytes(bool measure_logprob,
                                                                   bool measure_margin) noexcept;
 
+    // Stage E4C: runs the 56 visits in LoopPlan order over an already embedded
+    // hidden state, in place. `hidden` is contiguous BF16 [TextConfig::hidden,T];
+    // `positions` is contiguous I32 [T] of absolute text positions; and
+    // `visible_keys` is the longest causal history any visit of this pass sees
+    // (T for a prefill of T tokens, committed frontier + 1 for a one-token
+    // decode). The two mHC stream buffers this needs come from the context
+    // workspace and are released on return; each visit's own scratch is nested
+    // inside them.
+    //
+    // Every visit is bound explicitly. GDN visits get their own visit slot;
+    // mHC visits get theirs; full-attention visits get the typed state-image KV
+    // domain of LoopPlan visit identity, never a null cache. The executor is the
+    // only thing that touches device state, so this function is host-only.
+    void forward_visits(Tensor& hidden, const Tensor& positions,
+                        std::uint32_t visible_keys) const;
+
+    // Stage E4C: the whole text pass -- embed, the 56 visits, final norm, head,
+    // greedy sample. `sampled` and the optional logprob/margin follow
+    // project_logits_and_sample. `visible_keys` is as forward_visits.
+    void forward_full(const Tensor& ids, const Tensor& positions, std::uint32_t visible_keys,
+                      Tensor& sampled, Tensor* logprob = nullptr,
+                      Tensor* margin = nullptr) const;
+
+    // Transient workspace forward_full needs for a pass of at most `max_tokens`
+    // tokens whose longest causal history is `max_visible_keys`: the embedded
+    // hidden state, the two mHC stream buffers, the worst single-visit scratch,
+    // and the head's columns. Independent of which visit is running because the
+    // visits are sequential and each visit's scratch is scoped.
+    [[nodiscard]] static std::size_t forward_workspace_capacity_bytes(
+        std::uint32_t max_tokens, std::uint32_t max_visible_keys);
+
 private:
     const RuntimeModelView& model_;
     cudaStream_t stream_;
     std::byte* state_image_base_;
     std::uint32_t kv_capacity_;
     WorkspaceArena& workspace_;
+    TextExecutionBindings bindings_;
+    LayerVisitExecutor executor_;
 };
 
 } // namespace ninfer::targets::sensenova_loop_9b::detail

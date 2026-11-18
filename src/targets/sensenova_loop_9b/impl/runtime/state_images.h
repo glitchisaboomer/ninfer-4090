@@ -51,6 +51,27 @@ public:
         return total_kv_bytes(tokens, int8_kv, with_scales) + fixed_bytes();
     }
 
+    // Internal layout of one KV domain. Each domain holds two page-major planes -- all K pages,
+    // then all V pages -- in the exact tensor shape the paged GQA views consume:
+    // [head_dim, kKvPageTokens, kv_heads, pages]. Both halves of StateLayout's per-token KV bytes
+    // (K and V, 4 heads x 256) fit exactly, so a domain is attended with no copy or repacking.
+    static constexpr std::size_t kKvPageTokens = 128;
+
+    [[nodiscard]] static constexpr std::size_t kv_pages(std::size_t tokens) noexcept {
+        return tokens / kKvPageTokens;
+    }
+
+    // Bytes of one plane (K only, or V only) for a domain of `tokens` tokens. Requires `tokens`
+    // to be a whole number of pages; the domain layout reserves exactly two of these.
+    [[nodiscard]] static constexpr std::size_t kv_plane_bytes(std::size_t tokens) noexcept {
+        return tokens * StateLayout::kv_heads * StateLayout::head_dim * sizeof(std::uint16_t);
+    }
+
+    static_assert(2 * kKvPageTokens * StateLayout::kv_heads * StateLayout::head_dim *
+                          sizeof(std::uint16_t) ==
+                      kKvPageTokens * StateLayout::kv_bytes_per_token(false, false),
+                  "KV domain planes must tile the per-token KV bytes exactly");
+
     [[nodiscard]] static constexpr std::size_t kv_domain_for_visit(std::size_t visit) noexcept {
         // Full-attention visits are assigned compactly in visit order. The single MTP domain is
         // deliberately last and is never aliased with a text visit. Non-attention visits have no
@@ -62,12 +83,25 @@ public:
         return domain;
     }
 
+    // GDN and mHC slots are compact: one per visit of that kind, assigned in visit order. The
+    // slot count (42 and 48) is therefore smaller than the 56 visits, and indexing the region with
+    // a raw visit number would run past its end for the final 14 visits. A full-attention visit
+    // has no GDN slot and a non-mHC visit has no mHC slot; callers must gate on
+    // LoopPlan::is_gdn / LoopPlan::is_mhc first.
     [[nodiscard]] static constexpr std::size_t gdn_slot_for_visit(std::size_t visit) noexcept {
-        return visit;
+        std::size_t slot = 0;
+        for (std::size_t v = 0; v < visit; ++v) {
+            if (LoopPlan::is_gdn(v)) { ++slot; }
+        }
+        return slot;
     }
 
     [[nodiscard]] static constexpr std::size_t mhc_slot_for_visit(std::size_t visit) noexcept {
-        return visit;
+        std::size_t slot = 0;
+        for (std::size_t v = 0; v < visit; ++v) {
+            if (LoopPlan::is_mhc(v)) { ++slot; }
+        }
+        return slot;
     }
 };
 

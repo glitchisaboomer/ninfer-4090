@@ -108,32 +108,41 @@ void test_state_bases() {
 
     // GDN slots: unique for the revisited physical-layer pair (visits 4 and 28),
     // laid out one slot stride apart.
-    const std::byte* gdn4 = ctx.gdn_state_base(4);
+    const std::size_t gdn_slot4  = sn::StateImageLayout::gdn_slot_for_visit(4);
+    const std::size_t gdn_slot28 = sn::StateImageLayout::gdn_slot_for_visit(28);
+    const std::byte* gdn4  = ctx.gdn_state_base(4);
     const std::byte* gdn28 = ctx.gdn_state_base(28);
     expect(gdn4 != gdn28, "GDN state bases are unique for visits 4 and 28");
-    expect(std::size_t(gdn4 - base) == kv_bytes + sn::StateImageLayout::gdn_offset(4),
-           "GDN slot 4 address matches StateImageLayout");
-    expect(std::size_t(gdn28 - base) == kv_bytes + sn::StateImageLayout::gdn_offset(28),
-           "GDN slot 28 address matches StateImageLayout");
+    expect(std::size_t(gdn4 - base) == kv_bytes + sn::StateImageLayout::gdn_offset(gdn_slot4),
+           "GDN visit 4 address matches its compact slot");
+    expect(std::size_t(gdn28 - base) == kv_bytes + sn::StateImageLayout::gdn_offset(gdn_slot28),
+           "GDN visit 28 address matches its compact slot");
+    expect(gdn_slot28 - gdn_slot4 == 18, "18 GDN visits separate layer 7's two passes");
     expect(gdn28 - gdn4 ==
-               std::ptrdiff_t(24 * sn::StateLayout::gdn_state_bytes_per_slot()),
-           "GDN slot 28 is 24 slot strides after slot 4");
+               std::ptrdiff_t((gdn_slot28 - gdn_slot4) *
+                              sn::StateLayout::gdn_state_bytes_per_slot()),
+           "GDN visits 4 and 28 are a whole number of slot strides apart");
     expect(gdn28 + sn::StateLayout::gdn_state_bytes_per_slot() <= base + kv_bytes + gdn_region,
-           "GDN slot 28 fits inside the GDN region");
+           "GDN visit 28 fits inside the GDN region");
 
     // mHC slots: unique for visits 4 and 28 as well, and the mHC region follows
     // the GDN region.
-    const std::byte* mhc4 = ctx.mhc_state_base(4);
+    const std::size_t mhc_slot4  = sn::StateImageLayout::mhc_slot_for_visit(4);
+    const std::size_t mhc_slot28 = sn::StateImageLayout::mhc_slot_for_visit(28);
+    const std::byte* mhc4  = ctx.mhc_state_base(4);
     const std::byte* mhc28 = ctx.mhc_state_base(28);
     expect(mhc4 != mhc28, "mHC state bases are unique for visits 4 and 28");
-    expect(std::size_t(mhc4 - base) == kv_bytes + gdn_region + sn::StateImageLayout::mhc_offset(4),
-           "mHC slot 4 address matches StateImageLayout");
+    expect(std::size_t(mhc4 - base) ==
+               kv_bytes + gdn_region + sn::StateImageLayout::mhc_offset(mhc_slot4),
+           "mHC visit 4 address matches its compact slot");
     expect(mhc4 > gdn28, "mHC region follows the GDN region");
+    expect(mhc_slot28 - mhc_slot4 == 24, "24 mHC visits separate layer 7's two passes");
     expect(mhc28 - mhc4 ==
-               std::ptrdiff_t(24 * sn::StateLayout::mhc_state_bytes_per_slot()),
-           "mHC slot 28 is 24 slot strides after slot 4");
+               std::ptrdiff_t((mhc_slot28 - mhc_slot4) *
+                              sn::StateLayout::mhc_state_bytes_per_slot()),
+           "mHC visits 4 and 28 are a whole number of slot strides apart");
     expect(mhc28 + sn::StateLayout::mhc_state_bytes_per_slot() <= base + f.image.size(),
-           "mHC slot 28 fits inside the state image");
+           "mHC visit 28 fits inside the state image");
 
     // Aliasing: a GDN slot and an mHC slot of the same visit never share bytes.
     expect(gdn4 + sn::StateLayout::gdn_state_bytes_per_slot() <= base + kv_bytes + gdn_region,
@@ -188,16 +197,20 @@ void test_invalid_visit_helpers() {
     Fixture f;
     const sn::TextExecutionContext ctx(f.model, f.stream, f.image_base(), kKvCapacity, f.ws);
 
-    expect(throws_range<std::out_of_range>(
-              "GDN slot past the region",
-              [&] { (void)ctx.gdn_state_base(sn::StateImageLayout::kGdnSlots); }),
-           "gdn_state_base at the region end throws");
-    expect(throws_range<std::out_of_range>("mHC slot past the region",
-                                           [&] { (void)ctx.mhc_state_base(sn::StateImageLayout::kMhcSlots); }),
-           "mhc_state_base at the region end throws");
+    // Visit 3 is the first full-attention visit, so it owns no GDN slot; layer 0
+    // owns no mHC slot; and 56 is past the plan entirely.
+    expect(throws_range<std::out_of_range>("GDN slot for an attention visit",
+                                           [&] { (void)ctx.gdn_state_base(3); }),
+           "gdn_state_base for a full-attention visit throws");
+    expect(throws_range<std::out_of_range>("mHC slot before the boundary",
+                                           [&] { (void)ctx.mhc_state_base(0); }),
+           "mhc_state_base for a non-mHC visit throws");
     expect(throws_range<std::out_of_range>("visit out of range",
                                            [&] { (void)ctx.gdn_state_base(sn::LoopPlan::kVisits); }),
            "gdn_state_base for visit 56 throws");
+    expect(throws_range<std::out_of_range>("mHC visit out of range",
+                                           [&] { (void)ctx.mhc_state_base(sn::LoopPlan::kVisits); }),
+           "mhc_state_base for visit 56 throws");
 }
 
 // -----------------------------------------------------------------------------
@@ -386,6 +399,219 @@ void test_head_workspace_contract() {
     expect(with_margin == plain, "a bound margin needs no extra scratch");
 }
 
+// -----------------------------------------------------------------------------
+// Stage E4C: the 56-visit loop.
+//
+// The injected executor proves the plan without a device: visit order, the
+// physical layer whose weights each visit reads, and every state address the
+// visit is bound to. The fixture's weights are empty metadata -- the recorder
+// never executes them -- and the arena is host storage, which is exactly why this
+// test runs where no GPU or toolchain exists.
+// -----------------------------------------------------------------------------
+
+constexpr std::uint32_t kVisitKvCapacity = 256; // two state-image KV pages
+
+// Widths and buffer addresses are copied out of the request at call time: the
+// stream buffers forward_visits allocates live on its own stack, so retaining
+// their Tensor pointers would dangle once the pass returns.
+struct VisitRecord {
+    std::uint32_t visit              = 0;
+    int physical_layer               = 0;
+    const sn::TextLayerWeights* weights = nullptr;
+    std::int32_t hidden_in_width  = 0;
+    std::int32_t hidden_out_width = 0;
+    const void* hidden_in_data    = nullptr;
+    const void* hidden_out_data   = nullptr;
+    const ninfer::Tensor* positions = nullptr;
+    const std::byte* gdn_state       = nullptr;
+    const std::byte* mhc_state       = nullptr;
+    const std::byte* kv_domain       = nullptr;
+    std::uint32_t kv_domain_tokens   = 0;
+    const void* kv_block_table_data = nullptr;
+    const void* kv_table_rows_data  = nullptr;
+    const ninfer::Tensor* gdn_conv    = nullptr;
+    const ninfer::Tensor* router_attn = nullptr;
+    const ninfer::Tensor* router_ffn  = nullptr;
+    std::uint32_t envelope_min = 0;
+    std::uint32_t envelope_max = 0;
+};
+
+std::vector<VisitRecord> visit_records;
+
+void record_visit(const sn::LayerVisitRequest& request) {
+    visit_records.push_back(VisitRecord{
+        .visit              = request.visit,
+        .physical_layer     = sn::LoopPlan::physical_layer(request.visit),
+        .weights            = request.weights,
+        .hidden_in_width    = request.hidden_in != nullptr ? request.hidden_in->ne[0] : 0,
+        .hidden_out_width   = request.hidden_out != nullptr ? request.hidden_out->ne[0] : 0,
+        .hidden_in_data     = request.hidden_in != nullptr ? request.hidden_in->data : nullptr,
+        .hidden_out_data    = request.hidden_out != nullptr ? request.hidden_out->data : nullptr,
+        .positions          = request.positions,
+        .gdn_state          = request.gdn_state_base,
+        .mhc_state          = request.mhc_state_base,
+        .kv_domain          = request.attention_kv_domain_base,
+        .kv_domain_tokens   = request.attention_kv_domain_tokens,
+        .kv_block_table_data = request.attention_kv_block_table != nullptr
+                                   ? request.attention_kv_block_table->data
+                                   : nullptr,
+        .kv_table_rows_data  = request.attention_kv_table_rows != nullptr
+                                   ? request.attention_kv_table_rows->data
+                                   : nullptr,
+        .gdn_conv           = request.gdn_convolution_weight,
+        .router_attn        = request.mhc_attn_weight,
+        .router_ffn         = request.mhc_ffn_weight,
+        .envelope_min       = request.attention_envelope.min_visible_keys,
+        .envelope_max       = request.attention_envelope.max_visible_keys,
+    });
+}
+
+template <class Left, class Right>
+bool same_pointer(Left* left, Right* right) {
+    return static_cast<const void*>(left) == static_cast<const void*>(right);
+}
+
+struct VisitFixture {
+    std::vector<std::byte> image{
+        sn::StateImageLayout::total_bytes(kVisitKvCapacity, false, false)};
+    std::vector<std::byte> ws_storage{sn::TextExecutionContext::forward_workspace_capacity_bytes(
+        2, 2)};
+    sn::RuntimeModelView model{};
+    WorkspaceArena ws{DeviceSpan{ws_storage.data(), ws_storage.size()}};
+    cudaStream_t stream{reinterpret_cast<cudaStream_t>(std::uintptr_t{0x1})};
+
+    std::array<std::int32_t, 2> block_table{0, 1};
+    std::array<std::int32_t, 1> table_rows{0};
+    ninfer::Tensor block_table_t{block_table.data(), ninfer::DType::I32, {2}};
+    ninfer::Tensor table_rows_t{table_rows.data(), ninfer::DType::I32, {1}};
+
+    // Shared stub payloads: the recorder only inspects the bindings, and every
+    // op-form tensor of the same kind has the same shape.
+    std::array<std::uint16_t, 8192 * 4> conv_storage{};
+    std::array<float, 8192 * 8> router_storage{};
+    std::array<ninfer::Tensor, sn::TextConfig::layers> conv{};
+    std::array<ninfer::Tensor, 2 * sn::TextConfig::layers> router{};
+
+    VisitFixture() {
+        for (auto& tensor : conv) {
+            tensor = ninfer::Tensor(conv_storage.data(), ninfer::DType::BF16,
+                                    {sn::TextConfig::convolution_dim, 4});
+        }
+        for (auto& tensor : router) {
+            tensor = ninfer::Tensor(router_storage.data(), ninfer::DType::FP32,
+                                    {sn::MhcConfig::input_width, sn::MhcConfig::logits});
+        }
+    }
+
+    sn::TextExecutionBindings bindings() {
+        return sn::TextExecutionBindings{block_table_t, table_rows_t, conv, router};
+    }
+};
+
+void test_forward_visits_plan() {
+    VisitFixture f;
+    visit_records.clear();
+    const sn::TextExecutionContext ctx(f.model, f.stream, f.image.data(), kVisitKvCapacity, f.ws,
+                                      f.bindings(), &record_visit);
+
+    std::array<std::int32_t, 2> positions_host{0, 1};
+    ninfer::Tensor positions(positions_host.data(), ninfer::DType::I32, {2});
+    std::array<std::uint16_t, static_cast<std::size_t>(kHidden) * 2> hidden{};
+    ninfer::Tensor hidden_t(hidden.data(), ninfer::DType::BF16, {kHidden, 2});
+
+    ctx.forward_visits(hidden_t, positions, 2);
+
+    expect(visit_records.size() == sn::LoopPlan::kVisits,
+           "forward_visits executes exactly the 56 planned visits");
+    if (visit_records.size() != sn::LoopPlan::kVisits) { return; }
+
+    for (std::size_t visit = 0; visit < sn::LoopPlan::kVisits; ++visit) {
+        const VisitRecord& record = visit_records[visit];
+        const int physical        = sn::LoopPlan::physical_layer(visit);
+        expect(record.visit == visit, "visits run in LoopPlan order");
+        expect(record.physical_layer == physical, "visit reports its physical layer");
+        expect(same_pointer(record.weights, &ctx.model().layers[physical]),
+               "visit reads the physical layer's shared weights");
+        expect(record.positions == &positions, "visit receives the pass positions");
+        expect(record.envelope_min == 2 && record.envelope_max == 2,
+               "visit receives the declared visible-key envelope");
+
+        if (sn::LoopPlan::is_full_attention(visit)) {
+            const std::size_t domain = ctx.kv_domain(visit);
+            expect(record.kv_domain == f.image.data() +
+                                          sn::StateImageLayout::kv_offset(
+                                              domain, kVisitKvCapacity, false, false),
+                   "full-attention visit binds its own state-image KV domain");
+            expect(record.kv_domain_tokens == kVisitKvCapacity,
+                   "KV domain is bound at the declared capacity");
+            expect(record.kv_block_table_data == f.block_table_t.data &&
+                       record.kv_table_rows_data == f.table_rows_t.data,
+                   "KV domain carries the identity map and row selector");
+            expect(record.gdn_state == nullptr && record.gdn_conv == nullptr,
+                   "full-attention visit takes no GDN state");
+        } else {
+            expect(record.gdn_state == ctx.gdn_state_base(visit),
+                   "GDN visit binds its own visit state slot");
+            expect(record.gdn_conv == &f.conv[static_cast<std::size_t>(physical)],
+                   "GDN visit binds the physical layer's op-form convolution weight");
+            expect(record.kv_domain == nullptr && record.kv_domain_tokens == 0,
+                   "GDN visit takes no KV domain");
+        }
+
+        if (sn::LoopPlan::is_mhc(visit)) {
+            expect(record.mhc_state == ctx.mhc_state_base(visit),
+                   "mHC visit binds its own visit state slot");
+            expect(record.router_attn == &f.router[2 * static_cast<std::size_t>(physical)] &&
+                       record.router_ffn == &f.router[2 * static_cast<std::size_t>(physical) + 1],
+                   "mHC visit binds both router branches of its physical layer");
+        } else {
+            expect(record.mhc_state == nullptr && record.router_attn == nullptr &&
+                       record.router_ffn == nullptr,
+                   "non-mHC visit takes no mHC state");
+        }
+    }
+
+    // Revisited physical layers get distinct state slots, which is the whole point
+    // of addressing state by visit rather than by layer.
+    expect(visit_records[7].kv_domain != visit_records[31].kv_domain,
+           "layer 7 pass 0 and pass 1 hold distinct KV domains");
+    expect(visit_records[4].mhc_state != nullptr && visit_records[3].mhc_state == nullptr,
+           "mHC state begins at the enter boundary");
+
+    // The carried width changes exactly at the mHC boundaries and nowhere else.
+    expect(visit_records[4].hidden_in_width == kHidden &&
+               visit_records[4].hidden_out_width == sn::MhcConfig::input_width,
+           "mHC enter widens 4096 to 8192");
+    expect(visit_records[5].hidden_in_width == sn::MhcConfig::input_width &&
+               visit_records[5].hidden_out_width == sn::MhcConfig::input_width,
+           "an interior mHC visit carries 8192");
+    expect(visit_records[5].hidden_in_data != visit_records[5].hidden_out_data,
+           "interior mHC visits ping-pong between two stream buffers");
+    expect(visit_records[26].hidden_out_data != visit_records[27].hidden_out_data,
+           "consecutive visits alternate their destination");
+    expect(visit_records[27].hidden_in_width == sn::MhcConfig::input_width &&
+               visit_records[27].hidden_out_width == kHidden,
+           "mHC leave narrows 8192 to 4096");
+    // Visit 28 is the enter boundary again (layer 4, pass 1); the post-mHC run
+    // starts at visit 52 (layer 28).
+    expect(visit_records[52].hidden_in_width == kHidden &&
+               visit_records[52].hidden_out_width == kHidden,
+           "post-mHC visits carry 4096 again");
+}
+
+void test_forward_visits_requires_bindings() {
+    VisitFixture f;
+    const sn::TextExecutionContext ctx(f.model, f.stream, f.image.data(), kVisitKvCapacity, f.ws);
+
+    std::array<std::int32_t, 2> positions_host{0, 1};
+    ninfer::Tensor positions(positions_host.data(), ninfer::DType::I32, {2});
+    std::array<std::uint16_t, static_cast<std::size_t>(kHidden) * 2> hidden{};
+    ninfer::Tensor hidden_t(hidden.data(), ninfer::DType::BF16, {kHidden, 2});
+
+    throws_invalid_with("identity KV block table", "unbound KV assets",
+                        [&] { ctx.forward_visits(hidden_t, positions, 2); });
+}
+
 } // namespace
 
 int main() {
@@ -396,6 +622,8 @@ int main() {
     test_embed_tokens_contract();
     test_head_contract();
     test_head_workspace_contract();
+    test_forward_visits_plan();
+    test_forward_visits_requires_bindings();
     if (failures != 0) {
         std::cerr << "FAIL SenseNova text execution: " << failures << '\n';
         return 1;

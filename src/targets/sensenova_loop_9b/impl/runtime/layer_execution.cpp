@@ -2,6 +2,7 @@
 #include "targets/sensenova_loop_9b/impl/runtime/layer_execution.h"
 
 #include "core/layout.h"
+#include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_rmsnorm.h"
@@ -73,6 +74,51 @@ bool bound_kv_view(const PagedKVBatchLayerView& view) {
 bool bound_kv_view(const PagedKVLayerView& view) {
     return view.k_pages.data != nullptr && view.v_pages.data != nullptr &&
            view.block_table.data != nullptr;
+}
+
+bool bound_kv_domain(const LayerVisitRequest& request) {
+    return request.attention_kv_domain_base != nullptr;
+}
+
+// Derives the A1 batch view over one state-image KV domain. The domain already holds K then V in
+// the page-major plane shape the paged GQA kernels read, so this is pure tensor arithmetic: no
+// copy, no repacking, and the addresses are stable for the Program lifetime (graph replay safe).
+PagedKVBatchLayerView kv_domain_batch_view(const LayerVisitRequest& request) {
+    require(request.attention_kv_domain_base != nullptr,
+            "state-image KV domain base is required");
+    require(request.attention_kv_domain_tokens > 0,
+            "state-image KV domain token extent must be positive");
+    require(request.attention_kv_domain_tokens % StateImageLayout::kKvPageTokens == 0,
+            "state-image KV domain must hold a whole number of pages");
+    require(request.attention_kv_block_table != nullptr,
+            "state-image KV domain requires the identity block table");
+    require_tensor(request.attention_kv_block_table, DType::I32, "state-image block table");
+    const std::size_t pages = StateImageLayout::kv_pages(request.attention_kv_domain_tokens);
+    require(request.attention_kv_block_table->ne[0] == static_cast<int>(pages) &&
+                request.attention_kv_block_table->ne[1] == 1 &&
+                request.attention_kv_block_table->ne[2] == 1 &&
+                request.attention_kv_block_table->ne[3] == 1,
+            "state-image block table must be I32 [pages]");
+
+    auto* base = reinterpret_cast<std::uint8_t*>(
+        const_cast<std::byte*>(request.attention_kv_domain_base));
+    const std::int32_t page_tokens = static_cast<std::int32_t>(StateImageLayout::kKvPageTokens);
+    const std::int32_t kv_heads    = static_cast<std::int32_t>(StateLayout::kv_heads);
+    const std::int32_t head_dim    = static_cast<std::int32_t>(StateLayout::head_dim);
+    const std::int32_t page_count  = static_cast<std::int32_t>(pages);
+    const std::size_t plane_bytes  =
+        StateImageLayout::kv_plane_bytes(request.attention_kv_domain_tokens);
+
+    PagedKVBatchLayerView view;
+    view.k_pages     = Tensor(base, DType::BF16, {head_dim, page_tokens, kv_heads, page_count});
+    view.v_pages     = Tensor(base + plane_bytes, DType::BF16,
+                              {head_dim, page_tokens, kv_heads, page_count});
+    view.block_tables = request.attention_kv_block_table->view({page_count, 1});
+    view.head_dim     = head_dim;
+    view.num_kv_heads = kv_heads;
+    view.dtype        = DType::BF16;
+    view.quant_group  = 0;
+    return view;
 }
 
 void validate_kv_view_geometry(std::int32_t num_kv_heads, std::int32_t head_dim, DType dtype,
@@ -224,15 +270,17 @@ Tensor run_full_attention(VisitBuffers<WorkspaceArena>& b, const LayerVisitReque
     ops::rope(*request.positions, TextConfig::rotary_dim, TextConfig::rope_theta, qn, kn, stream);
 
     Tensor attention_out = b.attention_out.view({TextConfig::head_dim, TextConfig::query_heads, T});
-    const bool append = request.attention_k != nullptr;
+    const bool append = request.attention_k != nullptr || bound_kv_domain(request);
     if (append) {
         Tensor valid = request.attention_valid_columns != nullptr
                                  ? *request.attention_valid_columns
                                  : Tensor{};
+        const PagedKVBatchLayerView cache = bound_kv_domain(request)
+                                                ? kv_domain_batch_view(request)
+                                                : request.attention_kv_append;
         ops::gqa_attention(qn, kn, v, *request.positions, valid,
-                           *request.attention_kv_table_rows, kAttentionScale,
-                           request.attention_kv_append, request.attention_envelope, arena,
-                           attention_out, stream);
+                           *request.attention_kv_table_rows, kAttentionScale, cache,
+                           request.attention_envelope, arena, attention_out, stream);
     } else {
         ops::gqa_attention_cached(qn, *request.positions, kAttentionScale,
                                   request.attention_kv_cached, request.attention_envelope, arena,
@@ -342,10 +390,24 @@ void validate_request(const LayerVisitRequest& request, const VisitExecutionProf
 
         const bool append = request.attention_k != nullptr || request.attention_v != nullptr;
         const bool cached = bound_kv_view(request.attention_kv_cached);
-        if (append && cached) {
-            fail("bind exactly one GQA form (append or cached)");
+        const bool domain = bound_kv_domain(request);
+        if (static_cast<int>(append) + static_cast<int>(cached) + static_cast<int>(domain) != 1) {
+            fail("bind exactly one GQA form (append, cached, or state-image domain)");
         }
-        if (append) {
+        if (domain) {
+            require(request.attention_k == nullptr && request.attention_v == nullptr,
+                    "state-image KV domain takes no caller K/V payload");
+            require(request.attention_kv_block_table != nullptr,
+                    "state-image KV domain requires the identity block table");
+            require_tensor(request.attention_kv_table_rows, DType::I32,
+                           "attention kv_table_rows");
+            require(request.attention_kv_table_rows->ne[0] == 1 &&
+                        request.attention_kv_table_rows->ne[1] == 1,
+                    "attention kv_table_rows must be I32 [1] for B=1");
+            const PagedKVBatchLayerView view = kv_domain_batch_view(request);
+            validate_kv_view_geometry(view.num_kv_heads, view.head_dim, view.dtype,
+                                      view.quant_group, "attention state-image view");
+        } else if (append) {
             require(request.attention_k != nullptr && request.attention_v != nullptr,
                     "append attention requires both k and v");
             require_tensor(request.attention_k, DType::BF16, "attention k");
@@ -376,8 +438,10 @@ void validate_request(const LayerVisitRequest& request, const VisitExecutionProf
                                       "attention append view");
         } else if (cached) {
             require(request.attention_kv_table_rows == nullptr &&
-                        request.attention_valid_columns == nullptr,
-                    "cached attention takes no table rows or valid columns");
+                        request.attention_valid_columns == nullptr &&
+                        request.attention_kv_block_table == nullptr &&
+                        request.attention_kv_domain_tokens == 0,
+                    "cached attention takes no table rows, valid columns, or domain state");
             validate_kv_view_geometry(request.attention_kv_cached.num_kv_heads,
                                       request.attention_kv_cached.head_dim,
                                       request.attention_kv_cached.dtype,
@@ -405,7 +469,10 @@ void validate_request(const LayerVisitRequest& request, const VisitExecutionProf
                     request.attention_kv_table_rows == nullptr &&
                     request.attention_valid_columns == nullptr &&
                     !bound_kv_view(request.attention_kv_append) &&
-                    !bound_kv_view(request.attention_kv_cached),
+                    !bound_kv_view(request.attention_kv_cached) &&
+                    request.attention_kv_block_table == nullptr &&
+                    request.attention_kv_domain_tokens == 0 &&
+                    !bound_kv_domain(request),
                 "GDN visits take no GQA inputs");
 
         require(request.gdn_state_base != nullptr, "GDN visits require the visit state slot");

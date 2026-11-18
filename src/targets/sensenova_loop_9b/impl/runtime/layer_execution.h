@@ -143,7 +143,15 @@ struct LayerVisitRequest {
     // Full-attention GQA state. Exactly one form must be bound for a full-attention visit:
     //  - append form (A1): attention_kv_append view plus k/v BF16 [1024,T] and the B=1
     //    kv_table_rows I32 [1]; attention_valid_columns null (dense) or I32 [1];
-    //  - cached form (A3): attention_kv_cached view only, k/v null.
+    //  - cached form (A3): attention_kv_cached view only, k/v null;
+    //  - state-image form: attention_kv_domain_base names one contiguous KV domain of
+    //    attention_kv_domain_tokens tokens owned by the Program's state image, and the executor
+    //    derives the A1 batch view over it (see state_images.h for the plane layout). This is the
+    //    form the text forward uses: the executor appends the K/V it derives from its own
+    //    projections, so the caller cannot pass a stale or absent payload. It requires
+    //    attention_kv_block_table (I32 [pages], the identity logical-to-physical map) and
+    //    attention_kv_table_rows (I32 [1] naming row 0); k/v and the cached view stay unbound.
+    //
     // GDN visits must leave every GQA field null/empty.
     const Tensor* attention_k                   = nullptr;
     const Tensor* attention_v                   = nullptr;
@@ -152,6 +160,12 @@ struct LayerVisitRequest {
     PagedKVBatchLayerView attention_kv_append;  // A1 batch view (k_pages.data null = unbound)
     PagedKVLayerView attention_kv_cached;       // A3 single-sequence view (k_pages.data null)
     ops::GqaExecutionEnvelope attention_envelope;
+
+    // State-image KV domain (the third form above). All four are null/zero for the explicit
+    // append and cached forms.
+    const std::byte* attention_kv_domain_base   = nullptr;
+    std::uint32_t attention_kv_domain_tokens    = 0;
+    const Tensor* attention_kv_block_table      = nullptr;
 
     // GDN visit slot: stable base of StateLayout::gdn_state_bytes_per_slot() bytes holding
     // [recurrent FP32 | conv BF16] (see gdn_state_views). Required for GDN visits, null for

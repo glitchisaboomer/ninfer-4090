@@ -103,7 +103,8 @@ target_link_libraries(ninfer_sensenova_loop_9b_sequence_plan_test PRIVATE ninfer
 # real-artifact test, not here.
 ninfer_add_host_test(ninfer_sensenova_loop_9b_text_execution_test
   SOURCES targets/sensenova_loop_9b/test_text_execution.cpp
-          ../src/targets/sensenova_loop_9b/impl/runtime/text_execution.cpp)
+          ../src/targets/sensenova_loop_9b/impl/runtime/text_execution.cpp
+          ../src/targets/sensenova_loop_9b/impl/runtime/layer_execution.cpp)
 target_include_directories(ninfer_sensenova_loop_9b_text_execution_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
