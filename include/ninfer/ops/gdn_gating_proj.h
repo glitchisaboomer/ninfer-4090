@@ -84,4 +84,19 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
                           cudaStream_t stream);
 
+/**
+ * SenseNova-Loop-9B exact storage domain. `ab_weight` is one contiguous BF16_CTRL [64,4096]
+ * parent whose rows [0,32) and [32,64) are A and B. The semantic projection and numeric oracle
+ * are identical to the two-weight `gdn_gating_proj` form with `x [4096,T]` and 32 heads.
+ */
+void gdn_gating_proj_sensenova(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
+                               const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g, Tensor& beta,
+                               cudaStream_t stream);
+
+/** SenseNova-Loop-9B exact storage form of gdn_norm_gating_proj with `x/h [4096,T]`. */
+void gdn_norm_gating_proj_sensenova(const Tensor& x, const Tensor& norm_weight, float eps,
+                                    const Weight& ab_weight, const Tensor& A_log,
+                                    const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
+                                    Tensor& beta, cudaStream_t stream);
+
 } // namespace ninfer::ops

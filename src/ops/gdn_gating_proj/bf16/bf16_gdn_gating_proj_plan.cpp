@@ -54,6 +54,12 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{3905, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
+constexpr std::array<RouteSpec, 3> kSenseNovaRoutes{{
+    {{1, 4}, Bf16GdnGatingScheduleId::SimtWarpRowC4},
+    {{5, 8}, Bf16GdnGatingScheduleId::SimtWarpRowC8},
+    {{9, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
                                  std::int32_t last) noexcept {
@@ -67,6 +73,7 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
+static_assert(catalog_is_closed(kSenseNovaRoutes, kAnyCols));
 
 // Resident CTAs per SM for the compiled kernels. This is a property of the build - registers,
 // threads and shared memory of the specialization - and is the single source of truth read by both
@@ -142,6 +149,10 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
 
+bool is_sensenova(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 32 && problem.input_rows == 4096;
+}
+
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
@@ -161,7 +172,7 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
 }
 
 std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
-    return is_35(problem) ? 64 : 128;
+    return is_27(problem) ? 128 : 64;
 }
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
@@ -217,6 +228,19 @@ bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int3
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
                         const Bf16GdnGatingProblem& problem) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
+    if (is_sensenova(problem)) {
+        switch (schedule) {
+        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+            return problem.cols <= 4 * 65'535;
+        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+            return problem.cols <= 8 * 65'535;
+        case Bf16GdnGatingScheduleId::MmaUnsplit:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     if (is_27(problem)) {
         switch (schedule) {
         case Bf16GdnGatingScheduleId::GemvPairedRows:
@@ -289,12 +313,22 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                     scratch.data, scratch.bytes, g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
-        bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               stream);
+        if (is_sensenova(problem)) {
+            bf16_gdn_gating_proj_sensenova_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g,
+                                                           beta, stream);
+        } else {
+            bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                   stream);
+        }
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
-                                               stream);
+        if (is_sensenova(problem)) {
+            bf16_gdn_gating_proj_sensenova_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g,
+                                                           beta, stream);
+        } else {
+            bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                   stream);
+        }
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
         bf16_gdn_gating_proj_35_mma_split32_launch(plan.token_variant, x, a_weight, b_weight, A_log,
@@ -335,7 +369,10 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         }
         return;
     case Bf16GdnGatingScheduleId::MmaUnsplit:
-        if (is_35(problem)) {
+        if (is_sensenova(problem)) {
+            bf16_gdn_gating_proj_sensenova_mma_unsplit_launch(
+                plan.token_variant, x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
+        } else if (is_35(problem)) {
             bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
                                                        A_log, dt_bias, g, beta, stream);
         } else {
@@ -401,7 +438,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_sensenova(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -439,7 +476,9 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         }
         throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
     };
-    return is_27(problem) ? resolve(k27Routes) : resolve(k35Routes);
+    if (is_27(problem)) { return resolve(k27Routes); }
+    if (is_sensenova(problem)) { return resolve(kSenseNovaRoutes); }
+    return resolve(k35Routes);
 }
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
@@ -450,8 +489,9 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
     const Bf16GdnGatingProblem base{heads, input_rows, 1};
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
-    return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
-                       : route_capacity(k35Routes, base, min_cols, max_cols);
+    if (is_27(base)) { return route_capacity(k27Routes, base, min_cols, max_cols); }
+    if (is_sensenova(base)) { return route_capacity(kSenseNovaRoutes, base, min_cols, max_cols); }
+    return route_capacity(k35Routes, base, min_cols, max_cols);
 }
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {

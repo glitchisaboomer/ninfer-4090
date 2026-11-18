@@ -25,6 +25,7 @@ struct Geometry {
 
 constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
+constexpr Geometry kSenseNova{"sensenova_loop_9b", 4096, 32, true};
 
 constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.5e-4,
                                                 /*gross_absolute=*/1.5e-4,
@@ -260,7 +261,11 @@ int run_projection_case(const Geometry& geometry, std::int32_t tokens, std::uint
         geometry.heads, geometry.hidden, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
-    if (geometry.parent_weight) {
+    if (geometry.parent_weight && geometry.hidden == 4096) {
+        Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
+        ops::gdn_gating_proj_sensenova(tensor_x, parent, tensor_a_log, tensor_dt_bias, workspace,
+                                       tensor_g, tensor_beta, nullptr);
+    } else if (geometry.parent_weight) {
         Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
         ops::gdn_gating_proj(tensor_x, parent, tensor_a_log, tensor_dt_bias, workspace, tensor_g,
                              tensor_beta, nullptr);
@@ -355,7 +360,12 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
         geometry.heads, geometry.hidden, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
-    if (geometry.parent_weight) {
+    if (geometry.parent_weight && geometry.hidden == 4096) {
+        Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
+        ops::gdn_norm_gating_proj_sensenova(tensor_x, tensor_norm_weight, kEps, parent,
+                                            tensor_a_log, tensor_dt_bias, workspace, tensor_h,
+                                            tensor_g, tensor_beta, nullptr);
+    } else if (geometry.parent_weight) {
         Weight parent = bf16_weight(device_weight.p, 2 * geometry.heads, geometry.hidden);
         ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, parent, tensor_a_log,
                                   tensor_dt_bias, workspace, tensor_h, tensor_g, tensor_beta,
@@ -438,6 +448,7 @@ int main() {
     failures += verify_workspace_capacity_contract(
         kQwen27, {1, 8, 1280, 1281, 2688, 2689, 5376, 5377});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 960, 1920, 3904, 3905});
+    failures += verify_workspace_capacity_contract(kSenseNova, {1, 4, 5, 8, 9, 4096});
 
     // Every registered 27B projection route, including predicated and full token tiles, and both
     // sides of each residency boundary on the declared target (1280/1281, 2688/2689, 5376/5377).
@@ -451,6 +462,14 @@ int main() {
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
         failures +=
             run_projection_case(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
+    }
+
+    // SenseNova qualifies both SIMT token tiles and the long-context C8 route.
+    for (const std::int32_t tokens : {1, 2, 4, 5, 8, 9, 17, 64, 1024, 4096}) {
+        failures += run_projection_case(kSenseNova, tokens, 0x5000u + tokens);
+    }
+    for (const std::int32_t tokens : {1, 4, 5, 8, 64}) {
+        failures += run_norm_projection_case(kSenseNova, tokens, 0x6000u + tokens);
     }
 
     // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.

@@ -519,16 +519,18 @@ Remaining hard blocker before text execution can be correct:
 
 ### Stage E active work item: SenseNova GDN gating op
 
-- [ ] Implement `gdn_gating_proj` and `gdn_norm_gating_proj` for exactly
-      `heads=32`, `hidden=4096`, parent `ab_weight [64,4096]`; a weight is 32 rows, not 48.
-- [ ] Use the Qwen 35B path as the structural reference: BF16 parent halves, FP32 `A_log` and
+- [x] Implement `gdn_gating_proj_sensenova` and `gdn_norm_gating_proj_sensenova` for exactly
+      `heads=32`, `hidden=4096`, parent `ab_weight [64,4096]`.
+- [x] Use the Qwen 35B path as the structural reference: BF16 parent halves, FP32 `A_log` and
       `dt_bias`, FP32 `[32,T]` `g`/`beta`, and the same logical formula and FP64 oracle.
-- [ ] Use the SenseNova llama.cpp fork only as execution-order evidence; the C++ numerical
+- [x] Use the SenseNova llama.cpp fork only as execution-order evidence; the C++ numerical
       contract remains Hugging Face `Qwen3_5GatedDeltaNet` because the official checkpoint's
       `modeling_sensenova_loop.py` subclasses it.
-- [ ] Add first-class SenseNova geometry admission, planner, wrappers, and independent
-      CTest coverage at T=1, small-T, fused-boundary, prefill chunk, and long-token extents.
-- [ ] Do not widen existing Qwen 27B/35B profiles implicitly and do not bypass the oracle.
+- [x] Add first-class SenseNova geometry admission and planner: C4/C8 SIMT for T=1..8 and the
+      dedicated unsplit BN64 MMA geometry for T>=9. Existing Qwen route tables are untouched.
+- [x] Add wrappers for the contiguous `[64,4096]` parent and CTest coverage at T=1,2,4,5,8,9,
+      17,64,1024,4096 plus norm/control cases.
+- [x] Verified with `ninfer_gdn_gating_proj_test` and `ninfer_gdn_gating_test`: 2/2 passed.
 - [ ] After this op passes, continue Stage E with device-backed state images, snapshot/restore,
       graph stability, the 56-visit forward pass, and reference validation.
 - [ ] The stage-B/C/D Program remains lifecycle scaffolding only until the execution path is

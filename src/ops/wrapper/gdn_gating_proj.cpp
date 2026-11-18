@@ -155,4 +155,51 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                                           dt_bias, ws, g, beta, stream);
 }
 
+
+/**
+ * SenseNova-Loop-9B exact storage domain. `ab_weight` is one contiguous BF16_CTRL [64,4096]
+ * parent whose rows [0,32) and [32,64) are A and B. The semantic projection and numeric oracle
+ * are identical to the two-weight `gdn_gating_proj` form with `x [4096,T]` and 32 heads.
+ */
+void gdn_gating_proj_sensenova(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
+                               const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g, Tensor& beta,
+                               cudaStream_t stream) {
+    constexpr const char* op  = "gdn_gating_proj_sensenova";
+    const std::int32_t tokens = x.ne[1];
+    require_sequence_tensor(x, DType::BF16, 4096, tokens, op, "x");
+    require_vector_tensor(A_log, DType::FP32, 32, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, 32, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, 32, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, 32, tokens, op, "beta");
+    require_bf16_weight(ab_weight, 64, 4096, "ab_weight");
+
+    const Weight a_weight = bf16_row_view(ab_weight, 0, 32);
+    const Weight b_weight = bf16_row_view(ab_weight, 32, 32);
+    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+}
+
+void gdn_norm_gating_proj_sensenova(const Tensor& x, const Tensor& norm_weight, float eps,
+                                    const Weight& ab_weight, const Tensor& A_log,
+                                    const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
+                                    Tensor& beta, cudaStream_t stream) {
+    constexpr const char* op  = "gdn_norm_gating_proj_sensenova";
+    const std::int32_t tokens = x.ne[1];
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument(std::string(op) + ": eps must be positive and finite");
+    }
+    require_sequence_tensor(x, DType::BF16, 4096, tokens, op, "x");
+    require_vector_tensor(norm_weight, DType::BF16, 4096, op, "norm_weight");
+    require_sequence_tensor(h, DType::BF16, 4096, tokens, op, "h");
+    require_vector_tensor(A_log, DType::FP32, 32, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, 32, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, 32, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, 32, tokens, op, "beta");
+    require_bf16_weight(ab_weight, 64, 4096, "ab_weight");
+
+    const Weight a_weight = bf16_row_view(ab_weight, 0, 32);
+    const Weight b_weight = bf16_row_view(ab_weight, 32, 32);
+    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+                                          dt_bias, ws, g, beta, stream);
+}
+
 } // namespace ninfer::ops
