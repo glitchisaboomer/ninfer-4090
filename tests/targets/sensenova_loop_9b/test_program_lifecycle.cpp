@@ -101,6 +101,26 @@ void test_prepared_prompt_position_axes() {
     expect(rejected, "invalid prepared-prompt position axis is rejected");
 }
 
+void test_service_work_projection() {
+    auto program = sn::Program::create(1, 32, 4096, 1U << 20U);
+
+    qwen3_6::PreparedPromptData data;
+    data.token_ids = {785, 3895, 286, 2673, 315, 3387, 349};
+    qwen3_6::FrontendTestAccess::assign_text_positions(data);
+    const qwen3_6::PreparedPrompt prompt = qwen3_6::FrontendTestAccess::adopt(std::move(data));
+
+    ninfer::runtime::ResolvedExecutionOptions options;
+    options.requested_output_tokens = 4;
+    const auto base = program->plan_request_base(prompt, options);
+    const auto& summary = base.summary();
+    expect(summary.service_work_quanta == 4,
+           "one prefill plus three decodes are projected for four output tokens");
+    expect(summary.effective_output_tokens == 4,
+           "the projected output limit is four tokens");
+    expect(summary.effective_limit_reason == ninfer::FinishReason::OutputLimit,
+           "the output limit reason is set");
+}
+
 void test_prefill_requires_model() {
     auto program = sn::Program::create(1, 32, 4096, 1U << 20U);
 

@@ -538,7 +538,12 @@ RequestBasePlan Program::plan_request_base(const qwen3_6::PreparedPrompt& prompt
                                      ? 1
                                      : (summary.prompt_tokens + impl_->memory.max_context - 1) /
                                            std::max(1U, impl_->memory.max_context);
-    impl->summary.service_work_quanta = chunks + 1;
+    // Prefill licenses the first output token. Every remaining output token needs one decode
+    // quantum, so a 4-token request is one prefill plus three decodes.
+    const std::uint64_t decode_units = impl->summary.effective_output_tokens == 0
+                                           ? 0ULL
+                                           : impl->summary.effective_output_tokens - 1ULL;
+    impl->summary.service_work_quanta = static_cast<std::uint64_t>(chunks) + decode_units;
     return RequestBasePlan(std::move(impl));
 }
 
