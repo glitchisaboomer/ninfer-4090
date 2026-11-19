@@ -620,8 +620,13 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     }
     added_tokens_ = load_added_tokens(root, tokenizer_label, id_to_token_,
                                       vocab_metadata.occupied_ids, vocab_token_to_id_);
-    merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, id_to_token_,
-                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
+    // SenseNova ships the canonical added tokens only in tokenizer.json. A missing decoder is an
+    // omission, not a weakened check: when present, the decoder still has to agree exactly with
+    // tokenizer.json and pass every collision/flag validation.
+    if (tokenizer_config.contains("added_tokens_decoder")) {
+        merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, id_to_token_,
+                                   vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
+    }
     if (valid_token_ids_.size() < id_to_token_.size()) {
         valid_token_ids_.resize(id_to_token_.size());
     }

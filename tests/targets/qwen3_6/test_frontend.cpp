@@ -246,6 +246,35 @@ bool throws_invalid_argument(Callable&& callable) {
 }
 
 int test_official_tokenizer_merge() {
+    // A compatible artifact may carry all added tokens in tokenizer.json and omit the duplicate
+    // decoder object from tokenizer_config.json. Keep tokenizer.json's checks authoritative.
+    {
+        FrontendResources missing_decoder = resources();
+        nlohmann::json config = nlohmann::json::parse(missing_decoder.tokenizer_config_json);
+        config.erase("added_tokens_decoder");
+        missing_decoder.tokenizer_config_json = config.dump();
+        fi::Tokenizer tokenizer({.tokenizer_json         = missing_decoder.tokenizer_json,
+                                 .tokenizer_config_json  = missing_decoder.tokenizer_config_json,
+                                 .generation_config_json = missing_decoder.generation_config_json});
+        if (tokenizer.encode("<|im_start|>") != std::vector<int>{248045}) {
+            std::cerr << "FAIL: missing decoder form lost tokenizer.json added tokens\n";
+            return 1;
+        }
+
+        nlohmann::json conflicting = nlohmann::json::parse(missing_decoder.tokenizer_config_json);
+        conflicting["added_tokens_decoder"]["248045"]["special"] = false;
+        missing_decoder.tokenizer_config_json = conflicting.dump();
+        if (!throws_invalid_argument([&] {
+                (void)fi::Tokenizer({
+                    .tokenizer_json         = missing_decoder.tokenizer_json,
+                    .tokenizer_config_json  = missing_decoder.tokenizer_config_json,
+                    .generation_config_json = missing_decoder.generation_config_json});
+            })) {
+            std::cerr << "FAIL: malformed decoder form was accepted\n";
+            return 1;
+        }
+    }
+
     const char* configured_root = std::getenv("NINFER_QWEN3_6_27B_HF_DIR");
     if (configured_root == nullptr || *configured_root == '\0') {
         std::cout << "skip: NINFER_QWEN3_6_27B_HF_DIR is not set\n";
@@ -630,6 +659,13 @@ int test_official_resource_guards() {
     failures +=
         check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(mismatched); }),
               "different standalone and tokenizer-config chat templates were accepted");
+
+    FrontendResources omitted = resources();
+    nlohmann::json omitted_config = nlohmann::json::parse(omitted.tokenizer_config_json);
+    omitted_config.erase("add_bos_token");
+    omitted_config.erase("chat_template");
+    omitted.tokenizer_config_json = omitted_config.dump();
+    (void)FrontendFactory::create_component(omitted);
 
     FrontendResources unknown = resources("{{ messages }}");
     failures +=

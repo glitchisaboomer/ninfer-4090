@@ -31,7 +31,8 @@ void expect(bool condition, std::string_view message) {
 void test_lifecycle() {
     auto program = sn::Program::create(2, 32, 4096, 1U << 30U);
     const auto capacity = program->admission_capacity();
-    expect(capacity.active_lanes == 2 && capacity.main_kv_pages == 32, "admission capacity");
+    expect(capacity.active_lanes == 2 && capacity.main_kv_pages == 64,
+           "admission capacity uses engine-wide 64-token pages");
     expect(program->config_signature_slug().find("sensenova_loop_9b") != std::string::npos,
            "config signature");
 

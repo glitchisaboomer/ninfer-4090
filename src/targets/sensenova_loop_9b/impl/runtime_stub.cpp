@@ -68,7 +68,8 @@ struct RequestPlan::Impl {
 
 RequestPlan RequestPlanForTest::make() {
     auto impl = std::make_unique<RequestPlan::Impl>();
-    impl->summary.admission = {1, 1, 0};
+    // Admission resource counts are engine-wide 64-token pages.
+    impl->summary.admission = {1, sense_nova_page_groups_to_engine_pages(1), 0};
     impl->summary.service_work_quanta = 1;
     return RequestPlan(std::move(impl));
 }
@@ -297,8 +298,9 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
     impl->model  = model;
     impl->stream = stream;
     impl->use_cuda_graph = use_cuda_graph;
-    impl->admission.active_lanes         = active_lanes;
-    impl->admission.main_kv_pages        = kv_pages;
+    impl->admission.active_lanes = active_lanes;
+    // `kv_pages` is a 128-token planner group; admission accounts engine-wide 64-token pages.
+    impl->admission.main_kv_pages = sense_nova_page_groups_to_engine_pages(kv_pages);
     impl->memory.max_context             = context;
     impl->memory.kv_capacity             = kv_pages * kSenseNovaPageTokens;
     impl->memory.kv_capacity_page_groups = kv_pages;
@@ -327,7 +329,7 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
         // Identity logical-to-physical page map for every KV domain, followed by the B=1 row
         // selector. Both are constant for the Program lifetime: every domain is one contiguous
         // sequence, so the same table describes all fifteen.
-        const std::size_t pages = impl->kv_capacity / StateImageLayout::kKvPageTokens;
+        const std::size_t pages = StateImageLayout::kv_pages(impl->kv_capacity);
         impl->kv_aux = DeviceBuffer((pages + 1) * sizeof(std::int32_t));
         std::vector<std::int32_t> kv_host(pages + 1);
         for (std::size_t page = 0; page < pages; ++page) {
@@ -628,7 +630,9 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
     state.lifecycle        = Lifecycle::Pending;
     state.prompt_tokens    = tokens;
     state.prompt_token_ids.assign(data.token_ids.begin(), data.token_ids.end());
-    state.page_entitlement = (tokens + kSenseNovaPageTokens - 1) / kSenseNovaPageTokens;
+    state.page_entitlement =
+        sense_nova_page_groups_to_engine_pages((tokens + kSenseNovaPageTokens - 1) /
+                                                kSenseNovaPageTokens);
     state.frontier         = tokens;
 
     Impl::LaneExecution& execution = impl_->execution[lane];
@@ -730,8 +734,8 @@ Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity ident
     state.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size());
     state.prompt_token_ids = std::move(data.token_ids);
     state.frontier = state.prompt_tokens;
-    state.page_entitlement =
-        (state.frontier + kSenseNovaPageTokens - 1) / kSenseNovaPageTokens;
+    state.page_entitlement = sense_nova_page_groups_to_engine_pages(
+        (state.frontier + kSenseNovaPageTokens - 1) / kSenseNovaPageTokens);
     Impl::LaneExecution& execution = impl_->execution[lane];
     execution = Impl::LaneExecution{};
     execution.last_token = host_token;

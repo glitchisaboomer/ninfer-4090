@@ -2,6 +2,8 @@
 
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
 
+#include "core/paged_kv_delta_layout.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -53,9 +55,12 @@ public:
 
     // Internal layout of one KV domain. Each domain holds two page-major planes -- all K pages,
     // then all V pages -- in the exact tensor shape the paged GQA views consume:
-    // [head_dim, kKvPageTokens, kv_heads, pages]. Both halves of StateLayout's per-token KV bytes
-    // (K and V, 4 heads x 256) fit exactly, so a domain is attended with no copy or repacking.
-    static constexpr std::size_t kKvPageTokens = 128;
+    // [head_dim, kKvPageTokens, kv_heads, pages]. kKvPageTokens must match the engine-wide GQA
+    // page size: the kernels derive logical pages and page offsets from absolute positions with a
+    // compile-time 64-token shift. Both halves of StateLayout's per-token KV bytes (K and V,
+    // 4 heads x 256) fit exactly, so a domain is attended with no copy or repacking. Changing the
+    // page size changes only the number of pages, never the total KV state bytes.
+    static constexpr std::size_t kKvPageTokens = static_cast<std::size_t>(kPagedKVPageSize);
 
     [[nodiscard]] static constexpr std::size_t kv_pages(std::size_t tokens) noexcept {
         return tokens / kKvPageTokens;

@@ -186,8 +186,10 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
-    if (tokenizer_config.value("add_bos_token", true) ||
-        tokenizer_config.value("add_prefix_space", true)) {
+    // SenseNova's tokenizer_config omits add_bos_token; the registered no-BOS semantics are the
+    // default. A present add_prefix_space is still required to be false.
+    if (tokenizer_config.value("add_bos_token", false) ||
+        tokenizer_config.value("add_prefix_space", false)) {
         throw std::invalid_argument(
             "tokenizer_config.json does not match Qwen3.6 tokenizer prefix semantics");
     }
@@ -196,15 +198,18 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
     }
-    if (!tokenizer_config.contains("chat_template") ||
-        !tokenizer_config.at("chat_template").is_string()) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template must contain the loaded chat template");
-    }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
+    // Some compatible artifacts ship the chat template only as the separate hashed resource.
+    // When tokenizer_config.json does include it, the two must agree exactly.
+    if (tokenizer_config.contains("chat_template")) {
+        if (!tokenizer_config.at("chat_template").is_string()) {
+            throw std::invalid_argument(
+                "tokenizer_config.json.chat_template must contain the loaded chat template");
+        }
+        if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
+            resources.chat_template_jinja) {
+            throw std::invalid_argument(
+                "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
+        }
     }
 }
 
@@ -937,6 +942,10 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
 
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
+}
+
+PreparedPrompt FrontendTestAccess::adopt(PreparedPromptData&& prompt) {
+    return PreparedPrompt(std::make_unique<PreparedPromptData>(std::move(prompt)));
 }
 
 void FrontendTestAccess::assign_text_positions(PreparedPromptData& prompt) {

@@ -12,6 +12,7 @@ public:
                                                    bool vision_enabled            = true,
                                                    std::uint32_t vision_max_tokens = 8192);
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
+    [[nodiscard]] static PreparedPrompt adopt(PreparedPromptData&& prompt);
     static void assign_text_positions(PreparedPromptData& prompt);
 };
 

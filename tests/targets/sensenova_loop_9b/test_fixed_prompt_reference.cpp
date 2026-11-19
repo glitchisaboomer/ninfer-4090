@@ -1,30 +1,79 @@
-// Stage G: fixed-prompt execution gate.
+// Stage G: real fixed-prompt execution gate for SenseNova-Loop-9B.
 //
-// The prompt-position defect is fixed: SenseNova prefill now validates the frontend's three
-// axis-major mRoPE position axes and uploads text/temporal axis 0 as the device [T] positions.
-//
-// The remaining blocker is the GQA page geometry. SenseNova state images use BF16 cache planes
-// [head_dim=256, page_tokens=128, kv_heads=4, pages], but the GQA kernels derive logical pages
-// and page offsets from absolute positions with a compile-time 64-token shift/mask
-// (kPagedKVPageShift=6 and kPagedKVPageMask=63 in paged_kv_address.cuh). Relaxing wrapper
-// validation alone would silently corrupt cache addressing. Correct support requires threading a
-// runtime page shift/mask, or a separate 128-token geometry, through the BF16/INT8 prefill and
-// decode kernels, metadata structs, wrappers, delta-RoPE paths, and oracle tests; that broad
-// redesign is outside this authorized fix.
-//
-// No fake tokens, hidden state, or logits are substituted. The artifact-level quantized-weight
-// reference, the position-axis regression, and the existing host/state-contract CTests remain
-// active and are reported separately.
+// This test loads the licensed `.ninfer` artifact through the public Engine and generates from a
+// fixed token prompt. The external Hugging Face oracle lives in `hf_reference.py` and is run
+// separately against the same prompt. Returning 77 only means the licensed artifact is not
+// installed; CTest records that as a skip rather than a pass.
 
+#include "ninfer/engine.h"
+
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <vector>
+
+namespace {
+
+constexpr ninfer::TokenId kFixedPrompt[] = {785, 3895, 286, 2673, 315, 3387, 349};
+
+} // namespace
 
 int main() {
-    std::cout
-        << "SKIP: Stage G fixed-prompt execution remains blocked by the SenseNova 128-token-page "
-           "BF16 GQA cache geometry. The GQA kernels compile in a 64-token page shift and mask, "
-           "so accepting 128-token planes requires a cross-kernel prefill/decode and oracle-test "
-           "redesign rather than a wrapper validation change. Prompt positions are fixed and "
-           "covered separately; artifact-level quantized-weight validation and host/state-contract "
-           "validation remain active.\n";
-    return 77;
+    const char* env = std::getenv("NINFER_SENSENOVA_LOOP_9B_WEIGHTS");
+    const std::filesystem::path artifact =
+        env != nullptr && *env != '\0'
+            ? std::filesystem::path(env)
+            : std::filesystem::path("/home/user/models/sensenova/SenseNova-Loop-9B.ninfer");
+    if (!std::filesystem::is_regular_file(artifact)) {
+        std::cout << "skip: SenseNova artifact is not available at " << artifact << '\n';
+        return 77;
+    }
+
+    ninfer::EngineOptions options;
+    options.artifact_path       = artifact;
+    options.max_context         = 1024;
+    options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.max_concurrency     = 1;
+    options.prefill_chunk       = 1024;
+    options.kv_cache            = ninfer::KvCacheStorage::BFloat16;
+    options.enable_vision       = false;
+    options.use_cuda_graph      = false;
+    options.enable_prompt_cache = false;
+
+    try {
+        ninfer::Engine engine(options);
+        const auto mem = engine.memory_summary();
+        std::cerr << "MEM weights=" << mem.weights.capacity_bytes
+                  << " seq=" << mem.sequence.capacity_bytes
+                  << " workspace=" << mem.workspace.capacity_bytes
+                  << " transient=" << mem.request_transient.capacity_bytes
+                  << " kv=" << mem.kv_payload_bytes
+                  << " runtime=" << mem.runtime_reservation_bytes << '\n';
+        auto prompt = engine.prepare_tokens(
+            std::vector<ninfer::TokenId>(std::begin(kFixedPrompt), std::end(kFixedPrompt)));
+
+        ninfer::RequestOptions request;
+        request.execution.requested_output_tokens = 1;
+        request.execution.sampling.temperature    = 0.0F;
+        request.execution.sampling.top_k          = 1;
+        request.execution.sampling.top_p          = 1.0F;
+        request.execution.allow_prefix_reuse      = false;
+        request.stop.include_model_defaults       = false;
+
+        const ninfer::GenerationResult result = engine.generate(std::move(prompt), request);
+        if (result.generated_token_ids.size() != 1) {
+            std::cerr << "FAIL: fixed prompt produced " << result.generated_token_ids.size()
+                      << " tokens, expected one\n";
+            return 1;
+        }
+
+        std::cout << "HF_FIXED_PROMPT_IDS:";
+        for (const ninfer::TokenId token : kFixedPrompt) { std::cout << ' ' << token; }
+        std::cout << "\nENGINE_FIRST_TOKEN: " << result.generated_token_ids[0] << '\n';
+        std::cout << "OK SenseNova fixed-prompt execution\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: SenseNova fixed-prompt execution threw: " << error.what() << '\n';
+        return 1;
+    }
 }

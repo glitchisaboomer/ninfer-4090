@@ -2,6 +2,7 @@
 
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
 
+#include "core/paged_kv_delta_layout.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/sensenova_loop_9b/package.h>
 
@@ -10,6 +11,8 @@
 
 namespace ninfer::targets::sensenova_loop_9b::detail {
 
+// The planner's reservation group is 128 tokens. The state image itself is tiled with the
+// engine-wide 64-token GQA page, so each group is two paged-KV pages.
 inline constexpr std::uint32_t kSenseNovaPageTokens = 128;
 
 struct SequencePlanningInputs {
@@ -37,6 +40,17 @@ struct SequenceLayout {
     std::size_t request_transient_bytes = 0;
     std::size_t device_reservation_bytes = 0;
 };
+
+[[nodiscard]] constexpr std::uint32_t sense_nova_page_groups_to_engine_pages(
+    std::uint32_t page_groups) noexcept {
+    return page_groups * (kSenseNovaPageTokens /
+                          static_cast<std::uint32_t>(ninfer::kPagedKVPageSize));
+}
+
+[[nodiscard]] constexpr std::uint32_t engine_pages_to_sense_nova_page_groups(
+    std::uint32_t engine_pages) noexcept {
+    return engine_pages / sense_nova_page_groups_to_engine_pages(1);
+}
 
 [[nodiscard]] void validate_sequence_inputs(const SequencePlanningInputs& inputs);
 [[nodiscard]] runtime::SequenceCapacityCurve

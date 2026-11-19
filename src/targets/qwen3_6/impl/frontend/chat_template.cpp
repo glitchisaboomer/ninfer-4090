@@ -25,6 +25,14 @@ constexpr Sha256Digest kReasoningEffortTemplateDigest{
     0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
 };
 
+// SenseNova-Loop-9B ships the Qwen3.5 thinking-toggle template with the same turn/reasoning
+// semantics as kThinkingToggleTemplateDigest, but with the upstream tool-call and system-message
+// spelling. It is allowlisted by exact SHA only; unrelated chat templates still fail closed.
+constexpr Sha256Digest kSenseNovaLoopTemplateDigest{
+    0xa4, 0xae, 0xe8, 0xaf, 0xcf, 0x2e, 0x07, 0x11, 0x94, 0x2c, 0xf8, 0x48, 0x89, 0x9b, 0xe6, 0x60,
+    0x16, 0xf8, 0xd1, 0x4a, 0x88, 0x9f, 0xf9, 0xed, 0xe0, 0x7b, 0xca, 0x09, 0x9c, 0x28, 0xf7, 0x15,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -285,6 +293,9 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     }
     if (digest == kReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
+    }
+    if (digest == kSenseNovaLoopTemplateDigest) {
+        return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
     throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +
                                 sha256_hex(digest) + ")");

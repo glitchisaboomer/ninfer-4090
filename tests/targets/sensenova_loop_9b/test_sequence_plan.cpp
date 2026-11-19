@@ -1,5 +1,8 @@
 #include "targets/sensenova_loop_9b/impl/runtime/layouts.h"
+#include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
+
+#include "core/paged_kv_delta_layout.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +57,16 @@ void test_curve() {
     expect(curve.bytes_per_additional_main_page_group ==
                sn::StateLayout::total_kv_bytes_per_token(false, false, true) * 128,
            "per-page-group stride uses 14 full KV visits plus MTP");
+
+    // The 128-token planner group and the 64-token GQA page carry the same bytes; only the page
+    // count differs. Admission reports engine-wide 64-token pages.
+    static_assert(sn::sense_nova_page_groups_to_engine_pages(1) == 2);
+    static_assert(sn::engine_pages_to_sense_nova_page_groups(2) == 1);
+    static_assert(sn::kSenseNovaPageTokens / sn::StateImageLayout::kKvPageTokens ==
+                  static_cast<std::size_t>(ninfer::kPagedKVPageSize) / 32U);
+    expect(sn::StateImageLayout::kv_pages(4096) ==
+               sn::sense_nova_page_groups_to_engine_pages(32),
+           "32 planner groups are 64 state-image pages");
 }
 
 void test_layout() {

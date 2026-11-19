@@ -36,6 +36,23 @@ void test_domains() {
            "MTP KV domain is last");
 }
 
+void test_page_geometry() {
+    static_assert(sn::StateImageLayout::kKvPageTokens ==
+                  static_cast<std::size_t>(ninfer::kPagedKVPageSize));
+    constexpr std::size_t tokens = 4096;
+    constexpr std::size_t page_tokens = sn::StateImageLayout::kKvPageTokens;
+    constexpr std::size_t pages = tokens / page_tokens;
+    constexpr std::size_t plane_bytes = sn::StateImageLayout::kv_plane_bytes(tokens);
+    expect(pages == 64, "4096 tokens use twice as many 64-token pages as 128-token groups");
+    expect(plane_bytes == pages * page_tokens * sn::StateLayout::kv_heads *
+                              sn::StateLayout::head_dim * sizeof(std::uint16_t),
+           "each plane is [head_dim, page_tokens, kv_heads, pages]");
+    expect(2 * plane_bytes ==
+               sn::StateImageLayout::kv_bytes_per_domain(tokens, false, false),
+           "K and V planes tile one domain exactly");
+    expect(plane_bytes % page_tokens == 0, "page plane has a whole number of token slots");
+}
+
 void test_stable_visit_mapping() {
     std::set<std::size_t> kv;
     std::set<std::size_t> gdn;
@@ -94,6 +111,7 @@ void test_offsets() {
 
 int main() {
     test_domains();
+    test_page_geometry();
     test_stable_visit_mapping();
     test_offsets();
     if (failures != 0) {

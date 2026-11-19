@@ -409,7 +409,7 @@ void test_head_workspace_contract() {
 // test runs where no GPU or toolchain exists.
 // -----------------------------------------------------------------------------
 
-constexpr std::uint32_t kVisitKvCapacity = 256; // two state-image KV pages
+constexpr std::uint32_t kVisitKvCapacity = 128; // two 64-token state-image KV pages
 
 // Widths and buffer addresses are copied out of the request at call time: the
 // stream buffers forward_visits allocates live on its own stack, so retaining
@@ -482,7 +482,8 @@ struct VisitFixture {
 
     std::array<std::int32_t, 2> block_table{0, 1};
     std::array<std::int32_t, 1> table_rows{0};
-    ninfer::Tensor block_table_t{block_table.data(), ninfer::DType::I32, {2}};
+    ninfer::Tensor block_table_t{block_table.data(), ninfer::DType::I32,
+                                 {static_cast<std::int32_t>(block_table.size())}};
     ninfer::Tensor table_rows_t{table_rows.data(), ninfer::DType::I32, {1}};
 
     // Shared stub payloads: the recorder only inspects the bindings, and every
