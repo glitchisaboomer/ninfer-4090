@@ -18,12 +18,22 @@ constexpr ninfer::TokenId kFixedPrompt[] = {785, 3895, 286, 2673, 315, 3387, 349
 
 } // namespace
 
+namespace {
+
+void trace(const char* message) {
+    std::cerr << "FIXED_PROMPT_TRACE: " << message << std::endl;
+}
+
+} // namespace
+
 int main() {
+    trace("start");
     const char* env = std::getenv("NINFER_SENSENOVA_LOOP_9B_WEIGHTS");
     const std::filesystem::path artifact =
         env != nullptr && *env != '\0'
             ? std::filesystem::path(env)
             : std::filesystem::path("/home/user/models/sensenova/SenseNova-Loop-9B.ninfer");
+    trace(("artifact=" + artifact.string()).c_str());
     if (!std::filesystem::is_regular_file(artifact)) {
         std::cout << "skip: SenseNova artifact is not available at " << artifact << '\n';
         return 77;
@@ -39,9 +49,19 @@ int main() {
     options.enable_vision       = false;
     options.use_cuda_graph      = false;
     options.enable_prompt_cache = false;
+    options.wddm_evictable_budget = false;
+    options.load_progress.callback = [](std::string_view phase, std::uint64_t done,
+                                        std::uint64_t total) {
+        if (total == 0 || done == 0 || done == total || done % (64ULL << 20ULL) < (1ULL << 20ULL)) {
+            std::cerr << "FIXED_PROMPT_TRACE: load " << phase << ' ' << done << '/' << total
+                      << std::endl;
+        }
+    };
 
     try {
+        trace("constructing engine");
         ninfer::Engine engine(options);
+        trace("engine constructed");
         const auto mem = engine.memory_summary();
         std::cerr << "MEM weights=" << mem.weights.capacity_bytes
                   << " seq=" << mem.sequence.capacity_bytes
@@ -49,8 +69,10 @@ int main() {
                   << " transient=" << mem.request_transient.capacity_bytes
                   << " kv=" << mem.kv_payload_bytes
                   << " runtime=" << mem.runtime_reservation_bytes << '\n';
+        trace("preparing prompt");
         auto prompt = engine.prepare_tokens(
             std::vector<ninfer::TokenId>(std::begin(kFixedPrompt), std::end(kFixedPrompt)));
+        trace("prompt prepared");
 
         ninfer::RequestOptions request;
         request.execution.requested_output_tokens = 1;
@@ -60,7 +82,9 @@ int main() {
         request.execution.allow_prefix_reuse      = false;
         request.stop.include_model_defaults       = false;
 
+        trace("generating");
         const ninfer::GenerationResult result = engine.generate(std::move(prompt), request);
+        trace("generated");
         if (result.generated_token_ids.size() != 1) {
             std::cerr << "FAIL: fixed prompt produced " << result.generated_token_ids.size()
                       << " tokens, expected one\n";
