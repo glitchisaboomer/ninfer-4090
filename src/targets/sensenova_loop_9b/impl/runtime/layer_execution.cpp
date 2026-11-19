@@ -26,7 +26,9 @@ namespace {
 
 constexpr const char* kOp = "sensenova_layer_visit:";
 constexpr float kGdnRecurrentScale = 0.08838834764831845F; // 1/sqrt(128)
-constexpr float kAttentionScale    = 1.0F / std::sqrt(static_cast<float>(TextConfig::head_dim));
+// TextConfig::head_dim is 256, so the attention scale is exactly 1/16. MSVC does not treat
+// std::sqrt as a constant expression, so keep this as a literal constant.
+constexpr float kAttentionScale    = 0.0625F;
 // The stored W8 parent is [q 4096 | k 1024 | gate 4096 | v 1024] = [10240,4096] rows.
 constexpr std::int32_t kQueryKeyGateValueRows = 2 * (TextConfig::query_size + TextConfig::kv_size);
 constexpr std::int32_t kGdnInputProjectionRows = 2 * TextConfig::key_dim + 2 * TextConfig::value_dim;

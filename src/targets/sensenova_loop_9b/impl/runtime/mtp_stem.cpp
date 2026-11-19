@@ -23,6 +23,9 @@ namespace {
 constexpr std::size_t kAlign = 256;
 constexpr std::int32_t kQueryKeyGateValueRows =
     2 * (TextConfig::query_size + TextConfig::kv_size);
+// TextConfig::head_dim is 256, so the attention scale is exactly 1/16. MSVC does not treat
+// std::sqrt as a constant expression, so keep this as a literal constant.
+constexpr float kAttentionScale = 0.0625F;
 
 std::size_t align_up(std::size_t bytes) noexcept {
     return ((bytes + kAlign - 1) / kAlign) * kAlign;
