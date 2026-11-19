@@ -4,6 +4,7 @@
 
 #include "core/disk_state_cache.h"
 #include "ninfer/types.h"
+#include "runtime/engine/generation_trace.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
@@ -162,12 +163,15 @@ public:
 
         std::shared_ptr<Request> request;
         try {
+            { GenerationTraceLine trace_line; trace_line << "before make_output_session"; }
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output,
                                                                          options.structured_output);
+            { GenerationTraceLine trace_line; trace_line << "after make_output_session"; }
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted, std::move(host_input));
+            { GenerationTraceLine trace_line; trace_line << "request constructed"; }
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -808,8 +812,10 @@ private:
             return;
         }
         request->lane_plans[lane].reset();
+        { GenerationTraceLine trace_line; trace_line << "before plan_request_for_lane lane=" << lane; }
         request->lane_plans[lane].emplace(
             instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
+        { GenerationTraceLine trace_line; trace_line << "after plan_request_for_lane lane=" << lane; }
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
@@ -872,6 +878,10 @@ private:
                                                           LaneChoice choice,
                                                           BackfillClass backfill_class,
                                                           std::uint64_t backfill_epoch) {
+        { GenerationTraceLine trace_line;
+          trace_line << "admit_enter lane=" << choice.lane
+                     << " evict=" << static_cast<int>(choice.evict_retained)
+                     << " backfill=" << static_cast<int>(backfill_class); }
         if (Clock::now() >= request->deadline) {
             return remove_pending_error(
                 request, std::make_exception_ptr(RequestError(
@@ -924,6 +934,7 @@ private:
 
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
+        { GenerationTraceLine trace_line; trace_line << "selected plan moved lane=" << lane; }
         if (!erase_pending(request)) { return AdmissionProgress::None; }
         release_planning_state(request);
 
@@ -960,15 +971,22 @@ private:
 
             TransientRegion transient;
             if (needs_prefill) {
+                { GenerationTraceLine trace_line;
+                  trace_line << "before transient activate bytes="
+                             << summary.transient_bytes << " align=" << summary.transient_alignment; }
                 instance_.request_memory.activate(summary.transient_bytes,
                                                   summary.transient_alignment);
                 prefill_lane_ = lane;
                 transient     = instance_.request_memory.region();
+                { GenerationTraceLine trace_line; trace_line << "after transient activate"; }
             }
             publish_runtime_stats();
             target_started                = true;
+            { GenerationTraceLine trace_line; trace_line << "before start_prefill_lane lane=" << lane; }
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
+            { GenerationTraceLine trace_line;
+              trace_line << "after start_prefill_lane complete=" << first.complete; }
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
@@ -1020,7 +1038,9 @@ private:
             }
 
             try {
+                { GenerationTraceLine trace_line; trace_line << "before ensure_base_plan"; }
                 ensure_base_plan(head);
+                { GenerationTraceLine trace_line; trace_line << "after ensure_base_plan"; }
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -1038,7 +1058,11 @@ private:
 
             std::optional<LaneChoice> head_lane;
             try {
+                { GenerationTraceLine trace_line; trace_line << "before find_admission_lane"; }
                 head_lane = find_admission_lane(head);
+                { GenerationTraceLine trace_line;
+                  trace_line << "after find_admission_lane found="
+                             << static_cast<int>(head_lane.has_value()); }
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -1135,8 +1159,12 @@ private:
 
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
+        { GenerationTraceLine trace_line; trace_line << "before decode_batch lanes=" << lanes.size(); }
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
+        { GenerationTraceLine trace_line;
+          trace_line << "after decode_batch tokens=" << round.tokens.size()
+                     << " rows=" << round.row_counts.size(); }
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {

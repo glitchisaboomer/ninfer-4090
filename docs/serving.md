@@ -487,6 +487,11 @@ that server instance.
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
 
+The Engine's generation-path `GENERATION_TRACE:` diagnostics are off by default so normal builds and
+requests stay quiet. Set `NINFER_GENERATION_TRACE=1` before starting the server to print them to
+stderr; unset, empty, or `0` leaves them off. The switch is read once per process and applies to
+CLI and server generation requests alike.
+
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be

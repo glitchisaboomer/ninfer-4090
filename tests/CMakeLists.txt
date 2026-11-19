@@ -73,6 +73,33 @@ function(ninfer_add_host_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# The generation path's trace switch is a host policy, so it is pinned here without dragging the
+# executor's target and device headers into the test. The executable is registered once; each
+# additional invocation sees one environment value because the switch is cached for process life.
+ninfer_add_host_test(ninfer_generation_trace_test
+  SOURCES test_generation_trace.cpp)
+set_tests_properties(ninfer_generation_trace_test PROPERTIES
+  ENVIRONMENT "NINFER_GENERATION_TRACE=0")
+foreach(mode empty unset yes on)
+  set(env_value "${mode}")
+  if(mode STREQUAL "empty")
+    set(env_value "")
+  elseif(mode STREQUAL "unset")
+    set(env_value "")
+  elseif(mode STREQUAL "on")
+    set(env_value "1")
+  endif()
+  if(mode STREQUAL "unset")
+    add_test(NAME ninfer_generation_trace_${mode}_test
+      COMMAND ${CMAKE_COMMAND} -E env --unset=NINFER_GENERATION_TRACE
+              $<TARGET_FILE:ninfer_generation_trace_test>)
+  else()
+    add_test(NAME ninfer_generation_trace_${mode}_test COMMAND ninfer_generation_trace_test)
+    set_tests_properties(ninfer_generation_trace_${mode}_test PROPERTIES
+      ENVIRONMENT "NINFER_GENERATION_TRACE=${env_value}")
+  endif()
+endforeach()
+
 # The rope-delta plane's shape, sizing and per-page rule. Registered as a host test precisely because
 # docs/SCR.md records that `paged_kv_cache.h` includes <cuda_runtime_api.h>,
 # so the arithmetic had to be pulled into a CUDA-free header before it could be tested anywhere
