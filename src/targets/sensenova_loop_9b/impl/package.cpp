@@ -100,7 +100,7 @@ std::unique_ptr<detail::Program> Package::create_program(const LoadedModel& mode
                                                  DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return detail::Program::create(model.impl_->data.runtime, device.stream, plan.max_concurrency(),
-                                   plan.kv_capacity(), plan.capacity(),
+                                   plan.main_page_groups(), plan.capacity(),
                                    plan.device_reservation_bytes(), plan.use_cuda_graph());
 }
 

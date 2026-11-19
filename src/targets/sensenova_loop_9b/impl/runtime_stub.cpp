@@ -83,6 +83,7 @@ const runtime::RequestPlanSummary& RequestPlan::summary() const noexcept { retur
 struct SequencePlan::Impl {
     std::uint32_t capacity                  = 0;
     std::uint32_t kv_capacity               = 0;
+    std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
     std::size_t device_reservation_bytes    = 0;
     std::size_t workspace_bytes             = 0;
@@ -96,6 +97,7 @@ SequencePlan& SequencePlan::operator=(SequencePlan&&) noexcept = default;
 SequencePlan::~SequencePlan()                                  = default;
 std::uint32_t SequencePlan::capacity() const noexcept { return impl_->capacity; }
 std::uint32_t SequencePlan::kv_capacity() const noexcept { return impl_->kv_capacity; }
+std::uint32_t SequencePlan::main_page_groups() const noexcept { return impl_->main_page_groups; }
 std::uint32_t SequencePlan::max_concurrency() const noexcept { return impl_->max_concurrency; }
 std::size_t SequencePlan::device_reservation_bytes() const noexcept {
     return impl_->device_reservation_bytes;
@@ -135,9 +137,10 @@ SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
     }
     const SequenceLayout layout = finalize_sequence_layout(planning_inputs(impl_->options, impl_->weights_profile), main_page_groups);
     auto impl             = std::make_unique<SequencePlan::Impl>();
-    impl->capacity        = layout.capacity;
-    impl->kv_capacity     = layout.kv_capacity;
-    impl->max_concurrency = layout.inputs.max_concurrency;
+    impl->capacity         = layout.capacity;
+    impl->kv_capacity      = layout.kv_capacity;
+    impl->main_page_groups = layout.main_page_groups;
+    impl->max_concurrency  = layout.inputs.max_concurrency;
     impl->workspace_bytes = layout.workspace_bytes;
     impl->request_transient_bytes = layout.request_transient_bytes;
     impl->device_reservation_bytes = layout.device_reservation_bytes;
