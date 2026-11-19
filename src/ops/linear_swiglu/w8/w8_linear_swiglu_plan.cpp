@@ -50,8 +50,17 @@ constexpr bool catalog_is_closed() {
 static_assert(catalog_is_closed(), "W8 LinearSwiGLU routes must be exact and closed");
 
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == 12288 && problem.output_rows == 6144 && problem.k == 2048 &&
-           problem.padded_k == 2048;
+    const bool qwen = problem.geometry == W8LinearSwiGluGeometryKind::Qwen &&
+                      problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
+                      problem.k == 2048 && problem.padded_k == 2048;
+    const bool sense_nova = problem.geometry == W8LinearSwiGluGeometryKind::SenseNova &&
+                            problem.gate_up_rows == 24576 && problem.output_rows == 12288 &&
+                            problem.k == 4096 && problem.padded_k == 4096;
+    return qwen || sense_nova;
+}
+
+bool sense_nova_geometry(const W8LinearSwiGluProblem& problem) noexcept {
+    return problem.geometry == W8LinearSwiGluGeometryKind::SenseNova;
 }
 
 } // namespace
@@ -105,10 +114,43 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
 
 void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
                                    Tensor& out, cudaStream_t stream) {
-    const W8LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+    const bool sense_nova = w.n == 24576;
+    const W8LinearSwiGluProblem problem{
+        sense_nova ? W8LinearSwiGluGeometryKind::SenseNova : W8LinearSwiGluGeometryKind::Qwen,
+        w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const W8LinearSwiGluPlan resolved = w8_linear_swiglu_resolve_plan(problem);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("W8 LinearSwiGLU: plan does not match exact problem");
+    }
+    if (sense_nova_geometry(problem)) {
+        switch (plan.schedule) {
+        case W8LinearSwiGluScheduleId::MmaR32C64:
+            w8_linear_swiglu_sensenova_mma_r32_c64_launch(x, w, out, stream);
+            return;
+        case W8LinearSwiGluScheduleId::MmaR32C80:
+            w8_linear_swiglu_sensenova_mma_r32_c80_launch(x, w, out, stream);
+            return;
+        case W8LinearSwiGluScheduleId::MmaR32C96:
+            w8_linear_swiglu_sensenova_mma_r32_c96_launch(x, w, out, stream);
+            return;
+        case W8LinearSwiGluScheduleId::MmaR64C64:
+            w8_linear_swiglu_sensenova_mma_r64_c64_launch(x, w, out, stream);
+            return;
+        case W8LinearSwiGluScheduleId::MmaR64C96:
+            w8_linear_swiglu_sensenova_mma_r64_c96_launch(x, w, out, stream);
+            return;
+        case W8LinearSwiGluScheduleId::MmaR64C128:
+            w8_linear_swiglu_sensenova_mma_r64_c128_launch(x, w, out, stream);
+            return;
+        case W8LinearSwiGluScheduleId::MmaR128C64:
+            w8_linear_swiglu_sensenova_mma_r128_c64_launch(x, w, out, stream);
+            return;
+        case W8LinearSwiGluScheduleId::MmaR128C80:
+            w8_linear_swiglu_sensenova_mma_r128_c80_launch(x, w, out, stream);
+            return;
+        default:
+            throw std::logic_error("W8 LinearSwiGLU: unsupported SenseNova schedule");
+        }
     }
     switch (plan.schedule) {
     case W8LinearSwiGluScheduleId::DecodePairR16:
@@ -149,7 +191,10 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
 }
 
 void w8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const W8LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+    const bool sense_nova = w.n == 24576;
+    const W8LinearSwiGluProblem problem{
+        sense_nova ? W8LinearSwiGluGeometryKind::SenseNova : W8LinearSwiGluGeometryKind::Qwen,
+        w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     w8_linear_swiglu_execute_plan(w8_linear_swiglu_resolve_plan(problem), x, w, out, stream);
 }
 

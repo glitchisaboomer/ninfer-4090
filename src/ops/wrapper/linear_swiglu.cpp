@@ -148,7 +148,7 @@ void linear_swiglu_sensenova(const Tensor& x, const Weight& gate_up_weight, Tens
     } else if (x.ne[1] >= 2 && x.ne[1] <= 48) {
         detail::w8_linear_swiglu_sensenova_splitk_exact_t_launch(x, gate_up_weight, out, stream);
     } else {
-        throw std::invalid_argument("linear_swiglu_sensenova: unsupported T");
+        detail::w8_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
     }
 }
 

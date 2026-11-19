@@ -18,7 +18,8 @@ int main() {
         const int failures = run_profile(
             "LinearSwiGLU W8_A16",
             {QType::W8G32_F16S, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
-        constexpr std::array<std::int32_t, 6> kSenseNovaTokenCases{1, 2, 17, 32, 40, 48};
+        constexpr std::array<std::int32_t, 11> kSenseNovaTokenCases{1,  2,  17, 32, 40, 48,
+                                                                    49, 128, 341, 512, 561};
         const int sense_nova_failures = run_profile(
             "LinearSwiGLU W8_A16 SenseNova",
             {QType::W8G32_F16S, 24576, 4096, 12288, 1701U, ActivationCompute::A16},

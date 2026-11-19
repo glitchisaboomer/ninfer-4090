@@ -46,5 +46,21 @@ void w8_linear_swiglu_mma_r128_c64_launch(const Tensor& x, const Weight& w, Tens
                                           cudaStream_t stream);
 void w8_linear_swiglu_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r32_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                    cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r32_c80_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                    cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r32_c96_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                    cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r64_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                    cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r64_c96_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                    cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                     cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r128_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                     cudaStream_t stream);
+void w8_linear_swiglu_sensenova_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                                     cudaStream_t stream);
 
 } // namespace ninfer::ops::detail
