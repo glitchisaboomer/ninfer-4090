@@ -314,6 +314,10 @@ void assign_text_positions(PreparedPromptData& prompt) {
     prompt.rope_delta = 0;
 }
 
+void assign_text_positions_for_test(PreparedPromptData& prompt) {
+    assign_text_positions(prompt);
+}
+
 VisionItem convert_vision_item(fi::VisionItem item) {
     VisionItem result;
     result.modality =
@@ -933,6 +937,10 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
 
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
+}
+
+void FrontendTestAccess::assign_text_positions(PreparedPromptData& prompt) {
+    qwen3_6::assign_text_positions_for_test(prompt);
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input) const {

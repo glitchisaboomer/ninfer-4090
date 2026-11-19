@@ -769,14 +769,44 @@ test(targets): validate SenseNova MTP and prefix reuse together
 - [ ] Validate generation config EOS `(248044, 248046)` and `use_cache=true`.
 - [ ] Map the official chat template.
 - [ ] Register the serving identity `sensenova_loop_9b`.
-- [ ] Build a quantized-weight reference by dequantizing the existing `.ninfer` artifact in memory;
+- [~] Build a quantized-weight reference by dequantizing the existing `.ninfer` artifact in memory;
       do not create a duplicate BF16 artifact. Compare fixed prompts against that reference with
-      explicit tolerances.
-- [ ] As a weaker semantic sanity check, compare top-1/top-k overlap against the original BF16
-      Hugging Face checkpoint, without requiring bitwise logits.
-- [ ] Validate prefill, ordinary decode, MTP propose/verify, K=1..15, engine-level prefix reuse,
+      explicit tolerances. **Artifact-level validation added and run:** all 136 quantized tensors
+      are decoded in memory and sampled against an independent scalar FP32/FP64 oracle. The public
+      Engine API exposes generated tokens but no hidden/logit tensor, so a fixed-prompt logits
+      comparison is still blocked; the end-to-end claim is not made.
+- [~] As a weaker semantic sanity check, compare top-1/top-k overlap against the original BF16
+      Hugging Face checkpoint, without requiring bitwise logits. **External HF feasibility:** the
+      local model directory is complete and `hf_reference.py --preflight` validates its config,
+      generation config, resource hashes, and all safetensors shards. The actual BF16 forward is
+      blocked because this sandbox has no `torch`, `transformers`, or `safetensors` Python modules;
+      the script exits with code 77 and does not download anything.
+- [~] Validate prefill, ordinary decode, MTP propose/verify, K=1..15, engine-level prefix reuse,
       restart, and state-cache behavior. INT8 KV is deferred; BF16 KV is the v1 path.
-- [ ] Run the full CTest suite; all 84 tests must pass.
+      **Prompt positions fixed:** SenseNova prefill now validates `positions.size() ==
+      token_ids.size() * 3` and uploads text/temporal axis `position_axis(0)` to the device `[T]`
+      tensor in both cold and prefix-reuse prefill. The frontend axis-major `[3,T]` contract is
+      regression-tested. **Remaining execution blocker:** SenseNova state images use BF16 GQA
+      planes `[256,128,4,pages]`, while the GQA kernels derive logical pages and page offsets from
+      absolute positions with the compile-time 64-token `kPagedKVPageShift=6` and
+      `kPagedKVPageMask=63`. Relaxing wrapper validation alone would corrupt cache addressing;
+      correct support needs a runtime page shift/mask or separate 128-token geometry threaded
+      through BF16/INT8 prefill and decode kernels, metadata, delta-RoPE paths, wrappers, and
+      oracle tests. That broad redesign is not authorized here, so the fixed-prompt harness remains
+      a documented skip. Existing host/state-contract CTests still cover MTP K=1,2,15
+      verification/rollback and prefix identity/partition restore; graph replay vs eager is
+      covered by mechanism CTests. No end-to-end token-parity claim is made.
+- [~] Run the full CTest suite; all 84 tests must pass. **Expanded suite:** Stage G adds
+      `ninfer_sensenova_loop_9b_reference_quantized_weights_test` and a skipped fixed-prompt gate.
+      `JOBS=1 ./build-sandbox.sh --test` reported 114 tests: 97 percent passed, 3 failed, 9
+      skipped, and 102 executed tests passed in 115.35 seconds. CTest exited 8. The lifecycle
+      test passes after the prompt-position regression test was repaired. The three failures are
+      the preserved pre-existing sandbox libcurl/nghttp2 dependency failures
+      in `ninfer_openai_schema_test`, `ninfer_responses_schema_test`, and `ninfer_serve_ui_test`.
+      All 136 quantized tensors (134 W8 + one Q4 draft head + one Q6 LM head) are covered.
+      After the authorized prompt-position fix, the same suite result is revalidated; the
+      fixed-prompt test remains a documented skip solely for the compiled 64-token GQA page
+      shift/mask versus SenseNova's 128-token state-image planes.
 - [ ] Benchmark text-only baseline.
 - [ ] Benchmark MTP at K=3, 5, 7; choose a conservative default.
 - [ ] Tune only after correctness:

@@ -156,6 +156,20 @@ target_include_directories(ninfer_sensenova_loop_9b_bindings_test PRIVATE
 target_link_libraries(ninfer_sensenova_loop_9b_bindings_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_sensenova_loop_9b_bindings_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Stage G validation. The quantized-weight validator dequantizes objects from the existing
+# artifact in memory and compares them to an independent scalar FP32/FP64 oracle. The prompt-axis
+# contract is exercised by the program lifecycle test. The fixed-prompt gate remains a documented
+# skip: SenseNova's 128-token BF16 GQA pages require a cross-kernel page-shift/mask redesign that
+# is outside this authorized change. Neither test creates a duplicate BF16 artifact.
+ninfer_add_test(ninfer_sensenova_loop_9b_reference_quantized_weights_test
+  SOURCES targets/sensenova_loop_9b/test_reference_quantized_weights.cpp
+  LIBRARIES ninfer_artifact)
+set_tests_properties(ninfer_sensenova_loop_9b_reference_quantized_weights_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_sensenova_loop_9b_fixed_prompt_reference_test
+  SOURCES targets/sensenova_loop_9b/test_fixed_prompt_reference.cpp)
+set_tests_properties(ninfer_sensenova_loop_9b_fixed_prompt_reference_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # One-visit layer execution for the fixed 56-visit plan: the standalone executor's planning and
 # validation surface, plus one-visit execution proofs over the GDN/mHC/KV visit state slots.
 ninfer_add_op_test(ninfer_sensenova_loop_9b_layer_execution_test

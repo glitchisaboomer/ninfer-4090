@@ -3,6 +3,8 @@
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
 
 #include <ninfer/targets/qwen3_6/frontend.h>
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include "targets/qwen3_6/impl/frontend/test_access.h"
 #include <ninfer/targets/sensenova_loop_9b/package.h>
 
 #include <array>
@@ -68,6 +70,34 @@ void test_state_images() {
     expect(again.base == images.base && again.gdn_region == images.gdn_region &&
                again.mhc_region == images.mhc_region,
            "state addresses are stable across access");
+}
+
+void test_prepared_prompt_position_axes() {
+    qwen3_6::PreparedPromptData data;
+    data.token_ids = {0, 1, 2, 3};
+    qwen3_6::FrontendTestAccess::assign_text_positions(data);
+
+    expect(data.positions.size() == data.token_ids.size() * 3,
+           "prepared prompt stores three position axes per token");
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        const std::span<const std::int32_t> positions = data.position_axis(static_cast<int>(axis));
+        expect(positions.size() == data.token_ids.size(),
+               "every prepared-prompt position axis has T entries");
+        for (std::size_t i = 0; i < data.token_ids.size(); ++i) {
+            expect(positions[i] == static_cast<std::int32_t>(i),
+                   "text position axes are axis-major and sequential");
+        }
+    }
+
+    // A malformed axis count must be rejected by PreparedPromptData itself; the Program's own
+    // check uses the same contract before it takes any axis span.
+    bool rejected = false;
+    try {
+        (void)data.position_axis(3);
+    } catch (const std::out_of_range&) {
+        rejected = true;
+    }
+    expect(rejected, "invalid prepared-prompt position axis is rejected");
 }
 
 void test_prefill_requires_model() {
@@ -197,6 +227,7 @@ void test_memory() {
 int main() {
     test_lifecycle();
     test_state_images();
+    test_prepared_prompt_position_axes();
     test_prefill_requires_model();
     test_decode_batch_validation();
     test_output_contract();

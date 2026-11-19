@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <array>
+#include <span>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -562,9 +563,12 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
     if (data.token_ids.empty()) {
         throw std::invalid_argument("sensenova_loop_9b: prompt has no tokens");
     }
-    if (data.token_ids.size() != data.positions.size()) {
-        throw std::invalid_argument("sensenova_loop_9b: prompt positions do not match its tokens");
+    if (data.positions.size() != data.token_ids.size() * 3) {
+        throw std::invalid_argument("sensenova_loop_9b: prompt positions must contain three axes per token");
     }
+    // SenseNova reads text RoPE from the temporal/text axis. The frontend stores axes
+    // axis-major as [3,T], so axis 0 is the first T int32 values, not the whole vector.
+    const std::span<const std::int32_t> text_positions = data.position_axis(0);
     if (data.token_ids.size() > impl_->kv_capacity) {
         throw std::invalid_argument("sensenova_loop_9b: prompt exceeds the declared KV capacity");
     }
@@ -593,7 +597,7 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
         CUDA_CHECK(cudaMemcpyAsync(ids.data, data.token_ids.data(),
                                    tokens * sizeof(TokenId), cudaMemcpyHostToDevice,
                                    impl_->stream));
-        CUDA_CHECK(cudaMemcpyAsync(positions.data, data.positions.data(),
+        CUDA_CHECK(cudaMemcpyAsync(positions.data, text_positions.data(),
                                    tokens * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                    impl_->stream));
 
@@ -665,9 +669,12 @@ Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity ident
     if (data.token_ids.empty() || reused >= data.token_ids.size()) {
         throw std::invalid_argument("sensenova_loop_9b: shared prefix must be shorter than the prompt");
     }
-    if (data.token_ids.size() != data.positions.size()) {
-        throw std::invalid_argument("sensenova_loop_9b: prompt positions do not match its tokens");
+    if (data.positions.size() != data.token_ids.size() * 3) {
+        throw std::invalid_argument("sensenova_loop_9b: prompt positions must contain three axes per token");
     }
+    // SenseNova reads text RoPE from the temporal/text axis. The frontend stores axes
+    // axis-major as [3,T], so axis 0 is the first T int32 values, not the whole vector.
+    const std::span<const std::int32_t> text_positions = data.position_axis(0);
     if (data.token_ids.size() > impl_->kv_capacity) {
         throw std::invalid_argument("sensenova_loop_9b: prompt exceeds the declared KV capacity");
     }
@@ -696,7 +703,7 @@ Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity ident
         CUDA_CHECK(cudaMemcpyAsync(ids.data, data.token_ids.data() + reused,
                                    suffix_tokens * sizeof(TokenId), cudaMemcpyHostToDevice,
                                    impl_->stream));
-        CUDA_CHECK(cudaMemcpyAsync(positions.data, data.positions.data() + reused,
+        CUDA_CHECK(cudaMemcpyAsync(positions.data, text_positions.data() + reused,
                                    suffix_tokens * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                    impl_->stream));
         const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
