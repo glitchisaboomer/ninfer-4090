@@ -2,6 +2,7 @@
 
 #include "targets/sensenova_loop_9b/impl/config.h"
 #include "targets/sensenova_loop_9b/impl/load/bindings.h"
+#include "targets/sensenova_loop_9b/impl/runtime/text_execution.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -112,10 +113,21 @@ SequenceLayout build_sequence_layout(const SequencePlanningInputs& inputs,
     layout.workspace_bytes = kWorkspaceBytes;
     layout.graph_allowance_bytes =
         inputs.use_cuda_graph ? 16ULL * 1024ULL * 1024ULL : 0ULL;
-    layout.request_transient_bytes = align_up(
-        checked_mul(inputs.max_concurrency, 4096ULL,
-                    "sensenova_loop_9b: request transient overflow"),
-        256);
+    // The executor serializes prefill lanes, so the frozen transient region needs one worst-case
+    // request: the full configured context in one eager forward plus the id/position copies. This
+    // must match Program::plan_request_base, which sizes the activation from prompt tokens.
+    const std::uint32_t transient_tokens = std::max(1U, inputs.capacity);
+    const std::size_t forward_bytes =
+        TextExecutionContext::forward_workspace_capacity_bytes(transient_tokens, transient_tokens);
+    const std::size_t staging_bytes =
+        align_up(checked_mul(2ULL, checked_mul(transient_tokens, sizeof(std::int32_t),
+                                               "sensenova_loop_9b: staging token overflow"),
+                             "sensenova_loop_9b: staging byte overflow"),
+                 256);
+    layout.request_transient_bytes =
+        align_up(checked_add(forward_bytes, staging_bytes,
+                             "sensenova_loop_9b: request transient overflow"),
+                 256);
     layout.device_reservation_bytes = checked_add(
         checked_add(layout.persistent_bytes, layout.workspace_bytes,
                     "sensenova_loop_9b: persistent/workspace overflow"),

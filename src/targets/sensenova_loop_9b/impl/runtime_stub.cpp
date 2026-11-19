@@ -511,6 +511,7 @@ RequestBasePlan Program::plan_request_base(const qwen3_6::PreparedPrompt& prompt
     impl->summary.prompt_tokens = summary.prompt_tokens;
     impl->summary.requested_output_tokens = options.requested_output_tokens;
     impl->summary.effective_output_tokens = options.requested_output_tokens;
+    impl->summary.effective_limit_reason  = FinishReason::OutputLimit;
     // Eager prefill runs the whole prompt in one forward, so the request needs the embedding
     // hidden state, the mHC stream buffers, the worst visit scratch, the head columns, and the
     // device copies of its ids/positions.
