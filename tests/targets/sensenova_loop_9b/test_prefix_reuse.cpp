@@ -63,6 +63,17 @@ void test_mtp_program_rounds() {
         expect(stats.accepted_tokens == 1, "the matching first draft was counted as accepted");
         expect(stats.fallback_steps == (k == 1 ? 0U : 1U),
                "fallback is recorded only when a draft tail was rejected");
+        expect(!sn::Program::inspect_lane_for_test(*program, 0).retained &&
+               sn::Program::inspect_lane_for_test(*program, 0).frontier == 18,
+               "a decode round leaves the lane pending for host-side resolution");
+
+        std::array<std::uint32_t, 1> resolve_lanes{0};
+        std::array<std::uint32_t, 1> accepted{2};
+        std::array<std::uint8_t, 1> terminal{0};
+        std::array<std::uint8_t, 1> cancelled{0};
+        program->resolve_pending_batch(resolve_lanes, accepted, terminal, cancelled);
+        expect(sn::Program::inspect_lane_for_test(*program, 0).frontier == 20,
+               "resolve_pending_batch returns the lane to active");
     }
 }
 

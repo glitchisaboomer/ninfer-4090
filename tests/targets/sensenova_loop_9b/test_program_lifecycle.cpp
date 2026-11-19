@@ -145,6 +145,18 @@ void test_decode_batch_validation() {
     } catch (const std::invalid_argument&) { rejected_empty = true; } catch (...) {
     }
     expect(rejected_empty, "decode rejects an empty batch");
+
+    bool pending_after_decode = false;
+    try {
+        std::array<std::uint32_t, 1> resolve_lanes{0};
+        std::array<std::uint32_t, 1> accepted{0};
+        std::array<std::uint8_t, 1> terminal{0};
+        std::array<std::uint8_t, 1> cancelled{0};
+        program->resolve_pending_batch(resolve_lanes, accepted, terminal, cancelled);
+        pending_after_decode = true;
+    } catch (...) {
+    }
+    expect(!pending_after_decode, "resolve rejects an active lane that has not produced a round");
 }
 
 void test_output_contract() {

@@ -852,6 +852,9 @@ void Program::decode_one(std::uint32_t lane) {
     execution.timings.decode_seconds += seconds;
     execution.timings.total_seconds =
         execution.timings.prefill_seconds + execution.timings.decode_seconds;
+    // The executor commits this token with resolve_pending_batch. Keep the lane Pending between
+    // the device round and that host-side commit.
+    state.lifecycle = Lifecycle::Pending;
 }
 
 void Program::configure_mtp_for_test(Program& program, std::uint32_t draft_window) {
@@ -968,7 +971,9 @@ void Program::decode_one_speculative(std::uint32_t lane) {
     for (std::uint32_t i = 0; i < decision.accepted; ++i) {
         ++stats.accepted_per_position[i];
     }
-    state.lifecycle = Lifecycle::Active;
+    // The executor commits this round with resolve_pending_batch. Leave the lane Pending so the
+    // next decode round cannot start until the licensed tokens are registered.
+    state.lifecycle = Lifecycle::Pending;
 }
 
 runtime::BatchedGeneratedRound Program::decode_batch(std::span<const std::uint32_t> lanes,
