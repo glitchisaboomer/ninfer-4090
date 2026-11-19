@@ -101,6 +101,19 @@ void test_prepared_prompt_position_axes() {
     expect(rejected, "invalid prepared-prompt position axis is rejected");
 }
 
+void test_sequence_plan_exposes_draft_window() {
+    sn::EngineOptions options;
+    options.max_context = 4096;
+    options.max_concurrency = 1;
+    options.prefill_chunk = 1024;
+    options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens = 3;
+    auto planner = sn::SequencePlanner::create(options, sn::WeightsProfile::GroupwiseInt);
+    auto plan = std::move(planner).finalize(1);
+    expect(plan.draft_window() == 3,
+           "the sequence plan carries the configured draft window into Program creation");
+}
+
 void test_service_work_projection() {
     auto program = sn::Program::create(1, 32, 4096, 1U << 20U);
 

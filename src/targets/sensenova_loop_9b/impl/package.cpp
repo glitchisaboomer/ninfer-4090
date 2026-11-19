@@ -101,7 +101,8 @@ std::unique_ptr<detail::Program> Package::create_program(const LoadedModel& mode
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return detail::Program::create(model.impl_->data.runtime, device.stream, plan.max_concurrency(),
                                    plan.main_page_groups(), plan.capacity(),
-                                   plan.device_reservation_bytes(), plan.use_cuda_graph());
+                                   plan.device_reservation_bytes(), plan.use_cuda_graph(),
+                                   plan.draft_window());
 }
 
 } // namespace ninfer::targets::sensenova_loop_9b

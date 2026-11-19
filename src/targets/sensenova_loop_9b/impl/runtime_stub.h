@@ -206,6 +206,8 @@ public:
                                            std::span<const TokenId> target);
     [[nodiscard]] static std::uint32_t mtp_window_for_test(const Program& program,
                                                            std::uint32_t lane);
+    [[nodiscard]] static PrefixIdentity prefix_identity_for_tokens(
+        std::span<const TokenId> prompt_tokens);
     [[nodiscard]] static PrefixIdentity prefix_identity_for_test(
         std::span<const TokenId> prompt_tokens);
     static void write_lane_state_markers_for_test(Program& program, std::uint32_t lane,
@@ -214,11 +216,13 @@ public:
                                                                  std::uint32_t lane,
                                                                  std::uint8_t value);
     static std::unique_ptr<Program> create(std::uint32_t active_lanes, std::uint32_t kv_pages,
-                                           std::uint32_t context, std::size_t reservation_bytes);
+                                           std::uint32_t context, std::size_t reservation_bytes,
+                                           std::uint32_t draft_window = 0);
     static std::unique_ptr<Program> create(const RuntimeModelView& model, cudaStream_t stream,
                                            std::uint32_t active_lanes, std::uint32_t kv_pages,
                                            std::uint32_t context, std::size_t reservation_bytes,
-                                           bool use_cuda_graph = false);
+                                           bool use_cuda_graph = false,
+                                           std::uint32_t draft_window = 0);
     ~Program() noexcept;
 
     Program(const Program&)            = delete;
@@ -268,6 +272,10 @@ public:
     start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity identity,
                                    qwen3_6::PreparedPrompt&& prompt, RequestPlan&& plan,
                                    runtime::TransientRegion transient);
+    [[nodiscard]] runtime::PrefillStepResult
+    start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity identity,
+                                   qwen3_6::PreparedPromptData&& data, RequestPlan&& plan,
+                                   runtime::TransientRegion transient);
 
     // Stage E6 prefix reuse primitive. `capture_prefix_state` copies the whole state image at the
     // lane's current frontier into a fresh device buffer and records that frontier and the last
@@ -303,7 +311,8 @@ private:
                                                 std::uint32_t active_lanes,
                                                 std::uint32_t kv_pages, std::uint32_t context,
                                                 std::size_t reservation_bytes,
-                                                bool use_cuda_graph);
+                                                bool use_cuda_graph,
+                                                std::uint32_t draft_window);
     std::unique_ptr<Impl> impl_;
     friend struct ::ninfer::targets::sensenova_loop_9b::Package;
 };

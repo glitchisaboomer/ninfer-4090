@@ -54,6 +54,8 @@ runtime::SequenceCapacityCurve make_curve(const EngineOptions& options) {
 
 struct RequestBasePlan::Impl {
     runtime::RequestPlanSummary summary;
+    bool allow_prefix_reuse = true;
+    bool disable_speculation = false;
 };
 
 RequestBasePlan::RequestBasePlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -64,6 +66,8 @@ const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept { r
 
 struct RequestPlan::Impl {
     runtime::RequestPlanSummary summary;
+    bool allow_prefix_reuse = true;
+    bool disable_speculation = false;
 };
 
 RequestPlan RequestPlanForTest::make() {
@@ -107,6 +111,7 @@ std::size_t SequencePlan::request_transient_capacity_bytes() const noexcept {
     return impl_->request_transient_bytes;
 }
 bool SequencePlan::use_cuda_graph() const noexcept { return impl_->use_cuda_graph; }
+std::uint32_t SequencePlan::draft_window() const noexcept { return impl_->draft_window; }
 
 struct SequencePlanner::Impl {
     EngineOptions options;
@@ -240,6 +245,7 @@ struct Program::Impl {
         std::array<TokenId, 1> pending_tokens{};
         std::array<float, 1> pending_logprobs{};
         std::array<float, 1> pending_margins{};
+        std::vector<TokenId> speculative_licensed;
         GenerationTimings timings{};
     };
     std::array<LaneExecution, kMaximumConcurrency> execution;
@@ -277,23 +283,26 @@ const std::byte* Program::lane_state_base(const Program::Impl& impl, std::uint32
 }
 
 std::unique_ptr<Program> Program::create(std::uint32_t active_lanes, std::uint32_t kv_pages,
-                                         std::uint32_t context, std::size_t reservation_bytes) {
-    return create_impl(nullptr, nullptr, active_lanes, kv_pages, context, reservation_bytes, false);
+                                         std::uint32_t context, std::size_t reservation_bytes,
+                                         std::uint32_t draft_window) {
+    return create_impl(nullptr, nullptr, active_lanes, kv_pages, context, reservation_bytes, false,
+                       draft_window);
 }
 
 std::unique_ptr<Program> Program::create(const RuntimeModelView& model, cudaStream_t stream,
                                          std::uint32_t active_lanes, std::uint32_t kv_pages,
                                          std::uint32_t context, std::size_t reservation_bytes,
-                                         bool use_cuda_graph) {
+                                         bool use_cuda_graph, std::uint32_t draft_window) {
     return create_impl(&model, stream, active_lanes, kv_pages, context, reservation_bytes,
-                       use_cuda_graph);
+                       use_cuda_graph, draft_window);
 }
 
 std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cudaStream_t stream,
                                               std::uint32_t active_lanes, std::uint32_t kv_pages,
                                               std::uint32_t context,
                                               std::size_t reservation_bytes,
-                                              bool use_cuda_graph) {
+                                              bool use_cuda_graph,
+                                              std::uint32_t draft_window) {
     if (active_lanes == 0 || active_lanes > kMaximumConcurrency) {
         throw std::invalid_argument("sensenova_loop_9b: invalid active lane count");
     }
@@ -310,6 +319,7 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
     impl->memory.runtime_reservation_bytes = reservation_bytes;
     impl->max_concurrency                = active_lanes;
     impl->kv_capacity                    = kv_pages * kSenseNovaPageTokens;
+    impl->draft_window                   = draft_window;
 
     // Use the declared KV capacity as the fixed per-domain token extent. The region offsets are
     // derived from StateImageLayout, so every logical visit has a stable address for graph replay.
@@ -518,6 +528,8 @@ RequestBasePlan Program::plan_request_base(const qwen3_6::PreparedPrompt& prompt
                                            const runtime::ResolvedExecutionOptions& options) {
     const PromptSummary summary = prompt.summary();
     auto impl                   = std::make_unique<RequestBasePlan::Impl>();
+    impl->allow_prefix_reuse    = options.allow_prefix_reuse;
+    impl->disable_speculation   = options.disable_speculation;
     impl->summary.prompt_tokens = summary.prompt_tokens;
     impl->summary.requested_output_tokens = options.requested_output_tokens;
     impl->summary.effective_output_tokens = options.requested_output_tokens;
@@ -552,6 +564,8 @@ RequestPlan Program::plan_request_for_lane(std::uint32_t lane, const qwen3_6::Pr
     if (lane >= impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     auto impl      = std::make_unique<RequestPlan::Impl>();
     impl->summary  = base.summary();
+    impl->allow_prefix_reuse = base.impl_->allow_prefix_reuse;
+    impl->disable_speculation = base.impl_->disable_speculation;
     impl->summary.admission = impl_->admission;
     return RequestPlan(std::move(impl));
 }
@@ -601,10 +615,20 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
     }
     const auto tokens = static_cast<std::uint32_t>(data.token_ids.size());
 
+    // Target-local exact-prompt reuse. The engine always calls this entry point, so matching a
+    // previously committed prompt here keeps reuse inside the SenseNova target instead of adding
+    // a target-specific branch to the shared executor.
+    const PrefixIdentity prompt_identity = prefix_identity_for_tokens(data.token_ids);
+    if (plan.impl_->allow_prefix_reuse &&
+        plan_request_for_prefix(lane, prompt_identity, tokens, plan) &&
+        data.positions.size() == data.token_ids.size() * 3) {
+        return start_prefill_lane_with_prefix(lane, prompt_identity, std::move(data),
+                                              std::move(plan), transient);
+    }
+
     WorkspaceArena workspace(DeviceSpan{transient.data, transient.size});
     const DeviceArena::Scope scope = workspace.scope();
     const auto started             = std::chrono::steady_clock::now();
-
     TokenId host_token  = 0;
     float host_logprob  = 0.0F;
     float host_margin   = 0.0F;
@@ -664,6 +688,14 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
     execution.timings.first_token_seconds = seconds;
     execution.timings.total_seconds       = seconds;
 
+    // Keep a full state image for exact-prompt continuation. This is the target-local prefix
+    // cache entry that start_prefill_lane consults on later requests with the same token ids.
+    if (impl_->model != nullptr && tokens > 0) {
+        const PrefixIdentity identity = prefix_identity_for_tokens(state.prompt_token_ids);
+        impl_->engine_prefixes[identity.value] =
+            Impl::EnginePrefix{capture_prefix_state(lane)};
+    }
+
     runtime::PrefillStepResult result;
     result.summary.prompt_tokens   = tokens;
     result.processed_prompt_tokens = tokens;
@@ -681,6 +713,15 @@ runtime::PrefillStepResult
 Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity identity,
                                         qwen3_6::PreparedPrompt&& prompt, RequestPlan&& plan,
                                         runtime::TransientRegion transient) {
+    return start_prefill_lane_with_prefix(
+        lane, identity, qwen3_6::PreparedPromptAccess::take(std::move(prompt)), std::move(plan),
+        transient);
+}
+
+runtime::PrefillStepResult
+Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity identity,
+                                        qwen3_6::PreparedPromptData&& data_in, RequestPlan&& plan,
+                                        runtime::TransientRegion transient) {
     if (lane >= impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (!plan_request_for_prefix(lane, identity, 0, plan)) {
         throw std::invalid_argument("sensenova_loop_9b: prefix identity is not reusable");
@@ -688,7 +729,7 @@ Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity ident
     const Impl::EnginePrefix& prefix = impl_->engine_prefixes.at(identity.value);
     const std::uint32_t reused = prefix.image.token_count();
 
-    qwen3_6::PreparedPromptData data = qwen3_6::PreparedPromptAccess::take(std::move(prompt));
+    qwen3_6::PreparedPromptData data = std::move(data_in);
     if (data.token_ids.empty() || reused >= data.token_ids.size()) {
         throw std::invalid_argument("sensenova_loop_9b: shared prefix must be shorter than the prompt");
     }
@@ -708,7 +749,7 @@ Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity ident
     LaneState& state = impl_->lanes[lane];
     state.lifecycle = Lifecycle::Prefilling;
     restore_prefix_state(lane, prefix.image);
-    state.prompt_token_ids.assign(data.token_ids.begin(), data.token_ids.end());
+    state.prompt_token_ids = data.token_ids;
     state.lifecycle = Lifecycle::Free;
 
     const std::uint32_t suffix_tokens = static_cast<std::uint32_t>(data.token_ids.size() - reused);
@@ -761,6 +802,12 @@ Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity ident
     execution.prefill_tokens[0] = host_token;
     execution.prefill_logprobs[0] = host_logprob;
     execution.prefill_margins[0] = host_margin;
+
+    if (impl_->model != nullptr && state.prompt_tokens > 0) {
+        const PrefixIdentity identity = prefix_identity_for_tokens(state.prompt_token_ids);
+        impl_->engine_prefixes[identity.value] =
+            Impl::EnginePrefix{capture_prefix_state(lane)};
+    }
 
     runtime::PrefillStepResult result;
     result.summary.prompt_tokens = state.prompt_tokens;
@@ -960,7 +1007,7 @@ void Program::decode_one_speculative(std::uint32_t lane) {
                 egress.tokens.begin());
     egress.logprobs.fill(0.0F);
     egress.margins.fill(0.0F);
-    impl_->speculative_licensed_counts[lane] = static_cast<std::uint32_t>(licensed.size());
+    impl_->speculative_licensed_counts[lane] = decision.licensed;
 
     SpeculativeStats& stats = impl_->speculative_stats[lane];
     stats.backend = SpeculativeBackend::Mtp;
@@ -997,7 +1044,9 @@ runtime::BatchedGeneratedRound Program::decode_batch(std::span<const std::uint32
         if (lane >= impl_->max_concurrency) {
             throw std::out_of_range("decode batch lane is out of range");
         }
-        const bool speculative = impl_->draft_window != 0 && impl_->mtp[lane].armed;
+        LaneMtpState& mtp = impl_->mtp[lane];
+        const bool speculative = impl_->draft_window != 0 && mtp.armed &&
+                                 mtp.target_window.size() >= mtp.pending.valid + 1U;
         if (speculative) {
             decode_one_speculative(lane);
         } else {
@@ -1130,7 +1179,7 @@ void Program::restore_prefix_state(std::uint32_t lane, const PrefixStateSnapshot
     impl_->execution[lane].last_token  = snapshot.last_token_;
 }
 
-Program::PrefixIdentity Program::prefix_identity_for_test(std::span<const TokenId> tokens) {
+Program::PrefixIdentity Program::prefix_identity_for_tokens(std::span<const TokenId> tokens) {
     // FNV-1a over the exact token sequence. Deterministic, order sensitive, and independent of
     // lane or Program so the same prompt always resolves to the same cached prefix.
     std::uint64_t hash = 1469598103934665603ULL;
@@ -1142,6 +1191,11 @@ Program::PrefixIdentity Program::prefix_identity_for_test(std::span<const TokenI
         }
     }
     return PrefixIdentity{hash};
+}
+
+Program::PrefixIdentity Program::prefix_identity_for_test(std::span<const TokenId> tokens) {
+    // Kept for the unit tests that construct identities without a Program instance.
+    return prefix_identity_for_tokens(tokens);
 }
 
 Program::PrefixIdentity Program::capture_engine_prefix(std::uint32_t lane,
