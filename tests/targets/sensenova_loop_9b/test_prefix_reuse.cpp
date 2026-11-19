@@ -31,7 +31,7 @@ void test_mtp_program_rounds() {
     for (std::uint32_t k : {1U, 2U, 15U}) {
         auto program = sn::Program::create(1, 128, 4096, 1ULL << 30ULL);
         sn::Program::configure_mtp_for_test(*program, k);
-        sn::Program::seed_pending_lane_for_test(*program, 0, 16, 42);
+        sn::Program::seed_lane_for_test(*program, 0, 16, 42);
 
         std::vector<ninfer::TokenId> drafts(k, 7);
         std::vector<ninfer::TokenId> target(k + 1, 9);

@@ -777,8 +777,8 @@ runtime::PrefillStepResult Program::advance_prefill_lane(std::uint32_t) {
 
 void Program::decode_one(std::uint32_t lane) {
     LaneState& state = impl_->lanes[lane];
-    if (state.lifecycle != Lifecycle::Pending) {
-        throw std::logic_error("decode requires a pending lane");
+    if (state.lifecycle != Lifecycle::Active) {
+        throw std::logic_error("decode requires an active lane");
     }
     if (impl_->model == nullptr) {
         throw std::logic_error("sensenova_loop_9b: text decode requires a loaded model");
@@ -909,8 +909,8 @@ bool Program::verify_lane_state_markers_for_test(const Program& program, std::ui
 
 void Program::decode_one_speculative(std::uint32_t lane) {
     LaneState& state = impl_->lanes[lane];
-    if (state.lifecycle != Lifecycle::Pending) {
-        throw std::logic_error("decode requires a pending lane");
+    if (state.lifecycle != Lifecycle::Active) {
+        throw std::logic_error("decode requires an active lane");
     }
     LaneMtpState& mtp = impl_->mtp[lane];
     if (!mtp.armed || mtp.pending.valid == 0 || mtp.target_window.size() < mtp.pending.valid + 1U) {

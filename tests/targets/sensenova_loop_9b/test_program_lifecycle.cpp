@@ -129,15 +129,15 @@ void test_decode_batch_validation() {
 
     std::array<std::uint32_t, 1> lanes{0};
     std::array<ninfer::runtime::RoundBudget, 1> budgets{ninfer::runtime::RoundBudget{8}};
-    bool rejected_not_pending = false;
+    bool rejected_not_active = false;
     try {
         (void)program->decode_batch(lanes, budgets);
     } catch (const std::logic_error& error) {
-        rejected_not_pending =
-            std::string_view(error.what()).find("pending lane") != std::string_view::npos;
+        rejected_not_active =
+            std::string_view(error.what()).find("active lane") != std::string_view::npos;
     } catch (...) {
     }
-    expect(rejected_not_pending, "decode rejects a lane that is not pending");
+    expect(rejected_not_active, "decode rejects a lane that is not active");
 
     bool rejected_empty = false;
     try {
