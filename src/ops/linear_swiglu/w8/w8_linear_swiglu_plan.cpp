@@ -50,17 +50,15 @@ constexpr bool catalog_is_closed() {
 static_assert(catalog_is_closed(), "W8 LinearSwiGLU routes must be exact and closed");
 
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
-    const bool qwen = problem.geometry == W8LinearSwiGluGeometryKind::Qwen &&
-                      problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
+    const bool qwen = problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
                       problem.k == 2048 && problem.padded_k == 2048;
-    const bool sense_nova = problem.geometry == W8LinearSwiGluGeometryKind::SenseNova &&
-                            problem.gate_up_rows == 24576 && problem.output_rows == 12288 &&
+    const bool sense_nova = problem.gate_up_rows == 24576 && problem.output_rows == 12288 &&
                             problem.k == 4096 && problem.padded_k == 4096;
     return qwen || sense_nova;
 }
 
 bool sense_nova_geometry(const W8LinearSwiGluProblem& problem) noexcept {
-    return problem.geometry == W8LinearSwiGluGeometryKind::SenseNova;
+    return problem.gate_up_rows == 24576 && problem.output_rows == 12288;
 }
 
 } // namespace
@@ -114,10 +112,7 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
 
 void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
                                    Tensor& out, cudaStream_t stream) {
-    const bool sense_nova = w.n == 24576;
-    const W8LinearSwiGluProblem problem{
-        sense_nova ? W8LinearSwiGluGeometryKind::SenseNova : W8LinearSwiGluGeometryKind::Qwen,
-        w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+    const W8LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const W8LinearSwiGluPlan resolved = w8_linear_swiglu_resolve_plan(problem);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("W8 LinearSwiGLU: plan does not match exact problem");
@@ -191,10 +186,7 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
 }
 
 void w8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const bool sense_nova = w.n == 24576;
-    const W8LinearSwiGluProblem problem{
-        sense_nova ? W8LinearSwiGluGeometryKind::SenseNova : W8LinearSwiGluGeometryKind::Qwen,
-        w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+    const W8LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     w8_linear_swiglu_execute_plan(w8_linear_swiglu_resolve_plan(problem), x, w, out, stream);
 }
 

@@ -23,10 +23,7 @@ enum class W8LinearSwiGluScheduleId {
     MmaR128C80,
 };
 
-enum class W8LinearSwiGluGeometryKind { Qwen, SenseNova };
-
 struct W8LinearSwiGluProblem {
-    W8LinearSwiGluGeometryKind geometry = W8LinearSwiGluGeometryKind::Qwen;
     std::int32_t gate_up_rows;
     std::int32_t output_rows;
     std::int32_t k;
