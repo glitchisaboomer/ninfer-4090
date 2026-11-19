@@ -461,12 +461,11 @@ int run_device_tests(cudaStream_t stream) {
     };
     auto [bias0, bias1, router0, router1] = make_routers();
 
-    // GDN convolution prepared from the stored [4,8192] form to the op [8192,4] form.
-    std::vector<float> conv_host(4 * 8192);
+    // GDN convolution in op form. The artifact stores kernel-major bytes; the op reinterprets the
+    // same bytes as [8192,4].
+    std::vector<float> conv_host(8192 * 4);
     qt::fill_uniform(conv_host, 51, -0.2F, 0.2F);
-    Tensor conv_stored = f.tensor_bf16(conv_host, {4, 8192});
-    Tensor conv_op     = f.tensor_bf16(std::vector<float>(8192 * 4), {8192, 4});
-    le::transpose_gdn_convolution_weight(conv_stored, conv_op, stream);
+    Tensor conv_op = f.tensor_bf16(conv_host, {8192, 4});
 
     // GDN visit state image: two adjacent slots; only the bound slot may be mutated.
     const std::size_t gdn_bytes = le::StateLayout::gdn_state_bytes_per_slot();
@@ -747,28 +746,35 @@ int run_device_tests(cudaStream_t stream) {
         req.workspace            = &arena;
         run_visit(req);
 
-        // The leave reduction is the stream mean: hidden_out[d,t] = bf16(0.5*s0[d,t] + 0.5*s1[d,t]),
-        // with s0/s1 the published flattened streams of the final token (0.5 is exact, so the
-        // reference mean and the half-identity merge are bit-equal before the final BF16 round).
-        const std::vector<std::uint8_t> slot = read_bytes(mhc_slot, mhc_slot_bytes);
-        const std::vector<std::uint8_t> out  = read_bytes(hidden_out.data, hidden_out.bytes());
+        // Check the leave reduction directly. A full visit modifies the residual twice, so the
+        // original input streams are not the streams that enter the final reduction.
+        const std::size_t d = 4096;
+        const int tokens    = 2;
+        std::vector<float> merged_values(d * 2 * tokens);
+        qt::fill_uniform(merged_values, 97, -1.0F, 1.0F);
+        qt::round_to_bf16(merged_values);
+        const Tensor merged =
+            f.tensor_bf16(merged_values, {static_cast<int>(d), 2, tokens});
+        Tensor reduced = le::mhc_reduce_streams(merged, nullptr, arena, stream);
+        qt::cuda_synchronize();
+
+        const std::vector<uint8_t> merged_bytes = read_bytes(merged.data, merged.bytes());
+        const std::vector<uint8_t> out = read_bytes(reduced.data, reduced.bytes());
         float max_error = 0.0F;
         bool finite = true;
-        for (std::size_t d = 0; d < 4096; ++d) {
-            for (int t = 0; t < 2; ++t) {
-                const std::size_t out_base = (std::size_t(d) + std::size_t(4096) * t) * 2;
-                const std::size_t slot_base = std::size_t(d) * 2;
-                const std::size_t slot_stream1 = slot_base + std::size_t(4096) * 2;
-                const float s0 = qt::bf16_to_f32(std::uint16_t(slot[slot_base] |
-                                                               (slot[slot_base + 1] << 8)));
-                const float s1 = qt::bf16_to_f32(std::uint16_t(slot[slot_stream1] |
-                                                               (slot[slot_stream1 + 1] << 8)));
-                const float o  = qt::bf16_to_f32(std::uint16_t(out[out_base] |
-                                                               (out[out_base + 1] << 8)));
+        for (int t = 0; t < tokens; ++t) {
+            for (std::size_t i = 0; i < d; ++i) {
+                const std::size_t s0_index = (std::size_t(t) * 2 * d + i) * 2;
+                const std::size_t s1_index = (std::size_t(t) * 2 * d + d + i) * 2;
+                const float s0 = qt::bf16_to_f32(std::uint16_t(merged_bytes[s0_index] |
+                                                               (merged_bytes[s0_index + 1] << 8)));
+                const float s1 = qt::bf16_to_f32(std::uint16_t(merged_bytes[s1_index] |
+                                                               (merged_bytes[s1_index + 1] << 8)));
+                const std::size_t out_index = (std::size_t(t) * d + i) * 2;
+                const float o = qt::bf16_to_f32(std::uint16_t(out[out_index] |
+                                                              (out[out_index + 1] << 8)));
                 const float ref = 0.5F * s0 + 0.5F * s1;
-                if (!std::isfinite(o) || !std::isfinite(ref)) {
-                    finite = false;
-                }
+                if (!std::isfinite(o) || !std::isfinite(ref)) { finite = false; }
                 const float denom = std::max(1.0F, std::abs(ref));
                 max_error = std::max(max_error, std::abs(o - ref) / denom);
             }

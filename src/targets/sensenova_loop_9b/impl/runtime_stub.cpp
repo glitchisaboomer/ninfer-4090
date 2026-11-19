@@ -358,12 +358,22 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
         std::size_t asset_offset = 0;
         for (int layer = 0; layer < TextConfig::layers; ++layer) {
             Tensor& conv = impl->gdn_conv[layer];
+            // The artifact stores kernel-major [4,C] bytes. The convolution kernels also read the
+            // flat buffer as four channel planes, so reinterpreting that storage as [C,4] is the
+            // op form. Copy the bytes; do not transpose them.
             conv = Tensor(assets_base + asset_offset, DType::BF16,
                           {TextConfig::convolution_dim, TextConfig::gdn_conv_kernel});
             asset_offset += conv_bytes;
             if (!TextConfig::is_full_attention(layer)) {
-                transpose_gdn_convolution_weight(model->layers[layer].gdn.convolution, conv,
-                                                 impl->stream);
+                if (model->layers[layer].gdn.convolution.data == nullptr) {
+                    throw std::runtime_error("GDN convolution weight is not bound");
+                }
+                const cudaError_t status =
+                    cudaMemcpyAsync(conv.data, model->layers[layer].gdn.convolution.data,
+                                    conv.bytes(), cudaMemcpyDeviceToDevice, impl->stream);
+                if (status != cudaSuccess) {
+                    throw std::runtime_error("GDN convolution copy failed");
+                }
             }
         }
         for (int layer = 0; layer < TextConfig::layers; ++layer) {

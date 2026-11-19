@@ -172,8 +172,8 @@ struct LayerVisitRequest {
     // full-attention visits. Recurrent and conv state are mutated in place by the ops.
     const std::byte* gdn_state_base = nullptr;
 
-    // GDN convolution weight in op form: contiguous BF16 [8192,4]. The stored artifact form is
-    // [4,8192]; prepare the op form once at setup with transpose_gdn_convolution_weight.
+    // GDN convolution weight in op form: contiguous BF16 [8192,4]. The artifact stores the same
+    // bytes as kernel-major [4,8192]; setup reinterprets that storage without transposing it.
     // Required for GDN visits.
     const Tensor* gdn_convolution_weight = nullptr;
 
@@ -248,7 +248,5 @@ void mhc_publish_state(const Tensor& merged_streams, std::byte* slot_base, cudaS
 // Setup-time transpose helpers (source must be stream-stable; copies are stream-ordered).
 // stored: FP32 [8,8192] logits-major router rows -> out: contiguous FP32 [8192,8] op form.
 void transpose_mhc_router_weight(const Tensor& stored, Tensor& out, cudaStream_t stream);
-// stored: BF16 [4,8192] kernel-major convolution rows -> out: contiguous BF16 [8192,4] op form.
-void transpose_gdn_convolution_weight(const Tensor& stored, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::targets::sensenova_loop_9b::detail

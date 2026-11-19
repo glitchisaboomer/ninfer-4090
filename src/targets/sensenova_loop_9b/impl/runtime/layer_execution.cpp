@@ -673,6 +673,11 @@ void execute_layer_visit(const LayerVisitRequest& request) {
             ops::mhc_merge(ffn_residual, b.attn_out, b.post0, b.mix0, MhcConfig::streams,
                            b.merged0, stream);
             ffn_residual = b.merged0;
+        } else {
+            // The full-attention path folds its branch output into `b.carry` itself and the mHC
+            // path merges through the routers. A plain GDN visit needs the same residual add here,
+            // otherwise the FFN sees only the input embedding.
+            ops::residual_add(b.attn_out, b.carry, stream);
         }
     }
     Tensor final_streams = ffn_residual;
@@ -718,14 +723,19 @@ void mhc_enter_streams(const Tensor& hidden, Tensor& out, cudaStream_t stream) {
     require(out.ne[0] == TextConfig::hidden && out.ne[1] == MhcConfig::streams &&
                 out.ne[2] == hidden.ne[1] && out.ne[3] == 1 && out.is_contiguous(),
             "mhc enter output must be contiguous [4096,2,T]");
-    const std::size_t stream_bytes = hidden.bytes();
+    // The destination is token-major [D,2,T]: for each token, stream 0 is followed by stream 1.
+    // Copy rows with the two-stream pitch so each hidden token is duplicated into both streams.
+    const std::size_t row_bytes = static_cast<std::size_t>(TextConfig::hidden) *
+                                  dtype_size(DType::BF16);
     const std::uint8_t* src = static_cast<const std::uint8_t*>(hidden.data);
     std::uint8_t* dst = static_cast<std::uint8_t*>(out.data);
-    const cudaError_t first = cudaMemcpyAsync(dst, src, stream_bytes, cudaMemcpyDeviceToDevice,
-                                              stream);
+    const cudaError_t first =
+        cudaMemcpy2DAsync(dst, 2 * row_bytes, src, row_bytes, row_bytes,
+                          static_cast<std::size_t>(hidden.ne[1]), cudaMemcpyDeviceToDevice, stream);
     require(first == cudaSuccess, "mhc enter stream 0 copy failed");
-    const cudaError_t second = cudaMemcpyAsync(dst + stream_bytes, src, stream_bytes,
-                                               cudaMemcpyDeviceToDevice, stream);
+    const cudaError_t second =
+        cudaMemcpy2DAsync(dst + row_bytes, 2 * row_bytes, src, row_bytes, row_bytes,
+                          static_cast<std::size_t>(hidden.ne[1]), cudaMemcpyDeviceToDevice, stream);
     require(second == cudaSuccess, "mhc enter stream 1 copy failed");
 }
 
@@ -789,9 +799,12 @@ Tensor mhc_reduce_streams(const Tensor& merged, const Tensor* device_mix,
     ops::mhc_merge(merged, branch, post, mix, MhcConfig::streams, out, stream);
     const std::size_t stream_bytes = static_cast<std::size_t>(TextConfig::hidden) *
                                      static_cast<std::size_t>(T) * dtype_size(DType::BF16);
+    // `out` is token-major [D,2,T]. Both streams contain the averaged value, so copy stream 0
+    // rows with the two-stream source pitch into the contiguous [D,T] result.
     const cudaError_t status =
-        cudaMemcpyAsync(reduced.data, static_cast<const std::uint8_t*>(out.data) + stream_bytes,
-                        stream_bytes, cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpy2DAsync(reduced.data, stream_bytes / T, out.data, 2 * (stream_bytes / T),
+                          stream_bytes / T, static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice,
+                          stream);
     require(status == cudaSuccess, "mhc reduce copy failed");
     return reduced;
 }
@@ -842,34 +855,3 @@ void transpose_mhc_router_weight(const Tensor& stored, Tensor& out, cudaStream_t
                         cudaMemcpyHostToDevice, stream);
     require(up == cudaSuccess, "mhc router transpose host-to-device failed");
 }
-
-void transpose_gdn_convolution_weight(const Tensor& stored, Tensor& out, cudaStream_t stream) {
-    require(stored.dtype == DType::BF16 && stored.data != nullptr && out.dtype == DType::BF16 &&
-                out.data != nullptr,
-            "gdn convolution transpose requires BF16 stored and output tensors");
-    require(stored.ne[0] == TextConfig::gdn_conv_kernel &&
-                stored.ne[1] == TextConfig::convolution_dim && stored.ne[2] == 1 &&
-                stored.ne[3] == 1 && stored.is_contiguous(),
-            "stored gdn convolution weight must be contiguous BF16 [4,C]");
-    require(out.ne[0] == TextConfig::convolution_dim && out.ne[1] == TextConfig::gdn_conv_kernel &&
-                out.ne[2] == 1 && out.ne[3] == 1 && out.is_contiguous(),
-            "output gdn convolution weight must be contiguous BF16 [C,4]");
-    const std::size_t channels = static_cast<std::size_t>(TextConfig::convolution_dim);
-    const std::size_t kernel   = static_cast<std::size_t>(TextConfig::gdn_conv_kernel);
-    std::vector<std::uint16_t> host(channels * kernel);
-    const cudaError_t down = cudaMemcpyAsync(host.data(), stored.data,
-                                             host.size() * sizeof(std::uint16_t),
-                                             cudaMemcpyDeviceToHost, stream);
-    require(down == cudaSuccess, "gdn convolution transpose device-to-host failed");
-    for (std::size_t tap = 0; tap < kernel; ++tap) {
-        for (std::size_t channel = 0; channel < channels; ++channel) {
-            host[channel * kernel + tap] = host[tap * channels + channel];
-        }
-    }
-    const cudaError_t up = cudaMemcpyAsync(out.data, host.data(),
-                                           host.size() * sizeof(std::uint16_t),
-                                           cudaMemcpyHostToDevice, stream);
-    require(up == cudaSuccess, "gdn convolution transpose host-to-device failed");
-}
-
-} // namespace ninfer::targets::sensenova_loop_9b::detail
