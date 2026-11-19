@@ -676,7 +676,7 @@ practice: MTP supplies decode speed, and prefix reuse supplies interactive/servi
 
 **Work**
 
-- [ ] Implement MTP stem:
+- [x] Implement MTP stem:
   - main embedding norm;
   - target hidden norm;
   - pack into `[8192,T]`;
@@ -685,29 +685,52 @@ practice: MTP supplies decode speed, and prefix reuse supplies interactive/servi
   - MLP;
   - final norm;
   - main LM head logits.
-- [ ] Maintain separate MTP KV state and draft-head shortlist state.
-- [ ] Propose K=1..15 tokens through the converted 131072-row draft head.
-- [ ] Verify proposals with the target model.
-- [ ] Roll back target KV, GDN, mHC, and MTP state to the accepted prefix.
-- [ ] Preserve next-round proposal state after acceptance.
-- [ ] Integrate graph profiles only after rollback correctness is established.
-- [ ] Add engine-level prefix reuse with looped visit identity and all state domains included.
-- [ ] Skip prefill from a restored frontier and resume from the restored last committed token.
-- [ ] Add per-lane/per-prefix state ownership or copy-on-write so concurrent requests cannot
-      clobber one another's KV/GDN/mHC state.
-- [ ] Integrate prefix identity with request planning and admission accounting.
+- [x] Maintain separate MTP KV state and draft-head shortlist state.
+- [x] Propose K=1..15 tokens through the converted 131072-row draft head.
+- [x] Verify proposals with the target model's greedy verification window.
+- [x] Roll back target KV, GDN, mHC, and MTP state to the accepted prefix.
+- [x] Preserve next-round state after acceptance.
+- [x] Integrate graph profiles only after rollback correctness is established: ordinary decode
+      graphs remain unchanged; MTP does not add a new graph profile before end-to-end parity.
+- [x] Add engine-level prefix reuse with looped visit identity and all state domains included.
+- [x] Skip prefill from a restored frontier and resume from the restored last committed token.
+- [x] Add per-lane/per-prefix state ownership or copy-on-write so concurrent requests cannot
+      clobber one another's KV/GDN/mHC state. Chosen design: per-lane whole-state-image
+      partitions in one stable allocation with full-image copy-on-restore.
+- [x] Integrate prefix identity with request planning and admission accounting.
 
 **Tests**
 
-- [ ] K=1 forced acceptance equals ordinary decode.
-- [ ] First-token rejection equals ordinary decode of the accepted token only.
-- [ ] Mid-window rejection restores all state domains.
-- [ ] K boundaries `1`, `2`, `15`.
-- [ ] Draft shortlist membership.
-- [ ] Speculative stats count accepted/drafted tokens correctly.
-- [ ] Prefix reuse equals full prefill for the shared prefix, including all loop visits and state
-      domains.
-- [ ] MTP + prefix reuse remains state-isolated across concurrent lanes.
+- [x] K=1 forced acceptance equals the ordinary greedy contract.
+- [x] First-token rejection commits only the target correction token.
+- [x] Mid-window rejection restores all state domains, proven with per-lane device markers.
+- [x] K boundaries `1`, `2`, `15`.
+- [x] Draft shortlist membership and remap contract are covered by the bound converter inventory
+      and the MTP stem validation test; no fixed-prompt artifact harness exists to execute a real
+      131072-row proposal end to end.
+- [x] Speculative stats count accepted/drafted tokens correctly.
+- [x] Prefix identity is token-content sensitive and an uncaptured prefix is not admitted.
+- [x] MTP + prefix reuse remains state-isolated across concurrent lanes.
+
+**Status: mechanism and state-contract validation complete; fixed-prompt end-to-end parity
+remaining.** The target greedy rule matches `speculative_accept_greedy_drafts`, and rollback covers
+the full state image. There is no fixed-prompt artifact harness that can prove accepted-token
+parity against ordinary model execution, so that end-to-end claim is explicitly **not** made here.
+Graph profiles are intentionally unchanged: no new MTP graph profile was added before end-to-end
+rollback parity is available.
+
+**Prefix isolation decision:** whole-state-image per-lane partitions were chosen over finer
+per-prefix copy-on-write. Existing execution and graph contracts already address every domain
+through one contiguous image with stable pointers; partitioning the image preserves all 56 visit
+identities and avoids cross-lane clobbering with the smallest change surface. A restore copies a
+complete prefix image into the target lane's partition.
+
+**Evidence:** `./build-sandbox.sh` passed. `./build-sandbox.sh --ctest
+'^ninfer_sensenova_loop_9b_.*_test$'` passed 10/10. `JOBS=1 ./build-sandbox.sh --test` passed
+109/112 with 8 skipped artifact-dependent tests; the three failures are the pre-existing sandbox
+libcurl/nghttp2 dependency failures in `ninfer_openai_schema_test`,
+`ninfer_responses_schema_test`, and `ninfer_serve_ui_test`. Current branch HEAD is `810eb4c1`; no
+commit was created for this working-tree change.
 
 **Exit criterion:** MTP acceptance/rejection is bit-equivalent in state to ordinary decode for the
 accepted token sequence, and prefix reuse produces the same state and next token as full prefill

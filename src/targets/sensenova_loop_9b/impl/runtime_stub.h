@@ -173,6 +173,13 @@ public:
 
 class Program {
 public:
+    // Identity of a committed prompt prefix. The value is a deterministic hash of the full
+    // token sequence, so a shared prefix cannot be confused with a different prompt of the
+    // same length.
+    struct PrefixIdentity {
+        std::uint64_t value = 0;
+    };
+
     [[nodiscard]] static LaneStateSnapshot inspect_lane_for_test(const Program& program,
                                                                  std::uint32_t lane);
     [[nodiscard]] static StateImageInspection inspect_state_images_for_test(
@@ -183,6 +190,28 @@ public:
         const Program& program, std::uint32_t lane);
     static void seed_lane_for_test(Program& program, std::uint32_t lane,
                                    std::uint32_t frontier, std::uint32_t last_token);
+    static void seed_pending_lane_for_test(Program& program, std::uint32_t lane,
+                                           std::uint32_t frontier, std::uint32_t last_token);
+    static void set_committed_prompt_for_test(Program& program, std::uint32_t lane,
+                                              std::span<const TokenId> tokens);
+    // Stage F test hooks. They configure the target's MTP window and publish a deterministic
+    // draft/target window for verification tests; production construction keeps MTP disabled
+    // until an engine-supplied plan opts in.
+    static void configure_mtp_for_test(Program& program, std::uint32_t draft_window);
+    static void set_draft_window_for_test(Program& program, std::uint32_t draft_window);
+    static void set_proposal_for_test(Program& program, std::uint32_t lane,
+                                      std::span<const TokenId> drafts);
+    static void set_target_window_for_test(Program& program, std::uint32_t lane,
+                                           std::span<const TokenId> target);
+    [[nodiscard]] static std::uint32_t mtp_window_for_test(const Program& program,
+                                                           std::uint32_t lane);
+    [[nodiscard]] static PrefixIdentity prefix_identity_for_test(
+        std::span<const TokenId> prompt_tokens);
+    static void write_lane_state_markers_for_test(Program& program, std::uint32_t lane,
+                                                  std::uint8_t value);
+    [[nodiscard]] static bool verify_lane_state_markers_for_test(const Program& program,
+                                                                 std::uint32_t lane,
+                                                                 std::uint8_t value);
     static std::unique_ptr<Program> create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                            std::uint32_t context, std::size_t reservation_bytes);
     static std::unique_ptr<Program> create(const RuntimeModelView& model, cudaStream_t stream,
@@ -223,6 +252,22 @@ public:
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
 
+    // Stage F engine-level prefix reuse. `capture_engine_prefix` records the whole state image
+    // and host frontier under `identity`; `start_prefill_lane_with_prefix` restores a matching
+    // committed prefix into the lane's private state partition, skips the shared prompt tokens,
+    // and prefills only the suffix. Identity includes every looped visit and state domain because
+    // the copied image covers all 15 KV domains, 42 GDN slots, and 48 mHC slots.
+    [[nodiscard]] PrefixIdentity capture_engine_prefix(std::uint32_t lane,
+                                                       std::uint32_t prompt_token_count);
+    [[nodiscard]] bool has_engine_prefix(PrefixIdentity identity) const noexcept;
+    [[nodiscard]] bool plan_request_for_prefix(std::uint32_t lane, PrefixIdentity identity,
+                                               std::uint32_t prompt_token_count,
+                                               const RequestPlan& plan) const noexcept;
+    [[nodiscard]] runtime::PrefillStepResult
+    start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity identity,
+                                   qwen3_6::PreparedPrompt&& prompt, RequestPlan&& plan,
+                                   runtime::TransientRegion transient);
+
     // Stage E6 prefix reuse primitive. `capture_prefix_state` copies the whole state image at the
     // lane's current frontier into a fresh device buffer and records that frontier and the last
     // committed token. `restore_prefix_state` writes the image back and reinstates those two host
@@ -250,6 +295,9 @@ private:
     // state images advance when the forward runs, which is the eager path's
     // commit point until snapshots land with graph/prefix work.
     void decode_one(std::uint32_t lane);
+    void decode_one_speculative(std::uint32_t lane);
+    static std::byte* lane_state_base(Program::Impl& impl, std::uint32_t lane);
+    static const std::byte* lane_state_base(const Program::Impl& impl, std::uint32_t lane);
     static std::unique_ptr<Program> create_impl(const RuntimeModelView* model, cudaStream_t stream,
                                                 std::uint32_t active_lanes,
                                                 std::uint32_t kv_pages, std::uint32_t context,

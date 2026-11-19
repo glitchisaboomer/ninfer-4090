@@ -6,6 +6,8 @@
 #include "targets/sensenova_loop_9b/impl/state_layout.h"
 #include "targets/sensenova_loop_9b/impl/runtime/graph_impl.h"
 #include "targets/sensenova_loop_9b/impl/runtime/layer_execution.h"
+#include "targets/sensenova_loop_9b/impl/runtime/mtp.h"
+#include "targets/sensenova_loop_9b/impl/runtime/mtp_stem.h"
 #include "targets/sensenova_loop_9b/impl/runtime/layouts.h"
 #include "targets/sensenova_loop_9b/impl/runtime/state_images.h"
 #include "targets/sensenova_loop_9b/impl/runtime/text_execution.h"
@@ -18,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <array>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -145,6 +148,7 @@ enum class Lifecycle : std::uint8_t { Free, Prefilling, Active, Pending, Retaine
 struct LaneState {
     Lifecycle lifecycle = Lifecycle::Free;
     std::uint32_t prompt_tokens = 0;
+    std::vector<TokenId> prompt_token_ids;
     std::uint32_t generated_tokens = 0;
     std::uint32_t frontier = 0;
     std::uint32_t page_entitlement = 0;
@@ -153,11 +157,26 @@ struct LaneState {
     std::array<std::uint32_t, kMaximumConcurrency> token_mask{};
 };
 
+// Stage F1/F2: one lane's MTP proposal and verification window. Drafts are produced by the
+// device stem (or injected by a deterministic unit test); the target window is sampled by the
+// target LM head. The pending state is cleared at every commit so a rejected round can never
+// leak into the next proposal.
+struct LaneMtpState {
+    MtpRoundState round;
+    MtpProposal pending;
+    std::vector<TokenId> target_window;
+    bool armed = false;
+};
+
 struct Program::Impl {
     const RuntimeModelView* model = nullptr;
     cudaStream_t stream           = nullptr;
+    // Stage F3: one whole state image per lane. Every lane keeps a stable private partition,
+    // so concurrent requests cannot clobber one another's KV/GDN/mHC/MTP state. A prefix snapshot
+    // is copied into the target lane's partition on restore (copy-on-write at the image level).
     DeviceBuffer state_images;
     std::size_t state_image_bytes = 0;
+    std::size_t state_image_stride = 0;
     std::size_t state_kv_bytes    = 0;
     std::size_t state_gdn_bytes   = 0;
     std::size_t state_mhc_bytes   = 0;
@@ -219,7 +238,38 @@ struct Program::Impl {
         GenerationTimings timings{};
     };
     std::array<LaneExecution, kMaximumConcurrency> execution;
+
+    // Stage F1/F2: MTP window and real per-lane speculative counters.
+    std::uint32_t draft_window = 0;
+    std::array<LaneMtpState, kMaximumConcurrency> mtp;
+    std::array<SpeculativeStats, kMaximumConcurrency> speculative_stats{};
+    std::array<std::uint32_t, kMaximumConcurrency> speculative_licensed_counts{};
+    struct SpeculativeEgress {
+        std::array<TokenId, kMaximumMtpDraftTokens + 1> tokens{};
+        std::array<float, kMaximumMtpDraftTokens + 1> logprobs{};
+        std::array<float, kMaximumMtpDraftTokens + 1> margins{};
+    };
+    std::array<SpeculativeEgress, kMaximumConcurrency> speculative_egress{};
+
+    // Stage F3: engine-level prefix identity. The key is the canonical token sequence hash of
+    // a committed prompt; the value is a full state-image snapshot with its frontier and last
+    // committed token. Prefix snapshots are independent of lane state and can be restored into
+    // any admissible lane partition.
+    struct EnginePrefix {
+        PrefixStateSnapshot image;
+    };
+    std::unordered_map<std::uint64_t, EnginePrefix> engine_prefixes;
 };
+
+std::byte* Program::lane_state_base(Program::Impl& impl, std::uint32_t lane) {
+    return static_cast<std::byte*>(impl.state_images.p) +
+           static_cast<std::size_t>(lane) * impl.state_image_stride;
+}
+
+const std::byte* Program::lane_state_base(const Program::Impl& impl, std::uint32_t lane) {
+    return static_cast<const std::byte*>(impl.state_images.p) +
+           static_cast<std::size_t>(lane) * impl.state_image_stride;
+}
 
 std::unique_ptr<Program> Program::create(std::uint32_t active_lanes, std::uint32_t kv_pages,
                                          std::uint32_t context, std::size_t reservation_bytes) {
@@ -266,7 +316,10 @@ std::unique_ptr<Program> Program::create_impl(const RuntimeModelView* model, cud
     impl->state_mhc_bytes          = StateImageLayout::kMhcSlots *
                                      StateLayout::mhc_state_bytes_per_slot();
     impl->state_image_bytes        = kv_bytes + fixed_bytes;
-    impl->state_images             = DeviceBuffer(impl->state_image_bytes);
+    // One aligned whole-state partition per lane keeps every visit address stable and collision
+    // free. The allocation itself is one DeviceBuffer, so no per-lane pointer changes at runtime.
+    impl->state_image_stride = ((impl->state_image_bytes + 255ULL) / 256ULL) * 256ULL;
+    impl->state_images       = DeviceBuffer(impl->state_image_stride * active_lanes);
     impl->state_images.fill(0);
 
     if (model != nullptr) {
@@ -422,6 +475,26 @@ void Program::seed_lane_for_test(Program& program, std::uint32_t lane, std::uint
     program.impl_->execution[lane].last_token = last_token;
 }
 
+void Program::seed_pending_lane_for_test(Program& program, std::uint32_t lane,
+                                         std::uint32_t frontier, std::uint32_t last_token) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("lane is out of range"); }
+    LaneState& state = program.impl_->lanes[lane];
+    state = LaneState{};
+    state.lifecycle = Lifecycle::Pending;
+    state.prompt_tokens = frontier;
+    state.frontier = frontier;
+    program.impl_->execution[lane] = Impl::LaneExecution{};
+    program.impl_->execution[lane].last_token = last_token;
+}
+
+void Program::set_committed_prompt_for_test(Program& program, std::uint32_t lane,
+                                            std::span<const TokenId> tokens) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    LaneState& state = program.impl_->lanes[lane];
+    state.prompt_tokens = static_cast<std::uint32_t>(tokens.size());
+    state.prompt_token_ids.assign(tokens.begin(), tokens.end());
+}
+
 Program::Program(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 Program::~Program() noexcept                         = default;
 
@@ -527,8 +600,7 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
         const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
                                              impl_->gdn_conv, impl_->mhc_router,
                                              impl_->mhc_half_mix_tensor};
-        TextExecutionContext context(*impl_->model, impl_->stream,
-                                     static_cast<std::byte*>(impl_->state_images.p),
+        TextExecutionContext context(*impl_->model, impl_->stream, lane_state_base(*impl_, lane),
                                      impl_->kv_capacity, workspace, bindings);
         context.forward_full(ids, positions, tokens, sampled, &logprob, &margin);
 
@@ -551,6 +623,7 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
     state                  = LaneState{};
     state.lifecycle        = Lifecycle::Pending;
     state.prompt_tokens    = tokens;
+    state.prompt_token_ids.assign(data.token_ids.begin(), data.token_ids.end());
     state.page_entitlement = (tokens + kSenseNovaPageTokens - 1) / kSenseNovaPageTokens;
     state.frontier         = tokens;
 
@@ -574,6 +647,102 @@ runtime::PrefillStepResult Program::start_prefill_lane(std::uint32_t lane,
     result.round.tokens            = std::span<const TokenId>(execution.prefill_tokens);
     result.round.logprobs          = std::span<const float>(execution.prefill_logprobs);
     result.round.margins           = std::span<const float>(execution.prefill_margins);
+    return result;
+}
+
+runtime::PrefillStepResult
+Program::start_prefill_lane_with_prefix(std::uint32_t lane, PrefixIdentity identity,
+                                        qwen3_6::PreparedPrompt&& prompt, RequestPlan&& plan,
+                                        runtime::TransientRegion transient) {
+    if (lane >= impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (!plan_request_for_prefix(lane, identity, 0, plan)) {
+        throw std::invalid_argument("sensenova_loop_9b: prefix identity is not reusable");
+    }
+    const Impl::EnginePrefix& prefix = impl_->engine_prefixes.at(identity.value);
+    const std::uint32_t reused = prefix.image.token_count();
+
+    qwen3_6::PreparedPromptData data = qwen3_6::PreparedPromptAccess::take(std::move(prompt));
+    if (data.token_ids.empty() || reused >= data.token_ids.size()) {
+        throw std::invalid_argument("sensenova_loop_9b: shared prefix must be shorter than the prompt");
+    }
+    if (data.token_ids.size() != data.positions.size()) {
+        throw std::invalid_argument("sensenova_loop_9b: prompt positions do not match its tokens");
+    }
+    if (data.token_ids.size() > impl_->kv_capacity) {
+        throw std::invalid_argument("sensenova_loop_9b: prompt exceeds the declared KV capacity");
+    }
+
+    // Restore the full state image into this lane's private partition before running the suffix.
+    // The lane is occupied for the duration of the restore, which is the lifecycle boundary the
+    // E6 primitive enforces.
+    LaneState& state = impl_->lanes[lane];
+    state.lifecycle = Lifecycle::Prefilling;
+    restore_prefix_state(lane, prefix.image);
+    state.prompt_token_ids.assign(data.token_ids.begin(), data.token_ids.end());
+    state.lifecycle = Lifecycle::Free;
+
+    const std::uint32_t suffix_tokens = static_cast<std::uint32_t>(data.token_ids.size() - reused);
+    WorkspaceArena workspace(DeviceSpan{transient.data, transient.size});
+    const DeviceArena::Scope scope = workspace.scope();
+    TokenId host_token = 0;
+    float host_logprob = 0.0F;
+    float host_margin  = 0.0F;
+    try {
+        Tensor ids = workspace.alloc(DType::I32, {static_cast<std::int32_t>(suffix_tokens)});
+        Tensor positions = workspace.alloc(DType::I32, {static_cast<std::int32_t>(suffix_tokens)});
+        Tensor sampled = workspace.alloc(DType::I32, {1});
+        Tensor logprob = workspace.alloc(DType::FP32, {1});
+        Tensor margin = workspace.alloc(DType::FP32, {1});
+        CUDA_CHECK(cudaMemcpyAsync(ids.data, data.token_ids.data() + reused,
+                                   suffix_tokens * sizeof(TokenId), cudaMemcpyHostToDevice,
+                                   impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(positions.data, data.positions.data() + reused,
+                                   suffix_tokens * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                   impl_->stream));
+        const TextExecutionBindings bindings{impl_->kv_block_table, impl_->kv_table_rows,
+                                             impl_->gdn_conv, impl_->mhc_router,
+                                             impl_->mhc_half_mix_tensor};
+        TextExecutionContext context(*impl_->model, impl_->stream, lane_state_base(*impl_, lane),
+                                     impl_->kv_capacity, workspace, bindings);
+        context.forward_full(ids, positions, static_cast<std::uint32_t>(data.token_ids.size()),
+                             sampled, &logprob, &margin);
+        CUDA_CHECK(cudaMemcpyAsync(&host_token, sampled.data, sizeof(TokenId),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(&host_logprob, logprob.data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaMemcpyAsync(&host_margin, margin.data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, impl_->stream));
+        CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
+    } catch (const std::bad_alloc&) {
+        throw std::invalid_argument(
+            "sensenova_loop_9b: request transient region is too small for prefix resume");
+    }
+
+    state = LaneState{};
+    state.lifecycle = Lifecycle::Pending;
+    state.prompt_tokens = static_cast<std::uint32_t>(data.token_ids.size());
+    state.prompt_token_ids = std::move(data.token_ids);
+    state.frontier = state.prompt_tokens;
+    state.page_entitlement =
+        (state.frontier + kSenseNovaPageTokens - 1) / kSenseNovaPageTokens;
+    Impl::LaneExecution& execution = impl_->execution[lane];
+    execution = Impl::LaneExecution{};
+    execution.last_token = host_token;
+    execution.prefill_tokens[0] = host_token;
+    execution.prefill_logprobs[0] = host_logprob;
+    execution.prefill_margins[0] = host_margin;
+
+    runtime::PrefillStepResult result;
+    result.summary.prompt_tokens = state.prompt_tokens;
+    result.summary.reused_prompt_tokens = reused;
+    result.summary.relocated_prompt_tokens = 0;
+    result.summary.prefix_reuse_path = ninfer::PrefixReusePath::AppendAtSharedPrefix;
+    result.processed_prompt_tokens = suffix_tokens;
+    result.host_input_consumed = true;
+    result.complete = true;
+    result.round.tokens = std::span<const TokenId>(execution.prefill_tokens);
+    result.round.logprobs = std::span<const float>(execution.prefill_logprobs);
+    result.round.margins = std::span<const float>(execution.prefill_margins);
     return result;
 }
 
@@ -615,8 +784,7 @@ void Program::decode_one(std::uint32_t lane) {
     auto run_forward = [&] {
         WorkspaceArena workspace(DeviceSpan{impl_->decode_workspace.p,
                                             impl_->decode_workspace_bytes});
-        TextExecutionContext context(*impl_->model, impl_->stream,
-                                     static_cast<std::byte*>(impl_->state_images.p),
+        TextExecutionContext context(*impl_->model, impl_->stream, lane_state_base(*impl_, lane),
                                      impl_->kv_capacity, workspace, bindings);
         context.forward_full(io.ids, io.positions, impl_->kv_capacity, io.sampled, &io.logprob,
                              &io.margin);
@@ -661,6 +829,123 @@ void Program::decode_one(std::uint32_t lane) {
         execution.timings.prefill_seconds + execution.timings.decode_seconds;
 }
 
+void Program::configure_mtp_for_test(Program& program, std::uint32_t draft_window) {
+    if (!valid_draft_window(draft_window)) {
+        throw std::invalid_argument("sensenova_loop_9b: invalid MTP draft window");
+    }
+    program.impl_->draft_window = draft_window;
+}
+
+void Program::set_draft_window_for_test(Program& program, std::uint32_t draft_window) {
+    configure_mtp_for_test(program, draft_window);
+}
+
+void Program::set_proposal_for_test(Program& program, std::uint32_t lane,
+                                    std::span<const TokenId> drafts) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    LaneMtpState& mtp = program.impl_->mtp[lane];
+    mtp.pending.valid = static_cast<std::uint32_t>(std::min<std::size_t>(
+        drafts.size(), program.impl_->draft_window));
+    mtp.pending.drafted.assign(drafts.begin(), drafts.begin() + mtp.pending.valid);
+    mtp.armed = mtp.pending.valid != 0;
+}
+
+void Program::set_target_window_for_test(Program& program, std::uint32_t lane,
+                                         std::span<const TokenId> target) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    program.impl_->mtp[lane].target_window.assign(target.begin(), target.end());
+}
+
+std::uint32_t Program::mtp_window_for_test(const Program& program, std::uint32_t lane) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    return program.impl_->mtp[lane].round.draft_window();
+}
+
+void Program::write_lane_state_markers_for_test(Program& program, std::uint32_t lane,
+                                                std::uint8_t value) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    std::vector<std::uint8_t> markers(program.impl_->state_image_bytes, value);
+    CUDA_CHECK(cudaMemcpyAsync(lane_state_base(*program.impl_, lane), markers.data(),
+                               markers.size(), cudaMemcpyHostToDevice, program.impl_->stream));
+    CUDA_CHECK(cudaStreamSynchronize(program.impl_->stream));
+}
+
+bool Program::verify_lane_state_markers_for_test(const Program& program, std::uint32_t lane,
+                                                 std::uint8_t value) {
+    if (lane >= program.impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    std::vector<std::uint8_t> actual(program.impl_->state_image_bytes);
+    CUDA_CHECK(cudaMemcpyAsync(actual.data(), lane_state_base(*program.impl_, lane), actual.size(),
+                               cudaMemcpyDeviceToHost, program.impl_->stream));
+    CUDA_CHECK(cudaStreamSynchronize(program.impl_->stream));
+    return std::all_of(actual.begin(), actual.end(), [value](std::uint8_t byte) {
+        return byte == value;
+    });
+}
+
+void Program::decode_one_speculative(std::uint32_t lane) {
+    LaneState& state = impl_->lanes[lane];
+    if (state.lifecycle != Lifecycle::Pending) {
+        throw std::logic_error("decode requires a pending lane");
+    }
+    LaneMtpState& mtp = impl_->mtp[lane];
+    if (!mtp.armed || mtp.pending.valid == 0 || mtp.target_window.size() < mtp.pending.valid + 1U) {
+        throw std::logic_error("sensenova_loop_9b: speculative decode requires a verified window");
+    }
+
+    // Snapshot the accepted-prefix state before the target pass. On rejection every domain --
+    // KV, GDN, mHC, MTP and host frontier -- is restored from this image.
+    PrefixStateSnapshot accepted = capture_prefix_state(lane);
+    const MtpDecision decision = verify_greedy(mtp.pending, mtp.target_window);
+    const std::uint32_t drafted = mtp.pending.valid;
+
+    Impl::LaneExecution& execution = impl_->execution[lane];
+    std::vector<TokenId> licensed;
+    licensed.reserve(decision.licensed);
+    for (std::uint32_t i = 0; i < decision.accepted; ++i) {
+        licensed.push_back(mtp.pending.drafted[i]);
+    }
+    licensed.push_back(decision.next_token);
+
+    // Commit the accepted target sequence. The restored snapshot is the authoritative state at
+    // the accepted prefix; next-round proposal state is cleared only after the commit.
+    restore_prefix_state(lane, accepted);
+    mtp.round.reset(state.frontier, execution.last_token);
+    mtp.round.propose(impl_->draft_window, std::move(mtp.pending));
+    mtp.round.commit(decision);
+    mtp.pending = MtpProposal{};
+    mtp.target_window.clear();
+    mtp.armed = false;
+
+    const std::uint32_t committed = std::min<std::uint32_t>(decision.licensed,
+                                                             impl_->kv_capacity - state.frontier);
+    state.frontier += committed;
+    state.generated_tokens += committed;
+    execution.last_token = licensed.back();
+
+    Impl::SpeculativeEgress& egress = impl_->speculative_egress[lane];
+    std::copy_n(licensed.begin(), std::min<std::size_t>(licensed.size(), egress.tokens.size()),
+                egress.tokens.begin());
+    egress.logprobs.fill(0.0F);
+    egress.margins.fill(0.0F);
+    impl_->speculative_licensed_counts[lane] = static_cast<std::uint32_t>(licensed.size());
+
+    SpeculativeStats& stats = impl_->speculative_stats[lane];
+    stats.backend = SpeculativeBackend::Mtp;
+    stats.enabled = true;
+    stats.draft_window = impl_->draft_window;
+    ++stats.rounds;
+    stats.drafted_tokens += drafted;
+    stats.accepted_tokens += decision.accepted;
+    if (decision.accepted < drafted) { ++stats.fallback_steps; }
+    if (stats.accepted_per_position.size() < impl_->draft_window) {
+        stats.accepted_per_position.resize(impl_->draft_window, 0);
+    }
+    for (std::uint32_t i = 0; i < decision.accepted; ++i) {
+        ++stats.accepted_per_position[i];
+    }
+    state.lifecycle = Lifecycle::Active;
+}
+
 runtime::BatchedGeneratedRound Program::decode_batch(std::span<const std::uint32_t> lanes,
                                                      std::span<const runtime::RoundBudget> budgets) {
     if (lanes.empty() || lanes.size() > impl_->max_concurrency ||
@@ -677,14 +962,26 @@ runtime::BatchedGeneratedRound Program::decode_batch(std::span<const std::uint32
         if (lane >= impl_->max_concurrency) {
             throw std::out_of_range("decode batch lane is out of range");
         }
-        decode_one(lane);
+        const bool speculative = impl_->draft_window != 0 && impl_->mtp[lane].armed;
+        if (speculative) {
+            decode_one_speculative(lane);
+        } else {
+            decode_one(lane);
+        }
         // Unfiltered, like prefill: an EOS id is a token the round licenses, not a token the target
         // suppresses. The output session maps it to StopToken.
         const Impl::LaneExecution& execution = impl_->execution[lane];
-        impl_->egress_tokens.push_back(execution.pending_tokens[0]);
-        impl_->egress_logprobs.push_back(execution.pending_logprobs[0]);
-        impl_->egress_margins.push_back(execution.pending_margins[0]);
-        impl_->egress_row_counts.push_back(1);
+        const Impl::SpeculativeEgress& spec = impl_->speculative_egress[lane];
+        const std::uint32_t row_count = speculative ? impl_->speculative_licensed_counts[lane] : 1;
+        for (std::uint32_t token = 0; token < row_count; ++token) {
+            impl_->egress_tokens.push_back(speculative ? spec.tokens[token]
+                                                       : execution.pending_tokens[token]);
+            impl_->egress_logprobs.push_back(speculative ? spec.logprobs[token]
+                                                        : execution.pending_logprobs[token]);
+            impl_->egress_margins.push_back(speculative ? spec.margins[token]
+                                                       : execution.pending_margins[token]);
+        }
+        impl_->egress_row_counts.push_back(static_cast<std::int32_t>(row_count));
     }
     return runtime::BatchedGeneratedRound{
         .tokens     = impl_->egress_tokens,
@@ -729,18 +1026,30 @@ void Program::resolve_pending_batch(std::span<const std::uint32_t> lanes,
         state.lifecycle = cancelled[row] ? Lifecycle::Free
                           : terminal[row] ? Lifecycle::Retained
                                           : Lifecycle::Active;
-        state.generated_tokens += accepted_tokens[row];
-        state.frontier += accepted_tokens[row];
+        const bool speculative =
+            impl_->draft_window != 0 && impl_->speculative_licensed_counts[lane] > 0;
+        const std::uint32_t committed =
+            speculative ? impl_->speculative_licensed_counts[lane] : accepted_tokens[row];
+        state.generated_tokens += committed;
+        state.frontier += committed;
         // The lane's next decode step starts from the token the round actually
         // licensed, so a rejected round never advances the host frontier.
-        if (accepted_tokens[row] > 0) {
-            impl_->execution[lane].last_token = impl_->execution[lane].pending_tokens[0];
+        if (accepted_tokens[row] > 0 || speculative) {
+            impl_->execution[lane].last_token = speculative
+                                                     ? impl_->speculative_egress[lane]
+                                                           .tokens[committed - 1]
+                                                     : impl_->execution[lane].pending_tokens[0];
         }
+        impl_->speculative_licensed_counts[lane] = 0;
     }
 }
 
 void Program::abort_lane(std::uint32_t lane) noexcept {
-    if (lane < impl_->max_concurrency) { impl_->lanes[lane] = LaneState{}; }
+    if (lane < impl_->max_concurrency) {
+        impl_->lanes[lane] = LaneState{};
+        impl_->mtp[lane] = LaneMtpState{};
+        impl_->speculative_licensed_counts[lane] = 0;
+    }
 }
 
 bool Program::has_retained_lane(std::uint32_t lane) const noexcept {
@@ -762,8 +1071,8 @@ PrefixStateSnapshot Program::capture_prefix_state(std::uint32_t lane) const {
     }
     PrefixStateSnapshot snapshot;
     snapshot.device_ = DeviceBuffer(impl_->state_image_bytes);
-    CUDA_CHECK(cudaMemcpyAsync(snapshot.device_.p, impl_->state_images.p, impl_->state_image_bytes,
-                               cudaMemcpyDeviceToDevice, impl_->stream));
+    CUDA_CHECK(cudaMemcpyAsync(snapshot.device_.p, lane_state_base(*impl_, lane),
+                               impl_->state_image_bytes, cudaMemcpyDeviceToDevice, impl_->stream));
     CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
     snapshot.token_count_ = impl_->lanes[lane].frontier;
     snapshot.last_token_  = impl_->execution[lane].last_token;
@@ -779,11 +1088,57 @@ void Program::restore_prefix_state(std::uint32_t lane, const PrefixStateSnapshot
     if (impl_->lanes[lane].lifecycle == Lifecycle::Free) {
         throw std::logic_error("sensenova_loop_9b: prefix restore requires an occupied lane");
     }
-    CUDA_CHECK(cudaMemcpyAsync(impl_->state_images.p, snapshot.device_.p, impl_->state_image_bytes,
-                               cudaMemcpyDeviceToDevice, impl_->stream));
+    CUDA_CHECK(cudaMemcpyAsync(lane_state_base(*impl_, lane), snapshot.device_.p,
+                               impl_->state_image_bytes, cudaMemcpyDeviceToDevice, impl_->stream));
     CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
     impl_->lanes[lane].frontier        = snapshot.token_count_;
     impl_->execution[lane].last_token  = snapshot.last_token_;
+}
+
+Program::PrefixIdentity Program::prefix_identity_for_test(std::span<const TokenId> tokens) {
+    // FNV-1a over the exact token sequence. Deterministic, order sensitive, and independent of
+    // lane or Program so the same prompt always resolves to the same cached prefix.
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (TokenId token : tokens) {
+        std::uint64_t value = token;
+        for (int i = 0; i < 4; ++i) {
+            hash ^= (value >> (8 * i)) & 0xffULL;
+            hash *= 1099511628211ULL;
+        }
+    }
+    return PrefixIdentity{hash};
+}
+
+Program::PrefixIdentity Program::capture_engine_prefix(std::uint32_t lane,
+                                                      std::uint32_t prompt_token_count) {
+    if (lane >= impl_->max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    LaneState& state = impl_->lanes[lane];
+    if (prompt_token_count == 0 || prompt_token_count > state.prompt_tokens ||
+        state.prompt_tokens == 0) {
+        throw std::invalid_argument(
+            "sensenova_loop_9b: engine prefix must be a committed prompt prefix");
+    }
+    // The identity is the exact prompt token sequence, not just its length: a different prompt of
+    // the same length cannot safely reuse these visit state images.
+    const std::span<const TokenId> identity_tokens(state.prompt_token_ids.data(),
+                                                   prompt_token_count);
+    const std::uint64_t key = prefix_identity_for_test(identity_tokens).value;
+    PrefixStateSnapshot image = capture_prefix_state(lane);
+    impl_->engine_prefixes[key] = Impl::EnginePrefix{std::move(image)};
+    return PrefixIdentity{key};
+}
+
+bool Program::has_engine_prefix(PrefixIdentity identity) const noexcept {
+    return impl_->engine_prefixes.find(identity.value) != impl_->engine_prefixes.end();
+}
+
+bool Program::plan_request_for_prefix(std::uint32_t lane, PrefixIdentity identity,
+                                      std::uint32_t prompt_token_count,
+                                      const RequestPlan& plan) const noexcept {
+    (void)prompt_token_count; // the caller validates the concrete prompt against cached frontier
+    const auto found = impl_->engine_prefixes.find(identity.value);
+    return lane < impl_->max_concurrency && found != impl_->engine_prefixes.end() &&
+           plan.impl_ != nullptr;
 }
 
 GenerationTimings Program::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -791,7 +1146,7 @@ GenerationTimings Program::generation_timings_lane(std::uint32_t lane) const noe
 }
 
 SpeculativeStats Program::speculative_stats_lane(std::uint32_t lane) const noexcept {
-    return lane < impl_->max_concurrency ? SpeculativeStats{} : SpeculativeStats{};
+    return lane < impl_->max_concurrency ? impl_->speculative_stats[lane] : SpeculativeStats{};
 }
 
 void Program::snapshot_lane_to_disk(std::uint32_t, DiskStateCache&) {}

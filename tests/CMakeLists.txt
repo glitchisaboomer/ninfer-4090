@@ -110,6 +110,23 @@ target_include_directories(ninfer_sensenova_loop_9b_text_execution_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
 target_link_libraries(ninfer_sensenova_loop_9b_text_execution_test PRIVATE ninfer_engine ninfer_ops ${NINFER_CUDART_TARGET})
 
+ninfer_add_host_test(ninfer_sensenova_loop_9b_mtp_rollback_test
+  SOURCES targets/sensenova_loop_9b/test_mtp_rollback.cpp
+          ../src/targets/sensenova_loop_9b/impl/runtime/mtp.cpp
+          ../src/targets/sensenova_loop_9b/impl/runtime/mtp_stem.cpp)
+target_include_directories(ninfer_sensenova_loop_9b_mtp_rollback_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
+target_link_libraries(ninfer_sensenova_loop_9b_mtp_rollback_test PRIVATE ninfer_engine ninfer_ops ${NINFER_CUDART_TARGET})
+
+ninfer_add_test(ninfer_sensenova_loop_9b_prefix_reuse_test
+  SOURCES targets/sensenova_loop_9b/test_prefix_reuse.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_sensenova_loop_9b_prefix_reuse_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/sensenova_loop_9b/export)
+target_link_libraries(ninfer_sensenova_loop_9b_prefix_reuse_test PRIVATE ${NINFER_CUDART_TARGET})
+
 ninfer_add_test(ninfer_sensenova_loop_9b_program_lifecycle_test
   SOURCES targets/sensenova_loop_9b/test_program_lifecycle.cpp
   LIBRARIES ninfer_engine)
