@@ -855,3 +855,5 @@ void transpose_mhc_router_weight(const Tensor& stored, Tensor& out, cudaStream_t
                         cudaMemcpyHostToDevice, stream);
     require(up == cudaSuccess, "mhc router transpose host-to-device failed");
 }
+
+} // namespace ninfer::targets::sensenova_loop_9b::detail
